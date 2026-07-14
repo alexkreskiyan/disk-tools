@@ -1,0 +1,18 @@
+# ide
+/.idea/
+
+# local tools
+/.cargo/
+
+# environment
+.env
+.direnv/
+
+# artifacts
+/chat/*.txt
+/logs/*.log
+/target/
+
+# OS
+.DS_Store
+Thumbs.db
