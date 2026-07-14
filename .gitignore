@@ -12,6 +12,8 @@
 /chat/*.txt
 /logs/*.log
 /target/
+/mutants.out/
+/mutants.out.old/
 
 # OS
 .DS_Store

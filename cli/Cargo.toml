@@ -1,0 +1,12 @@
+[package]
+name = "disk-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "disk-tools"
+path = "src/main.rs"
+
+[dependencies]
+disk-tools-core = { path = "../core" }

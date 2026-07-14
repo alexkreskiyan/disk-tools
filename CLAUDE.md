@@ -1,6 +1,15 @@
 # disc-tools
 
-Rust tooling for chat/Discord data (working title). **Scaffold — no source code yet.** This file and `kb/` were bootstrapped by `/document-repository`; sections marked _TODO_ get filled as code lands.
+Cross-platform disk-utilities CLI in Rust, distributed as `disk-tools`. Its first
+capability is finding what eats disk space — a fast parallel scan printing a
+dust-style size-sorted tree of the largest directories and files — with cleanup,
+junk/old/duplicate detectors and a TUI planned on top of the same core.
+
+Currently building **v0.1** (scan + tree report). See the
+[concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
+its Roadmap for what lands when; the
+[v0.1 spec](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md) is the
+authoritative task breakdown.
 
 ## Important: Documentation Requirements
 
@@ -14,36 +23,42 @@ If unsure how to document a change, ask the user before proceeding.
 
 ## Quick Reference
 
-Intended stack: **Rust** (inferred from `.gitignore`: `/.cargo/`, `/target/`). No `Cargo.toml` exists yet.
+Stack: **Rust** — a Cargo workspace with `disk-tools-core` (lib) + `disk-tools` (bin).
+
+`justfile` is the single entry point for local tooling; add new operations there
+rather than as ad-hoc commands.
 
 | Command | Description |
 |---------|-------------|
-| `cargo build` | Build (once `Cargo.toml` exists) — _TODO_ |
-| `cargo test` | Run tests — _TODO_ |
-| `cargo run` | Run the app — _TODO_ |
+| `just` | List all recipes |
+| `just build` | Build the workspace (`cargo build --workspace`) |
+| `just test` | Run all tests (`cargo test --workspace`) |
+| `just lint` | Clippy, warnings as errors |
+| `just fmt` / `just fmt-check` | Format / check formatting |
+| `just verify` | Pre-commit gate: `fmt-check` + `lint` + `test` |
+| `just run <ARGS>` | Run the CLI, e.g. `just run ~/Downloads --json` (no-op until Task 6 lands the clap surface) |
 
 ## Project Structure
 
-Current tracked layout (empty scaffold):
-
 ```
 disc-tools/
-├── .gitignore          # ignores .idea, .cargo, target, .env, chat/*.txt, logs/*.log
+├── Cargo.toml          # workspace: members core, cli; edition 2024, MSRV 1.85
+├── justfile            # single entry point for local tooling
+├── core/               # disk-tools-core (lib) — the scanning engine
+│   ├── Cargo.toml      # no dependencies yet (rayon/filesize arrive in Tasks 2-3)
+│   └── src/
+│       ├── lib.rs      # forbid(unsafe_code); re-exports
+│       ├── options.rs  # ScanOptions
+│       └── tree.rs     # ScanNode / ScanTree / SkippedEntry / SkipReason
+├── cli/                # disk-tools (bin) — CLI frontend
+│   ├── Cargo.toml
+│   └── src/main.rs     # placeholder until Task 6
 ├── CLAUDE.md           # this file
 └── kb/                 # agentic knowledge base (dated snapshots)
-    ├── architecture/
-    └── guides/
 ```
 
-Anticipated (from `.gitignore` hints, not yet present):
-
-```
-disc-tools/
-├── Cargo.toml          # _TODO_ — crate manifest
-├── src/                # _TODO_ — Rust sources
-├── chat/               # runtime chat exports (*.txt, gitignored)
-└── logs/               # runtime logs (*.log, gitignored)
-```
+Planned modules, not yet present (spec §2): `core/src/{walk,size,dedup,units}.rs`,
+`cli/src/{args.rs,render/}`.
 
 ## Key Concepts
 
