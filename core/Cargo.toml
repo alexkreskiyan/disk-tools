@@ -5,3 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+
+# Windows hides allocated size from `std::fs::Metadata`; `GetCompressedFileSizeW`
+# is the only way to it. Unix builds stay dependency-free.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"
