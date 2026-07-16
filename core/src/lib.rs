@@ -16,11 +16,14 @@
 #![deny(unsafe_code)]
 
 mod options;
-// Nothing calls this yet — Task 3's walk is its first consumer. Drop the
-// `allow` once it does.
+// `walk` uses `size`, but nothing public reaches `walk` yet, so the compiler
+// rightly calls the whole chain dead. `scan()` in Task 5 is what makes it
+// reachable — drop both `allow`s then, not before.
 #[allow(dead_code)]
 mod size;
 mod tree;
+#[allow(dead_code)]
+mod walk;
 
 pub use options::ScanOptions;
 pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};

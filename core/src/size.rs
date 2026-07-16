@@ -44,6 +44,53 @@ fn allocated(_path: &Path, metadata: &Metadata) -> io::Result<u64> {
     Ok(metadata.blocks() * 512)
 }
 
+/// Give a drive-letter path past `MAX_PATH` the `\\?\` verbatim prefix Win32
+/// needs, and leave everything else untouched.
+///
+/// `std::fs` does this internally, but `GetCompressedFileSizeW` is raw FFI and
+/// gets whatever we hand it — so this is the one spot that has to prefix by hand.
+/// The conversion is driven by length, not by retrying after a failure: a length
+/// is a fact, whereas "which error means too long" is a guess. `std::path::absolute`
+/// produces the absolute form `\\?\` requires without touching the filesystem —
+/// unlike `canonicalize`, which this project never calls and which would rewrite
+/// short paths too, breaking on RAM disks / network drives / Docker mounts.
+///
+/// Only `C:\`-style drive paths are converted. A UNC path (`\\server\share`)
+/// needs the distinct `\\?\UNC\server\share` form, not a naive `\\?\` prefix, so
+/// rather than get that subtly wrong it is left alone — a long UNC path may still
+/// hit the limit and skip, a documented v0.1 gap for network shares.
+#[cfg(windows)]
+fn verbatim_if_long(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::borrow::Cow;
+    use std::path::{Component, Prefix};
+
+    // Under MAX_PATH (260), leaving margin so a short path stays short.
+    const THRESHOLD: usize = 248;
+
+    if path.as_os_str().len() <= THRESHOLD {
+        return Cow::Borrowed(path);
+    }
+    // Convert drive-letter paths only; anything else (already-verbatim, UNC,
+    // device namespace) is handed back untouched.
+    let is_plain_drive = matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+    );
+    if !is_plain_drive {
+        return Cow::Borrowed(path);
+    }
+    match std::path::absolute(path) {
+        Ok(absolute) => {
+            let mut verbatim = std::ffi::OsString::from(r"\\?\");
+            verbatim.push(absolute.as_os_str());
+            Cow::Owned(std::path::PathBuf::from(verbatim))
+        }
+        // Nothing to convert to — hand back the original and let the FFI raise a
+        // real error, which the caller turns into a skip.
+        Err(_) => Cow::Borrowed(path),
+    }
+}
+
 /// Windows keeps allocated size out of `Metadata` entirely, so this is the one
 /// place the crate reaches for FFI — hence the scoped `allow` against the
 /// crate-wide `deny(unsafe_code)`.
@@ -56,9 +103,8 @@ fn allocated(path: &Path, _metadata: &Metadata) -> io::Result<u64> {
     /// Not exported by `windows-sys`.
     const INVALID_FILE_SIZE: u32 = u32::MAX;
 
-    // The path goes to the API exactly as the walk produced it. Canonicalizing
-    // first would rewrite it to `\\?\` form, which other tools reject and which
-    // fails outright on some volumes (RAM disks, network drives, Docker mounts).
+    // Prefix long paths (but never canonicalize) — see `verbatim_if_long`.
+    let path = verbatim_if_long(path);
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
 
@@ -163,6 +209,60 @@ mod tests {
 
         assert_eq!(sizes.apparent, 0);
         assert_eq!(sizes.allocated, 0);
+    }
+
+    /// Short paths reach the FFI untouched — no needless rewriting.
+    #[cfg(windows)]
+    #[test]
+    fn short_path_is_not_prefixed() {
+        let path = std::path::Path::new(r"C:\short\enough");
+
+        assert_eq!(verbatim_if_long(path).as_ref(), path);
+    }
+
+    /// A path past MAX_PATH gets the `\\?\` prefix, so `GetCompressedFileSizeW`
+    /// never hits the length limit.
+    #[cfg(windows)]
+    #[test]
+    fn long_path_gets_verbatim_prefix() {
+        let long = format!(r"C:\{}", "a".repeat(300));
+        let path = std::path::Path::new(&long);
+
+        let converted = verbatim_if_long(path);
+
+        assert!(
+            converted.as_os_str().to_string_lossy().starts_with(r"\\?\"),
+            "a >MAX_PATH path must reach the FFI in verbatim form, got {converted:?}"
+        );
+    }
+
+    /// Prefixing an already-verbatim path would corrupt it.
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_path_is_not_prefixed_twice() {
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        let path = std::path::Path::new(&long);
+
+        let converted = verbatim_if_long(path);
+
+        assert_eq!(converted.as_ref(), path);
+        assert!(
+            !converted
+                .as_os_str()
+                .to_string_lossy()
+                .starts_with(r"\\?\\\?\")
+        );
+    }
+
+    /// A UNC path needs `\\?\UNC\...`, not a naive `\\?\` prefix, so a long one
+    /// is left untouched rather than corrupted (documented v0.1 gap).
+    #[cfg(windows)]
+    #[test]
+    fn long_unc_path_is_left_untouched() {
+        let long = format!(r"\\server\share\{}", "a".repeat(300));
+        let path = std::path::Path::new(&long);
+
+        assert_eq!(verbatim_if_long(path).as_ref(), path);
     }
 
     /// A normal file occupies whole blocks — this fails loudly if `allocated`

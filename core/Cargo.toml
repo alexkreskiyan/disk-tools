@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rayon = "1.12.0"
 
 # Windows hides allocated size from `std::fs::Metadata`; `GetCompressedFileSizeW`
 # is the only way to it. Unix builds stay dependency-free.
