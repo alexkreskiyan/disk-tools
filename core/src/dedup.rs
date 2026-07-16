@@ -66,6 +66,8 @@ mod tests {
         fs::write(path, vec![b'x'; bytes]).expect("write file");
     }
 
+    // Only the hardlink fixtures (all `#[cfg(unix)]`) inspect file entries.
+    #[cfg(unix)]
     fn file_entries(entries: &[WalkEntry]) -> impl Iterator<Item = &WalkEntry> {
         entries.iter().filter(|e| !e.is_dir)
     }

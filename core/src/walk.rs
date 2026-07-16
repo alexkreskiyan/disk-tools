@@ -136,18 +136,28 @@ fn walk_dir(dir: &Path, root_device: Option<u64>, options: &ScanOptions) -> Walk
             }
         };
 
-        if file_type.is_dir() {
-            // A mount point's inode belongs to the mounted filesystem, so a
-            // differing device means we've reached the boundary: don't record
-            // it and don't descend, the way `du -x` behaves.
-            if options.one_file_system && crosses_filesystem(&metadata, root_device) {
-                continue;
-            }
-            subdirs.push(path.clone());
+        // A mount point's inode belongs to the mounted filesystem, so a
+        // differing device means we've reached the boundary: don't record it and
+        // don't descend, the way `du -x` behaves.
+        if file_type.is_dir()
+            && options.one_file_system
+            && crosses_filesystem(&metadata, root_device)
+        {
+            continue;
         }
 
         match entry_for(&path, &metadata) {
-            Ok(entry) => walked.entries.push(entry),
+            Ok(entry) => {
+                // Descend only into a directory we could actually record. If its
+                // own measurement fails it becomes the single skip below;
+                // recursing anyway would orphan the measured subtree in
+                // aggregation — its parent would be missing from the tree — and
+                // silently drop those bytes.
+                if entry.is_dir {
+                    subdirs.push(path);
+                }
+                walked.entries.push(entry);
+            }
             Err(err) => walked.record_skip(path, &err),
         }
     }

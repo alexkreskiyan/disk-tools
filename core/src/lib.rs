@@ -15,17 +15,29 @@
 // still fails the build.
 #![deny(unsafe_code)]
 
-mod options;
-// `walk` uses `size` and feeds `dedup`, but nothing public reaches the chain
-// yet, so the compiler rightly calls it all dead. `scan()` in Task 5 is what
-// makes it reachable — drop these `allow`s then, not before.
-#[allow(dead_code)]
 mod dedup;
-#[allow(dead_code)]
+mod options;
 mod size;
 mod tree;
-#[allow(dead_code)]
 mod walk;
 
 pub use options::ScanOptions;
 pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
+
+/// Scan `options.root` and return a size-annotated tree plus whatever was
+/// skipped.
+///
+/// The one public entry point. Runs the three internal phases in order — walk
+/// the tree in parallel, resolve hardlink attribution, then aggregate bottom-up
+/// — because attribution must settle before any directory total is summed.
+/// Never fails: an unreadable root (or anything else that goes wrong) comes back
+/// as a [`SkippedEntry`] in [`ScanTree::skipped`], not an error.
+pub fn scan(options: &ScanOptions) -> ScanTree {
+    let mut walked = walk::walk(options);
+    dedup::attribute(&mut walked.entries);
+    let root = tree::aggregate(walked.entries, options.root.as_path());
+    ScanTree {
+        root,
+        skipped: walked.skipped,
+    }
+}
