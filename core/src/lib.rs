@@ -16,9 +16,11 @@
 #![deny(unsafe_code)]
 
 mod options;
-// `walk` uses `size`, but nothing public reaches `walk` yet, so the compiler
-// rightly calls the whole chain dead. `scan()` in Task 5 is what makes it
-// reachable — drop both `allow`s then, not before.
+// `walk` uses `size` and feeds `dedup`, but nothing public reaches the chain
+// yet, so the compiler rightly calls it all dead. `scan()` in Task 5 is what
+// makes it reachable — drop these `allow`s then, not before.
+#[allow(dead_code)]
+mod dedup;
 #[allow(dead_code)]
 mod size;
 mod tree;
