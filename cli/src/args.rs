@@ -19,9 +19,6 @@ pub struct Args {
 
     /// Show at most this many entries.
     #[arg(short = 'n', long = "number")]
-    // `allow`, not `expect`: a test reads this field, so the dead-code lint
-    // doesn't fire in the test build. Surfaced for --help now; Task 7 consumes it.
-    #[allow(dead_code)]
     pub number: Option<usize>,
 
     /// Hide entries below this size, e.g. `1M`, `512K`, `2G` (1024-based).
