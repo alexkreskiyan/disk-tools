@@ -1,6 +1,7 @@
-//! Presentation of a [`disk_tools_core::ScanTree`] for the terminal.
+//! Presentation of a [`disk_tools_core::ScanTree`].
 //!
-//! The core returns data; everything here decides how it reaches a human. Task 8
-//! adds a `json` renderer alongside `tree`.
+//! The core returns data; everything here decides how it reaches a consumer —
+//! [`tree`] for a human terminal report, [`json`] for machine-readable output.
 
+pub mod json;
 pub mod tree;

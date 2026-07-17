@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 /// One entry in the scanned tree — a file or a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScanNode {
     pub path: PathBuf,
 
@@ -22,6 +23,7 @@ pub struct ScanNode {
 
 /// Why an entry could not be scanned.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SkipReason {
     PermissionDenied,
     /// The entry disappeared between being listed and being measured.
@@ -34,6 +36,7 @@ pub enum SkipReason {
 /// Collected rather than logged — the core has no opinion on how this should
 /// reach a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SkippedEntry {
     pub path: PathBuf,
     pub reason: SkipReason,
@@ -41,6 +44,7 @@ pub struct SkippedEntry {
 
 /// The result of a scan: a size-annotated tree plus whatever was skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScanTree {
     pub root: ScanNode,
     pub skipped: Vec<SkippedEntry>,

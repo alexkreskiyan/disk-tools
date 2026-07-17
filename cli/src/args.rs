@@ -39,7 +39,6 @@ pub struct Args {
 
     /// Emit JSON instead of the tree report.
     #[arg(long)]
-    #[allow(dead_code)] // surfaced for --help now; Task 8 consumes it
     pub json: bool,
 }
 

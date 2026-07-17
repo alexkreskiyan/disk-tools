@@ -1,8 +1,8 @@
 //! `disk-tools` — the CLI frontend.
 //!
-//! Parses arguments into a [`disk_tools_core::ScanOptions`], scans, and prints a
-//! size-sorted tree report. JSON output (Task 8) and the progress/skipped
-//! summary (Task 9) are not wired yet.
+//! Parses arguments into a [`disk_tools_core::ScanOptions`], scans, and prints
+//! either a size-sorted tree report or JSON. The progress/skipped summary
+//! (Task 9) is not wired yet.
 
 mod args;
 mod render;
@@ -10,12 +10,14 @@ mod render;
 use args::{Args, validate_root};
 use clap::Parser;
 use disk_tools_core::scan;
+use render::json::render_json;
 use render::tree::{RenderOptions, render_tree};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args = Args::parse();
     // Copy the display-only knobs before `into_scan_options` consumes `args`.
+    let json = args.json;
     let render_options = RenderOptions {
         number: args.number,
         depth: args.depth,
@@ -31,7 +33,17 @@ fn main() -> ExitCode {
     }
 
     let tree = scan(&options);
-    print!("{}", render_tree(&tree, &render_options));
+    if json {
+        match render_json(&tree) {
+            Ok(payload) => println!("{payload}"),
+            Err(err) => {
+                eprintln!("disk-tools: cannot encode JSON: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        print!("{}", render_tree(&tree, &render_options));
+    }
     ExitCode::SUCCESS
 }
 
