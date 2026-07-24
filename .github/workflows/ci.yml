@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same ref supersedes the running check.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report every platform, not just the first one to go red.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # MSRV is pinned in Cargo.toml (rust-version = "1.85"); stable satisfies it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The justfile is the single entry point for tooling — CI calls its recipes
+      # rather than duplicating the raw cargo commands.
+      - uses: extractions/setup-just@v4
+
+      # fmt-check + lint + test. Windows needs no privilege setup: the symlink,
+      # hardlink, sparse-file and permission fixtures are all #[cfg(unix)], and
+      # the mount-point test is #[ignore].
+      - name: just verify
+        run: just verify
+
+      - name: just build
+        run: just build

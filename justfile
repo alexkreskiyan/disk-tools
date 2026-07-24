@@ -15,7 +15,7 @@ default:
 build:
     cargo build --workspace
 
-# Run the CLI (no-op until Task 6 replaces the cli/src/main.rs placeholder).
+# Run the CLI, e.g. `just run ~/Downloads --json`.
 run *ARGS:
     cargo run -p disk-tools -- {{ARGS}}
 
@@ -39,5 +39,6 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Pre-commit gate: formatting, lints, tests. Task 10's CI runs this too.
+# Pre-commit gate: formatting, lints, tests. CI runs this recipe on all three
+# platforms, so anything added here is enforced there too.
 verify: fmt-check lint test
