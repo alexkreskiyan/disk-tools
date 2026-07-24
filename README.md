@@ -149,6 +149,31 @@ apply to the tree report only.
 So `disk-tools <path> --json > out.json` yields valid JSON, and the spinner is
 suppressed entirely when stderr is not a terminal.
 
+## Benchmarks
+
+Warm cache, `hyperfine -N --warmup 5 --runs 20`, release build, output discarded.
+Mac16,5 (16 cores, 64 GB), macOS 26.5.2, APFS. Mean ± σ over 20 runs:
+
+| Fixture | `disk-tools --depth 0` | `disk-tools` (full tree) | `du -sh` | `diskus` |
+|---------|------------------------|--------------------------|----------|----------|
+| 105k small files, 1.2k dirs | **167.0 ms ± 11.8** | 220.9 ms ± 12.3 | 344.6 ms ± 48.7 | 100.4 ms ± 8.9 |
+| 20k mixed files, 20 GB | **32.3 ms ± 1.6** | 43.8 ms ± 1.5 | 59.6 ms ± 2.1 | 24.4 ms ± 1.4 |
+| 40 flat files, 7.8 GB | **3.5 ms ± 0.3** | 3.5 ms ± 0.3 | 6.7 ms ± 0.5 | 4.7 ms ± 0.3 |
+
+`--depth 0` is the like-for-like comparison with `du -sh`: both print one summary
+line. On that footing `disk-tools` is **1.8–2.1× faster than `du -sh`**, and it stays
+1.4–1.9× faster even while rendering the whole tree, which `du -sh` never does.
+`diskus` is 1.3–1.7× ahead on metadata-heavy trees because it accumulates one total
+and keeps nothing, where `disk-tools` builds the tree the report — and the future TUI
+— needs; on the flat media library `disk-tools` is the fastest of the three.
+
+**Memory:** peak RSS is **≈ 630 bytes per entry** — 1.42 GB for a real 2,247,326-entry
+tree, 868 MB for a 1,400,409-entry one.
+
+Full protocol, raw numbers and caveats:
+[kb/benchmarks/2026.07/2026.07.25-v0.1-scan-performance.md](kb/benchmarks/2026.07/2026.07.25-v0.1-scan-performance.md).
+Reproduce with `just bench-fixtures <dir>` → `just bench <dir>` → `just bench-memory <path>`.
+
 ## Limitations (v0.1)
 
 | Limitation | Detail |
@@ -158,7 +183,7 @@ suppressed entirely when stderr is not a terminal.
 | `--one-file-system` does nothing on Windows | Mount-boundary detection needs a device id (`st_dev`), which the walk cannot obtain there without an extra `open()` per directory. The flag is accepted and silently has no effect off Unix. |
 | Long UNC paths may be skipped on Windows | Only `C:\`-style drive paths get the `\\?\` prefix that lifts the `MAX_PATH` limit; a `\\server\share\…` path longer than that can end up in the skipped list. |
 | Wide glyphs misalign the right edge | Name widths are counted per `char`, so CJK, emoji and combining characters push the bar column out of alignment. |
-| The whole tree is held in memory | An accepted trade-off — directory totals and the planned interactive TUI both need the full tree. Peak memory grows with the number of entries scanned. |
+| The whole tree is held in memory | An accepted trade-off — directory totals and the planned interactive TUI both need the full tree. Costs **≈ 630 bytes per entry**: 1.4 GB for a 2.2M-entry scan (measured, see [Benchmarks](#benchmarks)). |
 
 ## Development
 
@@ -174,6 +199,9 @@ rather than as ad-hoc commands.
 | `just fmt` / `just fmt-check` | `cargo fmt --all` / `--check` |
 | `just lint` | Clippy, warnings as errors |
 | `just verify` | Pre-commit gate: `fmt-check` + `lint` + `test` |
+| `just bench-fixtures <dir>` | Generate the benchmark fixtures (~28 GB) |
+| `just bench <dir>` | Benchmark against `du -sh` and `diskus` (needs `hyperfine`, `diskus`) |
+| `just bench-memory <path>` | Peak RSS of one scan |
 
 CI runs `just verify` and `just build` on Linux, macOS and Windows
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).

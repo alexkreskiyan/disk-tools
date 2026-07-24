@@ -38,6 +38,7 @@ rather than as ad-hoc commands.
 | `just fmt` / `just fmt-check` | Format / check formatting |
 | `just verify` | Pre-commit gate: `fmt-check` + `lint` + `test` |
 | `just run <ARGS>` | Run the CLI, e.g. `just run ~/Downloads --json` |
+| `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
 CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` on Linux, macOS
 and Windows — it calls the justfile recipes rather than duplicating cargo commands,
@@ -71,7 +72,9 @@ disc-tools/
 │   │       ├── json.rs     # --json (full tree, raw byte counts)
 │   │       └── skipped.rs  # skipped-entries summary (capped at 10)
 │   └── tests/cli.rs    # integration tests
-├── README.md           # user-facing usage, flags, limitations
+├── scripts/
+│   └── bench-fixtures.sh   # generates the three benchmark fixture shapes
+├── README.md           # user-facing usage, flags, limitations, benchmarks
 ├── CLAUDE.md           # this file
 └── kb/                 # agentic knowledge base (dated snapshots)
 ```
@@ -117,6 +120,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 |--------|---------|-----------------|
 | `kb/architecture/` | System design, key patterns | `2026.07/2026.07.14` |
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.14` |
+| `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.25` |
 
 Files are always written under a `<YYYY.MM>/` folder — never directly under `kb/<folder>/`. Filenames begin with `<YYYY.MM.DD>-` and never include the folder name.
 
@@ -124,6 +128,9 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 
 **Architecture** (snapshots from `kb/architecture/2026.07/`)
 - [Overview](kb/architecture/2026.07/2026.07.14-overview.md)
+
+**Benchmarks** (snapshots from `kb/benchmarks/2026.07/`)
+- [v0.1 scan performance and memory](kb/benchmarks/2026.07/2026.07.25-v0.1-scan-performance.md)
 
 **Guides** (snapshots from `kb/guides/2026.07/`)
 - [Development](kb/guides/2026.07/2026.07.14-development.md)
