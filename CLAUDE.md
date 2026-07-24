@@ -107,9 +107,19 @@ Invariants worth keeping in mind:
 
 ## Configuration
 
-- **`.env`** — gitignored; environment config (contents _TODO_)
-- **`chat/`**, **`logs/`** — runtime output directories, gitignored
-- `.direnv/` present in ignore list → `direnv` likely used for env loading
+The tool reads **no** configuration — `<PATH>` and the flags are its entire input
+(`--config` and a TOML file arrive in v0.3). What configuration exists is build-time:
+
+| File | Holds |
+|------|-------|
+| `Cargo.toml` (workspace) | `version`, `edition = "2024"`, `rust-version = "1.85"`, inherited by both crates |
+| `core/Cargo.toml` | The optional `serde` feature; `windows-sys` under `[target.'cfg(windows)'.dependencies]` |
+| `cli/Cargo.toml` | Enables the core's `serde` feature for `--json` |
+| `.gitattributes` | `* text=auto eol=lf` — a CRLF checkout would fail `cargo fmt --check` on Windows |
+
+`.gitignore` also lists `.env`, `.direnv/`, `chat/` and `logs/`; none of these
+exist in the repository — they are leftovers from the initial scaffold, not
+features.
 
 ## Knowledge Base
 
@@ -121,19 +131,27 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 
 | Folder | Purpose | Latest snapshot |
 |--------|---------|-----------------|
-| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.14` |
-| `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.14` |
+| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.25` |
+| `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
 | `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.25` |
+| `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
+| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07` |
+| `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
+| `kb/research/` | Research reports (`/research`) | `2026.07` |
+| `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07` |
+| `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07` |
 
 Files are always written under a `<YYYY.MM>/` folder — never directly under `kb/<folder>/`. Filenames begin with `<YYYY.MM.DD>-` and never include the folder name.
 
 ## Documentation
 
 **Architecture** (snapshots from `kb/architecture/2026.07/`)
-- [Overview](kb/architecture/2026.07/2026.07.14-overview.md)
+- [Overview](kb/architecture/2026.07/2026.07.25-overview.md) — the three-phase pipeline, data model, invariants, platform splits
+- [Rust crate structure](kb/architecture/2026.07/2026.07.25-rust-crates.md) — workspace, feature flags, unsafe policy
+
+**Guides** (snapshots from `kb/guides/2026.07/`)
+- [Development](kb/guides/2026.07/2026.07.25-development.md) — workflow, justfile recipes, CI, benchmark harness
+- [Testing](kb/guides/2026.07/2026.07.25-testing.md) — test layout, platform gating, fixture patterns
 
 **Benchmarks** (snapshots from `kb/benchmarks/2026.07/`)
 - [v0.1 scan performance and memory](kb/benchmarks/2026.07/2026.07.25-v0.1-scan-performance.md)
-
-**Guides** (snapshots from `kb/guides/2026.07/`)
-- [Development](kb/guides/2026.07/2026.07.14-development.md)

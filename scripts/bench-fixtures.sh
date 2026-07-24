@@ -15,7 +15,8 @@
 # sparse fixture reports ~0 allocated bytes, which would make the sizes in the
 # report meaningless even though the walk timings would look the same.
 #
-# Costs roughly 10 GB and a few minutes. The target directory is created if
+# Costs roughly 28 GB and a few minutes (the cache fixture dominates: a uniform
+# 4 KiB-2 MiB draw averages ~1 MiB, so 20k files is ~20 GB). Created if
 # missing and must be empty or non-existent — this never deletes anything.
 set -euo pipefail
 
