@@ -4,4 +4,5 @@
 //! [`tree`] for a human terminal report, [`json`] for machine-readable output.
 
 pub mod json;
+pub mod skipped;
 pub mod tree;

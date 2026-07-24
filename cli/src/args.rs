@@ -40,6 +40,10 @@ pub struct Args {
     /// Emit JSON instead of the tree report.
     #[arg(long)]
     pub json: bool,
+
+    /// List every skipped entry instead of just the first ten.
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
 }
 
 impl Args {

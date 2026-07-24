@@ -233,3 +233,191 @@ fn json_includes_a_skipped_entry_from_a_real_unreadable_directory() {
         "the unreadable directory must appear in JSON skipped, got: {skipped:?}"
     );
 }
+
+/// In `--json` mode the skipped summary must go to stderr, leaving stdout as
+/// pure JSON — the stdout/stderr separation that keeps piped output parseable.
+#[cfg(unix)]
+#[test]
+fn json_stdout_stays_clean_progress_to_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).expect("mkdir");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        eprintln!("skipping: running with privileges that ignore chmod 000");
+        return;
+    }
+
+    let output = run(&["--json", dir.path().to_str().expect("utf8 path")]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+    // stdout is valid JSON and carries none of the summary prose.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout).expect("stdout must be valid JSON");
+    assert!(
+        !stdout.contains("skipped:"),
+        "the skipped summary must not appear on stdout:\n{stdout}"
+    );
+    // The summary went to stderr instead.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skipped:"),
+        "the skipped summary must be on stderr, got:\n{stderr}"
+    );
+}
+
+/// The same stdout/stderr split as `--json`, but for the default tree report:
+/// the human report belongs on stdout, the skipped summary on stderr, and
+/// neither leaks into the other.
+#[cfg(unix)]
+#[test]
+fn tree_mode_summary_goes_to_stderr_report_stays_on_stdout() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("visible.bin"), b"hello").expect("write file");
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).expect("mkdir");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        eprintln!("skipping: running with privileges that ignore chmod 000");
+        return;
+    }
+
+    let output = run(&[dir.path().to_str().expect("utf8 path")]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+    assert!(
+        output.status.success(),
+        "a skip must not fail the scan, got {:?} with stderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("visible.bin"),
+        "the tree report belongs on stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("skipped:"),
+        "the skipped summary must not leak onto stdout:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skipped:") && stderr.contains("locked"),
+        "the skipped summary (naming the locked dir) must be on stderr, got:\n{stderr}"
+    );
+}
+
+/// A run that produces a skip but is fully piped (no tty on either stream)
+/// must not leave any spinner escape sequences behind — indicatif is
+/// expected to hide itself entirely, so stderr should hold nothing but the
+/// plain-text summary.
+#[cfg(unix)]
+#[test]
+fn piped_stderr_carries_only_the_summary_no_spinner_control_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).expect("mkdir");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        eprintln!("skipping: running with privileges that ignore chmod 000");
+        return;
+    }
+
+    let output = run(&[dir.path().to_str().expect("utf8 path")]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+    assert!(
+        !output.stderr.contains(&0x1b),
+        "a piped run's stderr must contain no ESC control bytes from the spinner, got: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skipped:"),
+        "the summary itself must still be present, got:\n{stderr}"
+    );
+}
+
+/// With more than ten skips, the default run truncates and --verbose lists
+/// every one — exercised through the real binary against genuinely
+/// unreadable directories, not the formatter in isolation.
+#[cfg(unix)]
+#[test]
+fn verbose_flag_lists_every_skip_past_the_preview_cap() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut locked_dirs = Vec::new();
+    for i in 0..11 {
+        let locked = dir.path().join(format!("locked-{i}"));
+        std::fs::create_dir(&locked).expect("mkdir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        locked_dirs.push(locked);
+    }
+
+    // Bail loudly, as in the other chmod-000 fixtures, if privileges ignore it.
+    if std::fs::read_dir(&locked_dirs[0]).is_ok() {
+        for locked in &locked_dirs {
+            std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o755))
+                .expect("restore");
+        }
+        eprintln!("skipping: running with privileges that ignore chmod 000");
+        return;
+    }
+
+    let root = dir.path().to_str().expect("utf8 path");
+    let default_output = run(&[root]);
+    let verbose_output = run(&["--verbose", root]);
+
+    for locked in &locked_dirs {
+        std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+    }
+
+    assert!(
+        default_output.status.success(),
+        "{:?}",
+        default_output.status
+    );
+    assert!(
+        verbose_output.status.success(),
+        "{:?}",
+        verbose_output.status
+    );
+
+    let default_stderr = String::from_utf8_lossy(&default_output.stderr);
+    assert!(
+        default_stderr.contains("11 entries skipped:"),
+        "the header states the true total even when truncated:\n{default_stderr}"
+    );
+    assert!(
+        default_stderr.contains("… and 1 more"),
+        "eleven skips leave exactly one out of the default preview:\n{default_stderr}"
+    );
+
+    let verbose_stderr = String::from_utf8_lossy(&verbose_output.stderr);
+    assert!(
+        !verbose_stderr.contains("more"),
+        "--verbose must elide nothing:\n{verbose_stderr}"
+    );
+    for locked in &locked_dirs {
+        let name = locked.file_name().unwrap().to_str().unwrap();
+        assert!(
+            verbose_stderr.contains(name),
+            "--verbose must list every skipped path, missing {name} in:\n{verbose_stderr}"
+        );
+    }
+}
