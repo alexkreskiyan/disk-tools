@@ -27,8 +27,11 @@ Or build without installing:
 
 ```bash
 just build                      # → target/debug/disk-tools
-cargo build --release           # → target/release/disk-tools
+just release                    # → target/release/disk-tools
 ```
+
+There are no published binaries yet — see the concept's *Distribution — deferred*
+for what packaging will involve.
 
 Requires Rust **1.85** or newer (edition 2024, pinned as `rust-version` in the
 workspace manifest).
@@ -198,6 +201,7 @@ rather than as ad-hoc commands.
 | `just` | List all recipes |
 | `just build` | `cargo build --workspace` |
 | `just run <ARGS>` | `cargo run -p disk-tools -- <ARGS>` |
+| `just release` | Optimized build for this machine (`target/release/disk-tools`) |
 | `just test` | `cargo test --workspace` |
 | `just fmt` / `just fmt-check` | `cargo fmt --all` / `--check` |
 | `just lint` | Clippy, warnings as errors |

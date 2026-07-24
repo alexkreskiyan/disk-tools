@@ -19,6 +19,20 @@ build:
 run *ARGS:
     cargo run -p disk-tools -- {{ARGS}}
 
+# Builds for the host target only. Cross-OS builds belong to a release workflow
+# (see the concept's "Distribution — deferred"), not to a local recipe: they need
+# a cross-linker per target, and CI already proves the code compiles and passes
+# on Linux, macOS and Windows.
+
+# Build the optimized binary for this machine.
+release:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release
+    echo
+    echo "binary:  $PWD/target/release/disk-tools"
+    echo "install: cargo install --path cli"
+
 # =============================================================================
 # Quality
 # =============================================================================

@@ -38,6 +38,7 @@ rather than as ad-hoc commands.
 | `just fmt` / `just fmt-check` | Format / check formatting |
 | `just verify` | Pre-commit gate: `fmt-check` + `lint` + `test` |
 | `just run <ARGS>` | Run the CLI, e.g. `just run ~/Downloads --json` |
+| `just release` | Optimized host build → `target/release/disk-tools` |
 | `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
 CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` on Linux, macOS
