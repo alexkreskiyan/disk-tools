@@ -14,6 +14,7 @@ use indicatif::ProgressBar;
 use render::json::render_json;
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
+use std::io::{self, BufWriter, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -44,24 +45,50 @@ fn main() -> ExitCode {
     let tree = scan(&options);
     spinner.finish_and_clear();
 
-    if json {
+    let report = if json {
         match render_json(&tree) {
-            Ok(payload) => println!("{payload}"),
+            Ok(payload) => payload + "\n",
             Err(err) => {
                 eprintln!("disk-tools: cannot encode JSON: {err}");
                 return ExitCode::FAILURE;
             }
         }
     } else {
-        print!("{}", render_tree(&tree, &render_options));
+        render_tree(&tree, &render_options)
+    };
+
+    if let Err(err) = write_report(&report) {
+        // `disk-tools <path> | head` closes the pipe after a few lines. For a
+        // Unix filter that is a normal end of output, not a failure — stop
+        // quietly rather than reporting an error nobody can act on.
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            return ExitCode::SUCCESS;
+        }
+        eprintln!("disk-tools: cannot write report: {err}");
+        return ExitCode::FAILURE;
     }
 
     // Always to stderr — visible on a terminal, out of a stdout pipe (so `--json`
-    // stdout stays valid JSON).
+    // stdout stays valid JSON). Errors are dropped: stderr closing (`2>&1 | head`)
+    // must not turn a successful scan into a failure, and there is nowhere left
+    // to report it anyway.
     if let Some(summary) = render_skipped(&tree.skipped, verbose) {
-        eprint!("{summary}");
+        let _ = write!(io::stderr(), "{summary}");
     }
     ExitCode::SUCCESS
+}
+
+/// Write the finished report to stdout in one buffered pass.
+///
+/// Deliberately not `print!`: those macros **panic** when the reader goes away,
+/// which is exactly what `| head` does, and they write through a `LineWriter`
+/// that flushes once per newline — one syscall per tree line, 105,000 of them on
+/// a large scan. A `BufWriter` hands the error back instead and writes in 8 KiB
+/// chunks. The explicit `flush` matters: `BufWriter`'s `Drop` swallows errors.
+fn write_report(report: &str) -> io::Result<()> {
+    let mut out = BufWriter::new(io::stdout().lock());
+    out.write_all(report.as_bytes())?;
+    out.flush()
 }
 
 /// Terminal width, or a fixed fallback when stdout is not a tty (piped output).

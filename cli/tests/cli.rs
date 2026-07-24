@@ -4,14 +4,47 @@
 //! integration tests) rather than calling into the crate, so exit codes and
 //! stderr are exercised exactly as a user would see them.
 
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_disk-tools"))
         .args(args)
         .output()
         .expect("spawn disk-tools")
+}
+
+/// Run the binary, read one small chunk of stdout, then close the pipe —
+/// exactly what `disk-tools <path> | head` does to it.
+///
+/// The fixture must be big enough that the report exceeds the OS pipe buffer
+/// (64 KiB is typical); otherwise the child writes everything before the reader
+/// goes away and the closed-pipe path is never taken.
+fn run_with_stdout_closed_early(args: &[&str]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_disk-tools"))
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn disk-tools");
+
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut buf = [0u8; 64];
+    let _ = stdout.read(&mut buf);
+    drop(stdout);
+
+    child.wait_with_output().expect("wait for disk-tools")
+}
+
+/// A directory with enough entries that the rendered report is well past any
+/// pipe buffer.
+fn many_files_dir(count: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for i in 0..count {
+        std::fs::write(dir.path().join(format!("file-{i:05}.bin")), b"x").expect("write file");
+    }
+    dir
 }
 
 #[test]
@@ -349,6 +382,48 @@ fn piped_stderr_carries_only_the_summary_no_spinner_control_bytes() {
     assert!(
         stderr.contains("skipped:"),
         "the summary itself must still be present, got:\n{stderr}"
+    );
+}
+
+/// `disk-tools <path> | head` closes stdout after a few lines. That is a normal
+/// end of output for a Unix filter, not a failure: the process must stop
+/// quietly with success instead of panicking with "failed printing to stdout:
+/// Broken pipe".
+#[test]
+fn closed_stdout_pipe_exits_quietly_instead_of_panicking() {
+    let dir = many_files_dir(3000);
+
+    let output = run_with_stdout_closed_early(&[dir.path().to_str().expect("utf8 path")]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed stdout pipe must not panic, got:\n{stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "a closed stdout pipe must exit zero, got {:?} with stderr:\n{stderr}",
+        output.status
+    );
+}
+
+/// The same for `--json`: `disk-tools <path> --json | head -c 100` must not
+/// panic either, since the JSON payload takes the same output path.
+#[test]
+fn closed_stdout_pipe_in_json_mode_exits_quietly() {
+    let dir = many_files_dir(3000);
+
+    let output = run_with_stdout_closed_early(&["--json", dir.path().to_str().expect("utf8 path")]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed stdout pipe must not panic under --json, got:\n{stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "a closed stdout pipe must exit zero under --json, got {:?} with stderr:\n{stderr}",
+        output.status
     );
 }
 

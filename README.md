@@ -149,6 +149,9 @@ apply to the tree report only.
 So `disk-tools <path> --json > out.json` yields valid JSON, and the spinner is
 suppressed entirely when stderr is not a terminal.
 
+Closing the pipe early — `disk-tools ~ | head` — is treated as a normal end of
+output: the scan stops quietly and exits `0`, like any other Unix filter.
+
 ## Benchmarks
 
 Warm cache, `hyperfine -N --warmup 5 --runs 20`, release build, output discarded.
