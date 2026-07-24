@@ -188,7 +188,6 @@ Reproduce with `just bench-fixtures <dir>` → `just bench <dir>` → `just benc
 | Hardlinks are not deduplicated on Windows | The walk yields no `(volume, file index)` identity there without an extra `open()` per file, so each link is counted separately. Unix is unaffected. |
 | `--one-file-system` does nothing on Windows | Mount-boundary detection needs a device id (`st_dev`), which the walk cannot obtain there without an extra `open()` per directory. The flag is accepted and silently has no effect off Unix. |
 | Long UNC paths may be skipped on Windows | Only `C:\`-style drive paths get the `\\?\` prefix that lifts the `MAX_PATH` limit; a `\\server\share\…` path longer than that can end up in the skipped list. |
-| Wide glyphs misalign the right edge | Name widths are counted per `char`, so CJK, emoji and combining characters push the bar column out of alignment. |
 | The whole tree is held in memory | An accepted trade-off — directory totals and the planned interactive TUI both need the full tree. Costs **≈ 630 bytes per entry**: 1.4 GB for a 2.2M-entry scan (measured, see [Benchmarks](#benchmarks)). |
 
 ## Development
@@ -206,11 +205,13 @@ rather than as ad-hoc commands.
 | `just fmt` / `just fmt-check` | `cargo fmt --all` / `--check` |
 | `just lint` | Clippy, warnings as errors |
 | `just verify` | Pre-commit gate: `fmt-check` + `lint` + `test` |
+| `just check` | `cargo check --workspace --all-targets` (CI runs it pinned to the MSRV) |
 | `just bench-fixtures <dir>` | Generate the benchmark fixtures (~28 GB) |
 | `just bench <dir>` | Benchmark against `du -sh` and `diskus` (needs `hyperfine`, `diskus`) |
 | `just bench-memory <path>` | Peak RSS of one scan |
 
-CI runs `just verify` and `just build` on Linux, macOS and Windows
+CI runs `just verify` and `just build` on Linux, macOS and Windows, plus a
+Linux job pinned to the MSRV running `just check`
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 The workspace is `disk-tools-core` (the scanning engine — no printing, no logging,

@@ -302,4 +302,34 @@ mod tests {
             sizes.allocated
         );
     }
+
+    /// Proves the Windows FFI reads a genuine *allocated* size rather than
+    /// degrading to `metadata.len()`.
+    ///
+    /// `allocated_is_block_multiple` cannot: its 10-byte file lives resident in
+    /// its MFT record, where allocated and apparent legitimately coincide, so
+    /// that test would still pass if `allocated` started returning the logical
+    /// length. A file too large to be resident (an MFT record is 1 KiB) whose
+    /// size is not a whole number of clusters must occupy strictly more than it
+    /// holds — the smallest possible NTFS cluster is 512 bytes, so 5,000 rounds
+    /// up to at least 5,120 whatever the volume was formatted with.
+    ///
+    /// The Unix counterpart is `sparse_file_allocated_less_than_apparent`,
+    /// which catches the same regression from the other direction.
+    #[cfg(windows)]
+    #[test]
+    fn allocated_exceeds_apparent_for_a_non_resident_file() {
+        const LOGICAL: usize = 5000;
+        let (_dir, path) = file_with("non-resident.bin", &vec![b'x'; LOGICAL]);
+
+        let sizes = measure_path(&path);
+
+        assert_eq!(sizes.apparent, LOGICAL as u64);
+        assert!(
+            sizes.allocated > sizes.apparent,
+            "a non-resident {LOGICAL}-byte file must occupy whole clusters, \
+             strictly more than its length, got allocated={}",
+            sizes.allocated
+        );
+    }
 }

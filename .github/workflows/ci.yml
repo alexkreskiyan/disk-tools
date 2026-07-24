@@ -41,3 +41,17 @@ jobs:
 
       - name: just build
         run: just build
+
+  # `verify` runs on stable, which happily accepts APIs stabilized after our
+  # MSRV — the manifest's `rust-version = "1.85"` would silently become a lie.
+  # One Linux job pinned to that exact toolchain keeps it honest.
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v4
+      - name: just check
+        run: just check

@@ -10,6 +10,7 @@
 
 use disk_tools_core::{ScanNode, ScanTree};
 use std::fmt::Write;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Display knobs for the tree report. Every field filters output only; the tree
 /// itself (and its totals) is untouched.
@@ -130,18 +131,36 @@ fn name_columns(width: usize) -> Option<usize> {
     width.checked_sub(fixed).filter(|&cols| cols > 0)
 }
 
-/// Fit `text` into exactly `cols` columns — pad short text, or truncate long
-/// text with a trailing `…`. Counts by character, so a multi-byte name is never
-/// split mid-codepoint.
+/// Fit `text` into exactly `cols` **terminal columns** — pad short text, or
+/// truncate long text with a trailing `…`.
+///
+/// Measured in display width, not characters: CJK and emoji take two columns
+/// each and combining marks take none, so a char count would misplace the
+/// bar/percent block against the right edge. Truncation keeps whole characters,
+/// so a name is never split mid-codepoint.
 fn fit(text: &str, cols: usize) -> String {
-    if text.chars().count() <= cols {
-        return format!("{text:<cols$}");
+    let width = UnicodeWidthStr::width(text);
+    if width <= cols {
+        return format!("{text}{}", " ".repeat(cols - width));
     }
     if cols == 0 {
         return String::new();
     }
-    let kept: String = text.chars().take(cols - 1).collect();
-    format!("{kept}…")
+    // One column goes to the ellipsis; fill the rest with whole characters.
+    let budget = cols - 1;
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > budget {
+            break;
+        }
+        kept.push(ch);
+        used += ch_width;
+    }
+    // A double-width glyph straddling the boundary is dropped rather than
+    // half-drawn, leaving a column to pad so the total still lands on `cols`.
+    format!("{kept}{}…", " ".repeat(budget - used))
 }
 
 /// The root prints its whole path (the thing the user asked to scan); every
@@ -417,7 +436,7 @@ mod tests {
         let out = render_tree(&tree(root), &opts());
         for line in lines(&out) {
             assert_eq!(
-                line.chars().count(),
+                UnicodeWidthStr::width(line),
                 80,
                 "every line must fill the width:\n{line:?}"
             );
@@ -436,10 +455,74 @@ mod tests {
             "an over-long name is truncated:\n{child}"
         );
         assert_eq!(
-            child.chars().count(),
+            UnicodeWidthStr::width(child),
             80,
             "truncation keeps the line at the width:\n{child}"
         );
+    }
+
+    /// East-Asian glyphs occupy two terminal columns each. Counting them as one
+    /// character would push the bar/percent block past the right edge — the
+    /// line would *look* longer than the terminal and wrap.
+    #[test]
+    fn wide_glyph_names_keep_lines_at_the_terminal_width() {
+        let root = dir(
+            "root",
+            3000,
+            3000,
+            vec![
+                // 12 chars, 24 columns.
+                file("root/文書ファイル名前一覧表資料", 2000, 2000),
+                file("root/ascii.txt", 1000, 1000),
+            ],
+        );
+        let out = render_tree(&tree(root), &opts());
+        for line in lines(&out) {
+            assert_eq!(
+                UnicodeWidthStr::width(line),
+                80,
+                "a wide-glyph line must still fill exactly the width:\n{line:?}"
+            );
+        }
+    }
+
+    /// The same for a name long enough to be truncated: the ellipsis must land
+    /// on the width boundary measured in columns, not characters.
+    #[test]
+    fn wide_glyph_names_are_truncated_by_column_not_by_character() {
+        let long = "root/".to_owned() + &"漢".repeat(100);
+        let root = dir("root", 1000, 1000, vec![file(&long, 1000, 1000)]);
+        let out = render_tree(&tree(root), &opts());
+
+        let child = out.lines().find(|l| l.contains('漢')).unwrap();
+        assert!(
+            child.contains('…'),
+            "an over-long name is truncated:\n{child}"
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(child),
+            80,
+            "truncating wide glyphs keeps the line at the width:\n{child}"
+        );
+    }
+
+    /// A double-width glyph that would straddle the truncation boundary is
+    /// dropped rather than half-drawn, and the gap is padded — so an odd
+    /// budget still yields an exactly-width line.
+    #[test]
+    fn a_wide_glyph_straddling_the_boundary_is_dropped_and_padded() {
+        // Budget 4 leaves 3 columns before the ellipsis: two glyphs need 4, so
+        // one is dropped and a pad space takes its place.
+        assert_eq!(fit("漢字漢字", 4), "漢 …");
+        assert_eq!(UnicodeWidthStr::width(fit("漢字漢字", 4).as_str()), 4);
+    }
+
+    /// Zero-width combining marks add no columns, so a name carrying them is
+    /// padded on its visible width rather than its character count.
+    #[test]
+    fn combining_marks_do_not_consume_columns() {
+        // "e" + U+0301 (combining acute) renders as one column, not two.
+        assert_eq!(UnicodeWidthStr::width(fit("e\u{301}", 4).as_str()), 4);
     }
 
     #[test]

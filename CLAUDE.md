@@ -37,13 +37,15 @@ rather than as ad-hoc commands.
 | `just lint` | Clippy, warnings as errors |
 | `just fmt` / `just fmt-check` | Format / check formatting |
 | `just verify` | Pre-commit gate: `fmt-check` + `lint` + `test` |
+| `just check` | `cargo check --workspace --all-targets` — CI runs it pinned to MSRV 1.85 |
 | `just run <ARGS>` | Run the CLI, e.g. `just run ~/Downloads --json` |
 | `just release` | Optimized host build → `target/release/disk-tools` |
 | `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
 CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` on Linux, macOS
-and Windows — it calls the justfile recipes rather than duplicating cargo commands,
-so a new local check added there is automatically enforced in CI.
+and Windows, plus a Linux job pinned to MSRV 1.85 running `just check`. It calls the
+justfile recipes rather than duplicating cargo commands, so a new local check added
+there is automatically enforced in CI.
 
 ## Project Structure
 
@@ -52,7 +54,7 @@ disc-tools/
 ├── Cargo.toml          # workspace: members core, cli; edition 2024, MSRV 1.85
 ├── justfile            # single entry point for local tooling
 ├── .github/workflows/
-│   └── ci.yml          # verify matrix: just verify + just build on ×3 OS
+│   └── ci.yml          # verify matrix on ×3 OS + an MSRV-pinned check job
 ├── core/               # disk-tools-core (lib) — the scanning engine
 │   ├── Cargo.toml      # rayon; serde (optional); windows-sys on Windows
 │   └── src/
@@ -63,7 +65,7 @@ disc-tools/
 │       ├── dedup.rs    # hardlink identity → lexicographically-first attribution
 │       └── tree.rs     # ScanNode / ScanTree / SkippedEntry / SkipReason + aggregation
 ├── cli/                # disk-tools (bin) — CLI frontend
-│   ├── Cargo.toml      # clap, terminal_size, serde_json, indicatif
+│   ├── Cargo.toml      # clap, terminal_size, serde_json, indicatif, unicode-width
 │   ├── src/
 │   │   ├── main.rs     # args → scan → render; spinner + skips to stderr
 │   │   ├── args.rs     # clap derive; parse_size; validate_root

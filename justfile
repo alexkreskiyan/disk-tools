@@ -53,6 +53,11 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# `--all-targets` so tests and benches are checked too — an API stabilized after
+# the MSRV is just as breaking there. CI runs this under the pinned 1.85.
+check:
+    cargo check --workspace --all-targets
+
 # CI runs this recipe on all three platforms, so anything added here is
 # enforced there too.
 
