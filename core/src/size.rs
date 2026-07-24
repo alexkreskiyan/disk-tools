@@ -3,6 +3,12 @@
 //! Two numbers per file, and the gap between them is the point of this tool:
 //! `apparent` is what `ls` shows, `allocated` is what you'd actually get back by
 //! deleting it. They diverge for sparse and compressed files.
+//!
+//! **The two are equal for ordinary files on Windows.** `st_blocks` on Unix is
+//! true allocation, rounded up to a block; `GetCompressedFileSize` is only the
+//! *compressed or sparse* size, and falls back to the logical length for
+//! everything else. Slack space is therefore invisible on Windows — see
+//! [`allocated`]'s note for what it would take to fix.
 
 use std::fs::Metadata;
 use std::io;
@@ -94,6 +100,19 @@ fn verbatim_if_long(path: &Path) -> std::borrow::Cow<'_, Path> {
 /// Windows keeps allocated size out of `Metadata` entirely, so this is the one
 /// place the crate reaches for FFI — hence the scoped `allow` against the
 /// crate-wide `deny(unsafe_code)`.
+///
+/// **Known gap.** `GetCompressedFileSize` returns the true on-disk size only
+/// for compressed and sparse files; for an ordinary file it is documented to
+/// return "the actual file size, the same as the value returned by a call to
+/// `GetFileSize`". So a 1-byte file reports 1 byte here where Unix reports a
+/// whole block, and slack space never shows up in a Windows scan.
+///
+/// The true figure is `AllocationSize`, reachable two ways, both rejected for
+/// v0.1: `GetFileInformationByHandleEx(FileStandardInfo)` needs an open handle
+/// *per file* — the exact syscall cost this module exists to avoid — while
+/// `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` yields it per
+/// directory entry, one handle per *directory*, which would fit the walk but
+/// means replacing `read_dir` on Windows with a second enumeration path.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn allocated(path: &Path, _metadata: &Metadata) -> io::Result<u64> {
@@ -268,13 +287,12 @@ mod tests {
     /// A normal file occupies whole blocks — this fails loudly if `allocated`
     /// ever degrades into returning the logical length.
     ///
-    /// The block-multiple invariant is **Unix's alone**. NTFS stores a file this
-    /// small *resident inside its MFT record*, and `GetCompressedFileSizeW` then
-    /// reports the logical length rather than a cluster multiple — CI on
-    /// `windows-latest` returns exactly 10 here. That is not a degradation: a
-    /// resident file genuinely owns no cluster of its own, so 10 is the honest
-    /// answer. Windows keeps the weaker invariant below, which still catches a
-    /// garbage reading.
+    /// The block-multiple invariant is **Unix's alone**, and not by accident:
+    /// `GetCompressedFileSize` is documented to return "the actual file size,
+    /// the same as the value returned by a call to `GetFileSize`" unless the
+    /// file is compressed or sparse. Windows therefore reports 10 here, and the
+    /// weaker assertion below is all that can be checked — see
+    /// `ordinary_windows_file_reports_allocated_equal_to_apparent`.
     #[test]
     fn allocated_is_block_multiple() {
         let (_dir, path) = file_with("small.bin", b"0123456789");
@@ -292,8 +310,8 @@ mod tests {
         #[cfg(windows)]
         assert!(
             sizes.allocated % 512 == 0 || sizes.allocated == sizes.apparent,
-            "allocated should be whole 512-byte units or — for an MFT-resident \
-             file — the logical length, got {}",
+            "allocated should be whole 512-byte units or — as Windows documents \
+             for an uncompressed file — the logical length, got {}",
             sizes.allocated
         );
         assert!(
@@ -303,33 +321,35 @@ mod tests {
         );
     }
 
-    /// Proves the Windows FFI reads a genuine *allocated* size rather than
-    /// degrading to `metadata.len()`.
+    /// Pins the documented Windows contract, so the gap it describes cannot be
+    /// mistaken for a bug later.
     ///
-    /// `allocated_is_block_multiple` cannot: its 10-byte file lives resident in
-    /// its MFT record, where allocated and apparent legitimately coincide, so
-    /// that test would still pass if `allocated` started returning the logical
-    /// length. A file too large to be resident (an MFT record is 1 KiB) whose
-    /// size is not a whole number of clusters must occupy strictly more than it
-    /// holds — the smallest possible NTFS cluster is 512 bytes, so 5,000 rounds
-    /// up to at least 5,120 whatever the volume was formatted with.
+    /// `GetCompressedFileSize` "retrieves the actual number of bytes of disk
+    /// storage used" only for compressed and sparse files; for everything else
+    /// the docs are explicit that "the value obtained is the actual file size,
+    /// the same as the value returned by a call to `GetFileSize`". So on
+    /// Windows an ordinary file's `allocated` equals its `apparent` — slack
+    /// space up to the cluster boundary is invisible, unlike Unix's
+    /// `blocks * 512`.
     ///
-    /// The Unix counterpart is `sparse_file_allocated_less_than_apparent`,
-    /// which catches the same regression from the other direction.
+    /// This is *not* a guard against `allocated` degrading into
+    /// `metadata.len()` — no such guard is possible without a sparse or
+    /// compressed fixture, which needs `DeviceIoControl` FFI. See the README's
+    /// limitations.
     #[cfg(windows)]
     #[test]
-    fn allocated_exceeds_apparent_for_a_non_resident_file() {
-        const LOGICAL: usize = 5000;
-        let (_dir, path) = file_with("non-resident.bin", &vec![b'x'; LOGICAL]);
+    fn ordinary_windows_file_reports_allocated_equal_to_apparent() {
+        const LOGICAL: usize = 5000; // not a whole number of clusters
+        let (_dir, path) = file_with("ordinary.bin", &vec![b'x'; LOGICAL]);
 
         let sizes = measure_path(&path);
 
         assert_eq!(sizes.apparent, LOGICAL as u64);
-        assert!(
-            sizes.allocated > sizes.apparent,
-            "a non-resident {LOGICAL}-byte file must occupy whole clusters, \
-             strictly more than its length, got allocated={}",
-            sizes.allocated
+        assert_eq!(
+            sizes.allocated, sizes.apparent,
+            "GetCompressedFileSize returns the logical size for an uncompressed, \
+             non-sparse file — if this ever rounds up to a cluster, the README's \
+             Windows limitation is stale and should be revisited"
         );
     }
 }

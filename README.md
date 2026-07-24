@@ -130,12 +130,12 @@ apply to the tree report only.
 
 ## How sizes are measured
 
-- **Allocated (default)** — what the file actually occupies on disk:
-  `blocks × 512` on Unix, `GetCompressedFileSizeW` on Windows. Sparse and
-  compressed files therefore report *less* than their content length, and a
-  1-byte file reports a whole block.
-  On NTFS, a file small enough to live *inside its MFT record* owns no cluster of
-  its own, and its allocated size is reported as its logical length.
+- **Allocated (default)** — what the file actually occupies on disk. On Unix
+  that is `blocks × 512`: sparse and compressed files report *less* than their
+  content length, and a 1-byte file reports a whole block. On Windows it comes
+  from `GetCompressedFileSizeW`, which is **only** the compressed or sparse size
+  — for an ordinary file it returns the logical length, so allocated equals
+  apparent there (see limitations).
 - **Apparent (`--apparent`)** — the content length, i.e. what `ls -l` shows.
 - **Hardlinks are counted once.** The shared blocks are attributed to the
   **lexicographically first** path that reaches them, so directory totals are
@@ -185,6 +185,7 @@ Reproduce with `just bench-fixtures <dir>` → `just bench <dir>` → `just benc
 | Limitation | Detail |
 |------------|--------|
 | **APFS copy-on-write clones are overcounted** | On macOS, a cloned file (`cp -c`, Finder duplicate, many build tools) shares its blocks with the original, but each copy reports its *full* allocated size. A tree of clones therefore sums well above what deleting it would actually reclaim. Detecting shared extents needs per-file `fcntl` probing and is out of scope for v0.1. |
+| **Slack space is invisible on Windows** | `GetCompressedFileSizeW` reports true on-disk size only for compressed and sparse files; [Microsoft documents](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getcompressedfilesizew) that for anything else it returns "the actual file size, the same as the value returned by a call to `GetFileSize`". So on Windows an ordinary file's allocated size equals its apparent size and never rounds up to a cluster — a tree of tiny files under-reports what deleting it would reclaim. The true figure needs `AllocationSize` from `GetFileInformationByHandleEx`, which costs a handle per file (or a rewritten directory enumeration). Unix is unaffected: `st_blocks` is real allocation. |
 | Hardlinks are not deduplicated on Windows | The walk yields no `(volume, file index)` identity there without an extra `open()` per file, so each link is counted separately. Unix is unaffected. |
 | `--one-file-system` does nothing on Windows | Mount-boundary detection needs a device id (`st_dev`), which the walk cannot obtain there without an extra `open()` per directory. The flag is accepted and silently has no effect off Unix. |
 | Long UNC paths may be skipped on Windows | Only `C:\`-style drive paths get the `\\?\` prefix that lifts the `MAX_PATH` limit; a `\\server\share\…` path longer than that can end up in the skipped list. |
