@@ -56,7 +56,7 @@ disc-tools/
 │   └── src/
 │       ├── lib.rs      # deny(unsafe_code); pub fn scan(); re-exports
 │       ├── options.rs  # ScanOptions
-│       ├── walk.rs     # read_dir + rayon::scope recursion, skip collection
+│       ├── walk.rs     # read_dir + rayon par_iter recursion, skip collection
 │       ├── size.rs     # allocated (blocks*512 | GetCompressedFileSizeW) + apparent
 │       ├── dedup.rs    # hardlink identity → lexicographically-first attribution
 │       └── tree.rs     # ScanNode / ScanTree / SkippedEntry / SkipReason + aggregation

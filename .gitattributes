@@ -1,0 +1,5 @@
+# Keep line endings LF in the repository on every platform. `cargo fmt --check`
+# (which CI runs on windows-latest) normalizes to LF, so a CRLF checkout under
+# Git for Windows' default `core.autocrlf=true` would report a diff on every
+# file. Text files are auto-detected; binaries are left alone.
+* text=auto eol=lf

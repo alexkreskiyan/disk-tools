@@ -112,7 +112,7 @@ $ disk-tools project --depth 1
 | `--min-size <SIZE>` | Hide entries below `SIZE`. Bare bytes or a 1024-based `K`/`M`/`G`/`T` suffix (`512K`, `1M`, `2G`; `KB`/`KiB` etc. also accepted) | display |
 | `--depth <N>` | Print at most `N` levels below the root | display |
 | `--apparent` | Rank and report **apparent** size instead of allocated | display |
-| `--one-file-system` | Stop at filesystem boundaries instead of descending into other mounts | scan |
+| `--one-file-system` | Stop at filesystem boundaries instead of descending into other mounts (**Unix only** — see limitations) | scan |
 | `--json` | Emit JSON instead of the tree report | display |
 | `-v`, `--verbose` | List every skipped entry instead of just the first ten | display |
 | `-h`, `--help` / `-V`, `--version` | Print help / version | — |
@@ -155,6 +155,7 @@ suppressed entirely when stderr is not a terminal.
 |------------|--------|
 | **APFS copy-on-write clones are overcounted** | On macOS, a cloned file (`cp -c`, Finder duplicate, many build tools) shares its blocks with the original, but each copy reports its *full* allocated size. A tree of clones therefore sums well above what deleting it would actually reclaim. Detecting shared extents needs per-file `fcntl` probing and is out of scope for v0.1. |
 | Hardlinks are not deduplicated on Windows | The walk yields no `(volume, file index)` identity there without an extra `open()` per file, so each link is counted separately. Unix is unaffected. |
+| `--one-file-system` does nothing on Windows | Mount-boundary detection needs a device id (`st_dev`), which the walk cannot obtain there without an extra `open()` per directory. The flag is accepted and silently has no effect off Unix. |
 | Long UNC paths may be skipped on Windows | Only `C:\`-style drive paths get the `\\?\` prefix that lifts the `MAX_PATH` limit; a `\\server\share\…` path longer than that can end up in the skipped list. |
 | Wide glyphs misalign the right edge | Name widths are counted per `char`, so CJK, emoji and combining characters push the bar column out of alignment. |
 | The whole tree is held in memory | An accepted trade-off — directory totals and the planned interactive TUI both need the full tree. Peak memory grows with the number of entries scanned. |
