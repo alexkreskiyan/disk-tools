@@ -267,6 +267,14 @@ mod tests {
 
     /// A normal file occupies whole blocks — this fails loudly if `allocated`
     /// ever degrades into returning the logical length.
+    ///
+    /// The block-multiple invariant is **Unix's alone**. NTFS stores a file this
+    /// small *resident inside its MFT record*, and `GetCompressedFileSizeW` then
+    /// reports the logical length rather than a cluster multiple — CI on
+    /// `windows-latest` returns exactly 10 here. That is not a degradation: a
+    /// resident file genuinely owns no cluster of its own, so 10 is the honest
+    /// answer. Windows keeps the weaker invariant below, which still catches a
+    /// garbage reading.
     #[test]
     fn allocated_is_block_multiple() {
         let (_dir, path) = file_with("small.bin", b"0123456789");
@@ -274,10 +282,18 @@ mod tests {
         let sizes = measure_path(&path);
 
         assert_eq!(sizes.apparent, 10);
+        #[cfg(unix)]
         assert_eq!(
             sizes.allocated % 512,
             0,
             "allocated should be a whole number of 512-byte units, got {}",
+            sizes.allocated
+        );
+        #[cfg(windows)]
+        assert!(
+            sizes.allocated % 512 == 0 || sizes.allocated == sizes.apparent,
+            "allocated should be whole 512-byte units or — for an MFT-resident \
+             file — the logical length, got {}",
             sizes.allocated
         );
         assert!(

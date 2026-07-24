@@ -131,6 +131,8 @@ apply to the tree report only.
   `blocks × 512` on Unix, `GetCompressedFileSizeW` on Windows. Sparse and
   compressed files therefore report *less* than their content length, and a
   1-byte file reports a whole block.
+  On NTFS, a file small enough to live *inside its MFT record* owns no cluster of
+  its own, and its allocated size is reported as its logical length.
 - **Apparent (`--apparent`)** — the content length, i.e. what `ls -l` shows.
 - **Hardlinks are counted once.** The shared blocks are attributed to the
   **lexicographically first** path that reaches them, so directory totals are
