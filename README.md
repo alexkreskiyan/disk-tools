@@ -168,9 +168,16 @@ Mac16,5 (16 cores, 64 GB), macOS 26.5.2, APFS. Mean ± σ over 20 runs:
 `--depth 0` is the like-for-like comparison with `du -sh`: both print one summary
 line. On that footing `disk-tools` is **1.8–2.1× faster than `du -sh`**, and it stays
 1.4–1.9× faster even while rendering the whole tree, which `du -sh` never does.
-`diskus` is 1.3–1.7× ahead on metadata-heavy trees because it accumulates one total
-and keeps nothing, where `disk-tools` builds the tree the report — and the future TUI
-— needs; on the flat media library `disk-tools` is the fastest of the three.
+The comparison with `diskus` **depends on the tree's shape and the machine's load** —
+independent reruns have put it anywhere from 1.7× ahead to slightly behind. It
+accumulates one total and keeps nothing, where `disk-tools` builds the tree that the
+report, and the planned TUI, both need.
+
+**The parallelism has a low ceiling.** Only recursion into subdirectories runs in
+parallel; the per-entry loop inside a single directory does not, and neither does
+hardlink attribution or aggregation. Measured on 16 cores: 2.1–2.7× end to end, and
+**1.08× for 50,000 files in one flat directory**. See the note below for the
+per-phase split.
 
 **Memory:** peak RSS is **≈ 630 bytes per entry** — 1.42 GB for a real 2,247,326-entry
 tree, 868 MB for a 1,400,409-entry one.
@@ -207,6 +214,7 @@ rather than as ad-hoc commands.
 | `just bench-fixtures <dir>` | Generate the benchmark fixtures (~28 GB) |
 | `just bench <dir>` | Benchmark against `du -sh` and `diskus` (needs `hyperfine`, `diskus`) |
 | `just bench-memory <path>` | Peak RSS of one scan |
+| `just bench-phases <path>` | Where a scan spends its time, by phase |
 
 CI runs `just verify` and `just build` on Linux, macOS and Windows, plus a
 Linux job pinned to the MSRV running `just check`

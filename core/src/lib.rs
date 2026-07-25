@@ -54,3 +54,64 @@ pub fn scan(options: &ScanOptions) -> ScanTree {
         skipped: walked.skipped,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Diagnostic, not an assertion: prints where `scan` spends its time.
+    ///
+    /// The three phases are private, so nothing outside this crate can time
+    /// them separately — hence a test rather than an example or a bench.
+    /// Ignored by default because it needs a real tree and asserts nothing.
+    ///
+    /// ```text
+    /// just bench-phases ~/.cargo
+    /// RAYON_NUM_THREADS=1 just bench-phases ~/.cargo   # what actually scales
+    /// ```
+    #[test]
+    #[ignore = "diagnostic: needs DT_PHASE_PATH, prints timings, asserts nothing"]
+    fn phase_split() {
+        let root = std::env::var("DT_PHASE_PATH")
+            .expect("set DT_PHASE_PATH to the tree to scan, e.g. DT_PHASE_PATH=~/.cargo");
+        let options = ScanOptions {
+            root: root.clone().into(),
+            ..ScanOptions::default()
+        };
+
+        let start = Instant::now();
+        let mut walked = walk::walk(&options);
+        let walk = start.elapsed();
+        let entries = walked.entries.len();
+
+        let start = Instant::now();
+        dedup::attribute(&mut walked.entries);
+        let dedup = start.elapsed();
+
+        let start = Instant::now();
+        let tree = tree::aggregate(walked.entries, options.root.as_path());
+        let aggregate = start.elapsed();
+
+        let total = walk + dedup + aggregate;
+        let share = |d: std::time::Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64();
+
+        println!(
+            "\n{root} — {entries} entries, {} skipped",
+            walked.skipped.len()
+        );
+        println!("  walk       {:>9.1?}  {:>5.1}%", walk, share(walk));
+        println!("  dedup      {:>9.1?}  {:>5.1}%", dedup, share(dedup));
+        println!(
+            "  aggregate  {:>9.1?}  {:>5.1}%",
+            aggregate,
+            share(aggregate)
+        );
+        println!("  total      {total:>9.1?}");
+        println!(
+            "  threads    {}\n  root total {} bytes",
+            rayon::current_num_threads(),
+            tree.allocated
+        );
+    }
+}

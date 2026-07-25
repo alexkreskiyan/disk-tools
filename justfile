@@ -106,6 +106,14 @@ bench DIR:
 # `time -l` is BSD/macOS; GNU time spells the same thing `-v`. Extra ARGS are
 # passed to disk-tools, e.g. `just bench-memory ~/Projects --depth 0`.
 
+# Prefix with RAYON_NUM_THREADS=1 to see which phases actually scale — only the
+# walk does, and only across directories.
+
+# Print where a scan of DIR spends its time, split by phase.
+bench-phases DIR:
+    DT_PHASE_PATH="{{DIR}}" cargo test --release -p disk-tools-core --lib \
+        -- --ignored --nocapture phase_split
+
 # Peak RSS of one scan of DIR (AC3 of the v0.1 spec's Task 11).
 bench-memory DIR *ARGS:
     #!/usr/bin/env bash
