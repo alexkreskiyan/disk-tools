@@ -1,16 +1,19 @@
 # disc-tools
 
-Cross-platform disk-utilities CLI in Rust, distributed as `disk-tools`. Its first
-capability is finding what eats disk space — a fast parallel scan printing a
-dust-style size-sorted tree of the largest directories and files — with cleanup,
-junk/old/duplicate detectors and a TUI planned on top of the same core.
+Cross-platform disk-utilities CLI in Rust, distributed as `disk-tools`. It finds
+what eats disk space — a fast parallel scan printing a dust-style size-sorted
+tree — and, as of v0.2, offers to clean it up: `disk-tools clean` detects
+regenerable junk and stale files and removes them **to the OS trash**, dry-run by
+default.
 
-Currently building **v0.1** (scan + tree report). See the
+**v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete.**
+Config and a TUI are planned on top of the same core. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
-[v0.1 spec](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md) is the
-authoritative task breakdown. User-facing usage, flags and the documented v0.1
-limitations live in the [README](README.md).
+[v0.1](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md) and
+[v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) specs are
+the authoritative task breakdowns. User-facing usage, flags, the safety model and
+the documented limitations live in the [README](README.md).
 
 ## Important: Documentation Requirements
 
@@ -36,16 +39,21 @@ rather than as ad-hoc commands.
 | `just test` | Run all tests (`cargo test --workspace`) |
 | `just lint` | Clippy, warnings as errors |
 | `just fmt` / `just fmt-check` | Format / check formatting |
-| `just verify` | Pre-commit gate: `fmt-check` + `lint` + `test` |
+| `just verify` | Pre-commit gate: `fmt-check` + `lint` + `doc` + `check-minimal` + `test` |
+| `just doc` | Build docs with warnings as errors — catches a public item linking to a private one, which clippy cannot see |
+| `just check-minimal` | Core without default features: proves a scan-only consumer still compiles without the trash backend |
+| `just smoke-trash` | The `#[ignore]`d tests that move real files to the OS trash, in both crates |
+| `just coverage-branch` | Nightly-only branch coverage; advisory, mirrored by a non-blocking CI job |
 | `just check` | `cargo check --workspace --all-targets` — CI runs it pinned to MSRV 1.85 |
 | `just run <ARGS>` | Run the CLI, e.g. `just run ~/Downloads --json` |
 | `just release` | Optimized host build → `target/release/disk-tools` |
 | `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` / `just bench-phases <path>` / `just bench-stat <dir>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
-CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` on Linux, macOS
-and Windows, plus a Linux job pinned to MSRV 1.85 running `just check`. It calls the
-justfile recipes rather than duplicating cargo commands, so a new local check added
-there is automatically enforced in CI.
+CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` + `just smoke-trash`
+on Linux, macOS and Windows, plus a Linux job pinned to MSRV 1.85 running
+`just check` and a non-blocking nightly branch-coverage job. It calls the justfile
+recipes rather than duplicating cargo commands, so a new local check added there
+is automatically enforced in CI.
 
 ## Project Structure
 
@@ -55,25 +63,32 @@ disc-tools/
 ├── justfile            # single entry point for local tooling
 ├── .github/workflows/
 │   └── ci.yml          # verify matrix on ×3 OS + an MSRV-pinned check job
-├── core/               # disk-tools-core (lib) — the scanning engine
-│   ├── Cargo.toml      # rayon; serde (optional); windows-sys on Windows
+├── core/               # disk-tools-core (lib) — the engine
+│   ├── Cargo.toml      # rayon; serde + trash (optional); windows-sys on Windows
 │   └── src/
 │       ├── lib.rs      # deny(unsafe_code); pub fn scan(); re-exports
 │       ├── options.rs  # ScanOptions
 │       ├── walk.rs     # read_dir + rayon par_iter recursion, skip collection
 │       ├── size.rs     # allocated (blocks*512 | GetCompressedFileSizeW) + apparent
-│       ├── dedup.rs    # hardlink identity → lexicographically-first attribution
-│       ├── tree.rs     # ScanNode / ScanTree / SkippedEntry / SkipReason + aggregation
-│       └── windows_dir.rs  # cfg(windows): AllocationSize + file id per directory
+│       ├── dedup.rs    # hardlink attribution + the link groups it finds
+│       ├── tree.rs     # ScanNode / ScanTree / SkippedEntry + aggregation
+│       ├── windows_dir.rs  # cfg(windows): AllocationSize, file id, LastWriteTime
+│       ├── paths.rs    # the path comparisons that decide what is a candidate
+│       ├── detect.rs   # the rules: four safe-list categories plus age
+│       ├── git.rs      # is there uncommitted work here?
+│       ├── clean.rs    # denylist, tiers, totals → CleanPlan. Writes nothing
+│       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
 ├── cli/                # disk-tools (bin) — CLI frontend
 │   ├── Cargo.toml      # clap, terminal_size, serde_json, indicatif, unicode-width
 │   ├── src/
-│   │   ├── main.rs     # args → scan → render; spinner + skips to stderr
-│   │   ├── args.rs     # clap derive; parse_size; validate_root
+│   │   ├── main.rs     # mode dispatch; scan/plan/apply; spinner + bar to stderr
+│   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
+│   │   ├── env.rs      # UserDirs from the environment — what the core refuses
 │   │   └── render/
 │   │       ├── mod.rs
 │   │       ├── tree.rs     # dust-style tree, parent-relative bars
 │   │       ├── json.rs     # --json (full tree, raw byte counts)
+│   │       ├── clean.rs    # the dry-run report and the apply outcome
 │   │       └── skipped.rs  # skipped-entries summary (capped at 10)
 │   └── tests/cli.rs    # integration tests
 ├── scripts/
@@ -91,11 +106,17 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 
 | Item | Where | Role |
 |------|-------|------|
-| `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs:35` | The one public entry point; runs walk → dedup → aggregate in that order |
-| `ScanOptions` | `core/src/options.rs` | `root`, `min_size`, `depth`, `apparent`, `one_file_system` — the core's whole input |
-| `ScanNode` / `ScanTree` | `core/src/tree.rs:7,48` | The result: a node carries `path`, `allocated`, `apparent`, `is_dir`, `children`; the tree adds `skipped` |
-| `SkippedEntry` / `SkipReason` | `core/src/tree.rs:40,27` | Failures returned **as data** — the core never prints |
-| `RenderOptions` | `cli/src/render/tree.rs:16` | Display-only knobs (`number`, `depth`, `min_size`, `apparent`, `width`) |
+| `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs` | Walk → dedup → aggregate, in that order |
+| `plan(&ScanTree, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | Decides what may go and what that frees. **Writes nothing** |
+| `apply(&CleanPlan, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything |
+| `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
+| `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
+| `DetectOptions` / `Detection` | `core/src/detect.rs` | The rules' input and output. `age: Option<Age>` pairs the threshold with `now` so it cannot be half-armed |
+| `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason |
+| `CleanOutcome` | `core/src/trash.rs` | `removed` / `failed` / `reclaimed` — never a `Result` |
+| `SkippedEntry` / `SkipReason` | `core/src/tree.rs` | Failures returned **as data** — the core never prints |
+| `RenderOptions` | `cli/src/render/tree.rs` | Display-only knobs |
+| `Intent` | `cli/src/render/clean.rs` | Whether the plan is a dry run or a preview — the closing line differs |
 
 Invariants worth keeping in mind:
 
@@ -111,6 +132,14 @@ Invariants worth keeping in mind:
   path and is unchanged.
 - **`deny(unsafe_code)` is exempted per function, never per module** — four
   `#[cfg(windows)]` functions, each listed in `core/src/lib.rs`.
+- **Nothing is deleted without `--apply`,** and what is deleted goes to the OS
+  trash, never `rm`. The denylist is absolute — no flag overrides it.
+- **The core reads no clock and no environment.** `now` and `UserDirs` come from
+  `cli/src/env.rs`; that is what makes every rule testable with a temp directory
+  standing in for a home.
+- **No candidate nests inside another** (`detect` never descends into a match),
+  which is what lets totals be summed and removals not repeat.
+- **Anything that really deletes is `#[ignore]`d** and run by `just smoke-trash`.
 
 ## Configuration
 
@@ -162,3 +191,5 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 
 **Benchmarks** (snapshots from `kb/benchmarks/2026.07/`)
 - [v0.1 scan performance and memory](kb/benchmarks/2026.07/2026.07.25-v0.1-scan-performance.md)
+- [What the cleanup engine costs](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) — the git guard at ~23 ms per repository
+- [The trash backend](kb/benchmarks/2026.07/2026.07.25-trash-backend.md) — 10,000 files across three platforms
