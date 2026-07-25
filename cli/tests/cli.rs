@@ -748,3 +748,42 @@ fn clean_on_a_missing_path_exits_two() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("does not exist"), "{stderr}");
 }
+
+/// `--purge` is the one path that leaves nothing to recover, so it is worth
+/// proving end to end — and it needs no `#[ignore]`, because nothing reaches the
+/// developer's Trash by definition.
+#[test]
+fn purge_removes_without_trashing_and_says_so() {
+    let dir = cleanable_dir();
+    let path = dir.path().to_str().expect("utf8 path");
+
+    let output = run(&["clean", path, "--apply", "--purge"]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    assert!(
+        !dir.path().join("node_modules").exists(),
+        "the candidate is gone"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be put back"),
+        "the user must be told before it happens:\n{stderr}"
+    );
+}
+
+#[test]
+fn purge_without_apply_is_a_usage_error() {
+    let dir = cleanable_dir();
+    let before = snapshot(dir.path());
+
+    let output = run(&["clean", dir.path().to_str().expect("utf8 path"), "--purge"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a destructive flag on its own is a usage error, got {:?}",
+        output.status
+    );
+    assert_eq!(before, snapshot(dir.path()), "and nothing was removed");
+}

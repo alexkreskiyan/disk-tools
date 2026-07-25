@@ -6,7 +6,7 @@
 //! (Task 8).
 
 use clap::{CommandFactory, Parser, Subcommand};
-use disk_tools_core::{Age, CleanOptions, DetectOptions, ScanOptions, UserDirs};
+use disk_tools_core::{Age, CleanOptions, DetectOptions, Removal, ScanOptions, UserDirs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -82,6 +82,10 @@ pub struct CleanArgs {
     #[arg(long)]
     pub apply: bool,
 
+    /// Delete outright instead of trashing. Nothing can be put back. Requires --apply.
+    #[arg(long, requires = "apply")]
+    pub purge: bool,
+
     /// Include build output whose project has uncommitted changes.
     #[arg(long = "allow-dirty")]
     pub allow_dirty: bool,
@@ -99,6 +103,7 @@ pub enum Mode {
         scan: ScanOptions,
         clean: CleanOptions,
         apply: bool,
+        removal: Removal,
     },
 }
 
@@ -132,6 +137,11 @@ impl Args {
                     allow_dirty: clean.allow_dirty,
                 },
                 apply: clean.apply,
+                removal: if clean.purge {
+                    Removal::Purge
+                } else {
+                    Removal::Trash
+                },
             }),
             None => match self.root {
                 Some(root) => Ok(Mode::Scan(ScanOptions {
@@ -445,7 +455,10 @@ mod tests {
         ])
         .expect("parse");
 
-        let Mode::Clean { scan, clean, apply } = mode else {
+        let Mode::Clean {
+            scan, clean, apply, ..
+        } = mode
+        else {
             panic!("expected the clean subcommand");
         };
         assert_eq!(scan.root, PathBuf::from("/x"));
@@ -487,6 +500,37 @@ mod tests {
     #[test]
     fn a_bare_path_is_still_a_scan() {
         assert!(matches!(resolved(&["/x"]), Ok(Mode::Scan(_))));
+    }
+
+    /// `--purge` alone would read as "prepare to delete permanently" and do
+    /// nothing, which is the worst possible reading of a destructive flag. clap
+    /// enforces the pairing so the intent has to be stated twice.
+    #[test]
+    fn purge_requires_apply() {
+        let err = parse(&["clean", "/x", "--purge"])
+            .expect_err("--purge without --apply must be a usage error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        assert!(parse(&["clean", "/x", "--purge", "--apply"]).is_ok());
+    }
+
+    #[test]
+    fn removal_defaults_to_the_trash() {
+        let mode = resolved(&["clean", "/x", "--apply"]).expect("resolve");
+        let Mode::Clean { removal, .. } = mode else {
+            panic!("expected the clean subcommand");
+        };
+        assert_eq!(
+            removal,
+            Removal::Trash,
+            "nothing becomes unrecoverable without being asked for"
+        );
+
+        let mode = resolved(&["clean", "/x", "--apply", "--purge"]).expect("resolve");
+        let Mode::Clean { removal, .. } = mode else {
+            panic!("expected the clean subcommand");
+        };
+        assert_eq!(removal, Removal::Purge);
     }
 
     #[test]

@@ -108,7 +108,7 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 |------|-------|------|
 | `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs` | Walk → dedup → aggregate, in that order |
 | `plan(&ScanTree, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | Decides what may go and what that frees. **Writes nothing** |
-| `apply(&CleanPlan, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything |
+| `apply(&CleanPlan, Removal, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. `Removal::Trash` batches; `Removal::Purge` deletes outright |
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
 | `DetectOptions` / `Detection` | `core/src/detect.rs` | The rules' input and output. `age: Option<Age>` pairs the threshold with `now` so it cannot be half-armed |
@@ -132,8 +132,13 @@ Invariants worth keeping in mind:
   path and is unchanged.
 - **`deny(unsafe_code)` is exempted per function, never per module** — four
   `#[cfg(windows)]` functions, each listed in `core/src/lib.rs`.
-- **Nothing is deleted without `--apply`,** and what is deleted goes to the OS
-  trash, never `rm`. The denylist is absolute — no flag overrides it.
+- **Nothing is deleted without `--apply`,** and the default destination is the OS
+  trash. `--purge` deletes outright — an opt-in reversal of that rule, which
+  requires `--apply` and which the report never describes as recoverable. The
+  denylist stays absolute: no flag overrides it, `--purge` included.
+- **Trashing is batched** — one backend call, not one per candidate, because on
+  macOS each is a ~230 ms `osascript` round-trip. The per-item loop survives as
+  the diagnostic path, run only when the batch reports a failure.
 - **The core reads no clock and no environment.** `now` and `UserDirs` come from
   `cli/src/env.rs`; that is what makes every rule testable with a temp directory
   standing in for a home.

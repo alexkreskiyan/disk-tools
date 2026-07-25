@@ -10,7 +10,9 @@ mod render;
 
 use args::{Args, Mode, validate_root};
 use clap::Parser;
-use disk_tools_core::{CleanOptions, CleanPlan, ScanOptions, ScanTree, Tier, apply, plan, scan};
+use disk_tools_core::{
+    CleanOptions, CleanPlan, Removal, ScanOptions, ScanTree, Tier, apply, plan, scan,
+};
 use indicatif::ProgressBar;
 use render::clean::{Intent, render_clean, render_outcome};
 use render::json::render_json;
@@ -38,7 +40,12 @@ fn main() -> ExitCode {
     // handed over. Once, at the top, so every rule sees the same "now".
     match args.resolve(SystemTime::now(), env::user_dirs()) {
         Ok(Mode::Scan(options)) => run_scan(options, json, verbose, &render_options),
-        Ok(Mode::Clean { scan, clean, apply }) => run_clean(scan, clean, apply, verbose),
+        Ok(Mode::Clean {
+            scan,
+            clean,
+            apply,
+            removal,
+        }) => run_clean(scan, clean, apply, removal, verbose),
         // clap's own formatting and exit code — a usage error looks the same
         // whether clap raised it or we did.
         Err(err) => err.exit(),
@@ -70,7 +77,13 @@ fn run_scan(
     emit(&report, &tree, verbose)
 }
 
-fn run_clean(options: ScanOptions, clean: CleanOptions, apply: bool, verbose: bool) -> ExitCode {
+fn run_clean(
+    options: ScanOptions,
+    clean: CleanOptions,
+    apply: bool,
+    removal: Removal,
+    verbose: bool,
+) -> ExitCode {
     // The git guard runs a `git status` per repository, so a tree of many
     // projects spends real time after the walk finishes.
     let Some(tree) = scan_or_report(&options, "Scanning…") else {
@@ -78,7 +91,7 @@ fn run_clean(options: ScanOptions, clean: CleanOptions, apply: bool, verbose: bo
     };
 
     if apply {
-        return remove(&plan(&tree, &clean), &tree, verbose);
+        return remove(&plan(&tree, &clean), removal, &tree, verbose);
     }
 
     let planned = plan(&tree, &clean);
@@ -101,7 +114,7 @@ fn run_clean(options: ScanOptions, clean: CleanOptions, apply: bool, verbose: bo
 /// The plan is printed **before** it is carried out, so the last thing a user
 /// sees before the removal is the list of what is about to go — the same report
 /// a dry run would have given them.
-fn remove(planned: &CleanPlan, tree: &ScanTree, verbose: bool) -> ExitCode {
+fn remove(planned: &CleanPlan, removal: Removal, tree: &ScanTree, verbose: bool) -> ExitCode {
     if planned.candidates.is_empty() {
         return emit(&render_clean(planned, None, Intent::DryRun), tree, verbose);
     }
@@ -121,14 +134,23 @@ fn remove(planned: &CleanPlan, tree: &ScanTree, verbose: bool) -> ExitCode {
         eprintln!("{confirm} of these are not regenerable — removing anyway, as asked.");
     }
 
-    // A bar rather than a spinner: the total is known, and on Windows a single
-    // candidate can take seconds (Task 1 measured 3.1 s for 10,000 files).
-    let bar = ProgressBar::new(planned.candidates.len() as u64);
-    let outcome = apply(planned, |candidate| {
-        bar.set_message(candidate.path.display().to_string());
-        bar.inc(1);
-    });
-    bar.finish_and_clear();
+    if removal == Removal::Purge {
+        // The last word before something becomes unrecoverable. `--purge` is a
+        // deliberate reversal of this tool's central promise, so it is said
+        // plainly rather than assumed understood.
+        eprintln!("Deleting outright — these will NOT go to the trash and cannot be put back.");
+    }
+
+    // A spinner, not a bar. Trashing is **one** batched call: a bar would fill
+    // instantly as the candidates were submitted and then sit still for the
+    // whole operation, which is worse than not drawing one. `--purge` is
+    // per-item and could show a bar, but two different progress shapes for one
+    // command would be its own confusion.
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_message(format!("Removing {} items…", planned.candidates.len()));
+    spinner.enable_steady_tick(Duration::from_millis(100));
+    let outcome = apply(planned, removal, |_| {});
+    spinner.finish_and_clear();
 
     // Whether the freed figure needs the same hedge the dry run's total carried:
     // a removed candidate that shares content with something outside it did not
@@ -138,7 +160,11 @@ fn remove(planned: &CleanPlan, tree: &ScanTree, verbose: bool) -> ExitCode {
         .iter()
         .any(|c| c.shared && outcome.removed.contains(&c.path));
 
-    let code = emit(&render_outcome(&outcome, shared_removed), tree, verbose);
+    let code = emit(
+        &render_outcome(&outcome, shared_removed, removal == Removal::Purge),
+        tree,
+        verbose,
+    );
     if !outcome.is_complete() {
         // A partial removal is not a success, whatever else went right.
         return ExitCode::FAILURE;

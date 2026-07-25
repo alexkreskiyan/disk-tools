@@ -128,9 +128,9 @@ Dry run — nothing was removed. Re-run with --apply.
 ```
 
 **Nothing is deleted without `--apply`.** The command above touched nothing; it
-is a report. And when you do pass `--apply`, everything goes to the **OS trash**,
-never `rm` — a cleanup tool that is wrong once should cost you a trip to the
-Trash, not your data.
+is a report. And when you do pass `--apply`, everything goes to the **OS trash**
+— a cleanup tool that is wrong once should cost you a trip to the Trash, not
+your data. (`--purge` deletes outright instead; see [below](#purge).)
 
 ### What it looks for
 
@@ -188,6 +188,29 @@ non-regenerable items is said back to you before it acts. Use `--safe` if you
 want only the regenerable ones. (The concept asks for a per-target prompt here;
 that is a v0.3 question.)
 
+### Purge
+
+The trash is not free. On macOS every removal is an `osascript` round-trip to
+Finder — **~230 ms per call**, whatever the size of what is being removed — so a
+tree of many small `__pycache__` directories used to take minutes. Removals are
+now sent in **one batch**, which brought 60 such directories from 14 s to 1.4 s.
+
+Where even that is more ceremony than the content deserves:
+
+```console
+$ disk-tools clean ~/code --apply --purge
+Deleting outright — these will NOT go to the trash and cannot be put back.
+Removed 3 of 3. Freed 2.0M.
+```
+
+**`--purge` deletes permanently.** No trash, no "Put Back", nothing to recover.
+The same 60 directories take 0.02 s.
+
+It requires `--apply` — on its own it is a usage error, so the intent has to be
+stated twice — and the report never claims anything is recoverable after it. Use
+it for build output and caches you would not miss; use the default for anything
+you would.
+
 ### Reclaimable is an upper bound
 
 A candidate holding content hardlinked from outside it does not free its full
@@ -225,6 +248,7 @@ conclude anything.
 |------|--------|
 | `--apply` | **Actually remove**, to the OS trash. Without it nothing is touched |
 | `--safe` | Offer only the `auto` tier — regenerable output, nothing needing confirmation |
+| `--purge` | Delete **permanently** instead of trashing. Nothing can be put back; requires `--apply` |
 | `--allow-dirty` | Include build output whose project has uncommitted changes. Relaxes **only** the git guard |
 | `--older-than <DURATION>` | Also offer anything untouched for this long: `90d`, `2w`, `6m`, `1y`. A bare number is rejected — `90` could mean seconds as easily as days. `m` is 30 days, `y` is 365 |
 
@@ -308,6 +332,7 @@ Cleanup, first — these are the ones worth reading before `--apply`:
 | **On Windows, one failure mode cannot be caught** | The `trash` crate calls `CoCreateInstance(...).unwrap()` on its Windows delete path. If COM cannot be initialised — a service, a session-0 process, some sandboxes — it **panics** rather than returning an error, aborting the run mid-way. No wrapper here can convert a panic, so "the summary names what survived" holds for every failure the backend *reports*, and not for that one. `just smoke-trash` runs on all three platforms in CI so a COM-hostile environment shows up as a red build. |
 | **On macOS, recoverability cannot be verified by a test** | `~/.Trash` needs Full Disk Access and the crate offers no way to list it there, so an automated test can assert only that the original path is gone — which an unrecoverable delete would also satisfy. It rests on the crate's documented behaviour and one manual check. Linux and Windows can be checked properly. |
 | **`(shared)` is not detectable across the scan boundary on Windows** | See [Reclaimable is an upper bound](#reclaimable-is-an-upper-bound). Absence of the flag there is not evidence of unshared content. |
+| **Removing to the trash costs ~230 ms per batch on macOS** | Every trash operation is an `osascript` round-trip to Finder. Removals are batched into one call, so the cost is per *run* rather than per candidate — 60 small directories take 1.4 s, against 0.02 s for `--purge`. |
 | **A dry run costs ~23 ms per repository** | The git guard spawns `git status --porcelain` once per repository. Over 50 dirty Rust projects a `clean` is 1.2 s against 15 ms for a plain scan — 80×. `--allow-dirty` skips it entirely and is free. [Measured.](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) |
 | **`--apply` does not prompt per target** | Even for the `confirm` tier. See [Removing](#removing). |
 

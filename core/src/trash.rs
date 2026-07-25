@@ -1,13 +1,17 @@
-//! Removing things, recoverably.
+//! Removing things.
 //!
-//! Everything this crate deletes goes to the **OS trash**, never `rm`. A cleanup
-//! tool that is wrong once should cost its user a trip to the Trash, not their
-//! data — so the recoverable operation is the only one offered.
+//! **The default is the OS trash**, and that is the whole safety argument: a
+//! cleanup tool that is wrong once should cost its user a trip to the Trash, not
+//! their data. [`Removal::Purge`] deletes outright and exists because the trash
+//! is not free — on macOS it is an `osascript` round-trip to Finder, ~230 ms per
+//! call — but it is opt-in, never a default, and the frontend says plainly that
+//! nothing purged can be put back.
 //!
 //! Failures travel as data, the way [`crate::ScanTree::skipped`] does: one path
-//! that cannot be trashed must not abort the rest, and the caller needs to know
+//! that cannot be removed must not abort the rest, and the caller needs to know
 //! precisely what survived. The `Result` here is therefore a *per-item* outcome,
-//! not an error to propagate.
+//! not an error to propagate — which is why the batched fast path falls back to
+//! a per-item loop the moment anything goes wrong.
 //!
 //! This is the only module that needs the `trash` crate, which is why it is the
 //! only one behind the feature. Deciding *what* to remove ([`crate::clean`])
@@ -80,26 +84,115 @@ impl CleanOutcome {
     }
 }
 
-/// Move every candidate in `plan` to the trash.
+/// How thoroughly to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Removal {
+    /// To the OS trash, recoverable. The default, and what every other document
+    /// here describes.
+    #[default]
+    Trash,
+
+    /// Deleted outright. **Nothing to put back.**
+    ///
+    /// This exists because the trash is not free: on macOS it is an `osascript`
+    /// round-trip to Finder, measured at ~230 ms *per call*, which a tree of
+    /// many small `__pycache__` directories turns into minutes. Batching fixed
+    /// most of that; this is for the case where even a recoverable delete is
+    /// more ceremony than the content deserves.
+    ///
+    /// It is a deliberate reversal of the project's founding rule and the
+    /// frontend is expected to say so plainly — see `--purge`.
+    Purge,
+}
+
+/// Move every candidate in `plan` to the trash, or delete it outright.
 ///
 /// **The only function in this project that removes anything.**
+pub fn apply(plan: &CleanPlan, removal: Removal, progress: impl FnMut(&Candidate)) -> CleanOutcome {
+    match removal {
+        Removal::Trash => apply_batched(plan, progress),
+        Removal::Purge => apply_with(plan, progress, purge),
+    }
+}
+
+/// Trash everything in one call, and only fall back to one-at-a-time to find out
+/// who failed.
 ///
-/// Never stops early: a path that cannot be trashed is recorded and the rest
-/// proceed. The concept's rule is that there is no partial *silent* delete — a
-/// partial delete is fine, so long as the caller is told precisely what moved.
+/// `trash::delete` *is* `delete_all(&[path])`, so removing candidates one by one
+/// paid a full backend round-trip each — on macOS an `osascript` invocation to
+/// Finder, ~230 ms, whatever the size of what was being removed. Sixty tiny
+/// directories took 14 seconds; the same content in one call is a fraction of a
+/// second.
 ///
-/// `progress` is called once per candidate, before it is attempted, because the
-/// core neither logs nor prints and this is the only way it can say where it is.
-/// **Per candidate is as fine as it gets:** the backend reports no per-file
-/// completion, so a percentage inside one tree is not obtainable — and on
-/// Windows one tree can take seconds (Task 1 measured 3.1 s for 10,000 files),
-/// which is exactly long enough for a user to conclude the tool has hung.
-///
-/// Candidates are taken in plan order, which [`crate::plan`] sorted and which
-/// contains no candidate inside another — so nothing is removed twice, and no
-/// parent goes before a child it contains.
-pub fn apply(plan: &CleanPlan, progress: impl FnMut(&Candidate)) -> CleanOutcome {
-    apply_with(plan, progress, move_to_trash)
+/// The batch gives back **one** result for the whole set, which cannot satisfy
+/// [`CleanOutcome`]'s promise to name what survived. So the batch is the fast
+/// path and the per-item loop is the diagnostic one: it runs only when something
+/// went wrong, when being slow no longer matters and being precise does.
+fn apply_batched(plan: &CleanPlan, mut progress: impl FnMut(&Candidate)) -> CleanOutcome {
+    let mut attempting: Vec<&Candidate> = Vec::new();
+    for candidate in &plan.candidates {
+        progress(candidate);
+        // Defensive, as in `apply_with`: a candidate inside one already accepted
+        // would go with its parent, and submitting both invites the backend to
+        // report a failure for something that is in fact gone.
+        let accepted: Vec<PathBuf> = attempting.iter().map(|c| c.path.clone()).collect();
+        if already_gone(&candidate.path, &accepted) {
+            continue;
+        }
+        attempting.push(candidate);
+    }
+
+    if attempting.is_empty() {
+        return CleanOutcome::default();
+    }
+
+    let paths: Vec<&Path> = attempting.iter().map(|c| c.path.as_path()).collect();
+    if trash::delete_all(&paths).is_ok() {
+        return CleanOutcome {
+            removed: attempting.iter().map(|c| c.path.clone()).collect(),
+            failed: Vec::new(),
+            reclaimed: attempting.iter().map(|c| c.allocated).sum(),
+        };
+    }
+
+    // Something in the batch failed and the backend will not say what. Ask again,
+    // one at a time, so the report can name it. Whatever the first call already
+    // removed now answers "not found", which is a failure this loop records —
+    // pessimistic, and the safe direction: it claims less was removed than may
+    // have been, never more.
+    let mut outcome = CleanOutcome::default();
+    for candidate in attempting {
+        match move_to_trash(&candidate.path) {
+            Ok(()) => {
+                outcome.removed.push(candidate.path.clone());
+                outcome.reclaimed += candidate.allocated;
+            }
+            Err(failure) => outcome.failed.push(failure),
+        }
+    }
+    outcome
+}
+
+/// Delete `path` outright, with no trash and no way back.
+fn purge(path: &Path) -> Result<(), TrashFailure> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|err| TrashFailure {
+        path: path.to_path_buf(),
+        reason: err.to_string(),
+    })?;
+
+    // `remove_dir_all` follows no symlinks, but it also refuses a symlink *to* a
+    // directory — so the two cases are told apart by the link's own metadata,
+    // never by the target's.
+    let removed = if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+
+    removed.map_err(|err| TrashFailure {
+        path: path.to_path_buf(),
+        reason: err.to_string(),
+    })
 }
 
 /// The body of [`apply`], with the removal itself as a parameter.
@@ -218,7 +311,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let plan = doomed_plan(dir.path());
 
-        let outcome = apply(&plan, |_| {});
+        let outcome = apply(&plan, Removal::Trash, |_| {});
 
         assert_eq!(
             outcome.failed.len(),
@@ -237,7 +330,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let plan = doomed_plan(dir.path());
 
-        let outcome = apply(&plan, |_| {});
+        let outcome = apply(&plan, Removal::Trash, |_| {});
 
         let named: Vec<&PathBuf> = outcome.failed.iter().map(|f| &f.path).collect();
         assert_eq!(
@@ -261,7 +354,7 @@ mod tests {
         let plan = doomed_plan(dir.path());
         assert_eq!(plan.reclaimable, 3072, "the plan expected to free 3 KiB");
 
-        let outcome = apply(&plan, |_| {});
+        let outcome = apply(&plan, Removal::Trash, |_| {});
 
         assert_eq!(
             outcome.reclaimed, 0,
@@ -278,7 +371,9 @@ mod tests {
         let plan = doomed_plan(dir.path());
         let mut seen = Vec::new();
 
-        apply(&plan, |candidate| seen.push(candidate.path.clone()));
+        apply(&plan, Removal::Trash, |candidate| {
+            seen.push(candidate.path.clone())
+        });
 
         assert_eq!(
             seen,
@@ -390,6 +485,77 @@ mod tests {
         );
     }
 
+    // ---- purge -----------------------------------------------------------
+
+    /// `--purge` is the one path with no way back, so what it removes and what
+    /// it leaves are both worth asserting. Uses real files, which is safe here
+    /// precisely *because* nothing goes to the trash — a tempdir is destroyed
+    /// either way.
+    #[test]
+    fn purge_deletes_outright_and_touches_nothing_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let doomed_dir = dir.path().join("__pycache__");
+        let doomed_file = dir.path().join("stale.pyc");
+        let keeper = dir.path().join("src.py");
+        std::fs::create_dir(&doomed_dir).expect("mkdir");
+        std::fs::write(doomed_dir.join("m.pyc"), b"bytecode").expect("write");
+        std::fs::write(&doomed_file, b"bytecode").expect("write");
+        std::fs::write(&keeper, b"source").expect("write");
+
+        let plan = plan_of(vec![
+            candidate(doomed_dir.to_str().expect("utf8"), 4096),
+            candidate(doomed_file.to_str().expect("utf8"), 1024),
+        ]);
+
+        let outcome = apply(&plan, Removal::Purge, |_| {});
+
+        assert!(outcome.is_complete(), "{:?}", outcome.failed);
+        assert!(!doomed_dir.exists(), "a directory goes with its contents");
+        assert!(!doomed_file.exists(), "and so does a file");
+        assert!(keeper.exists(), "nothing outside the plan is touched");
+        assert_eq!(outcome.reclaimed, 5120);
+    }
+
+    /// A purge that cannot happen is still reported as data, not a panic — the
+    /// same contract the trash path keeps.
+    #[test]
+    fn a_purge_failure_is_reported_per_item() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = doomed_plan(dir.path());
+
+        let outcome = apply(&plan, Removal::Purge, |_| {});
+
+        assert_eq!(outcome.failed.len(), 2, "{:?}", outcome.failed);
+        assert!(outcome.removed.is_empty());
+        assert_eq!(outcome.reclaimed, 0);
+    }
+
+    /// A symlink is removed as a link, never followed — deleting what it points
+    /// at would take something the plan never named.
+    #[cfg(unix)]
+    #[test]
+    fn purging_a_symlink_leaves_its_target_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("real");
+        std::fs::create_dir(&target).expect("mkdir");
+        std::fs::write(target.join("keep.txt"), b"precious").expect("write");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let outcome = apply(
+            &plan_of(vec![candidate(link.to_str().expect("utf8"), 64)]),
+            Removal::Purge,
+            |_| {},
+        );
+
+        assert!(outcome.is_complete(), "{:?}", outcome.failed);
+        assert!(!link.exists(), "the link itself is gone");
+        assert!(
+            target.join("keep.txt").exists(),
+            "but what it pointed at is untouched"
+        );
+    }
+
     /// The guard that stops a child being blamed for its parent's success.
     ///
     /// Driven directly, with no filesystem and no trash: the branch it protects
@@ -426,7 +592,7 @@ mod tests {
     fn an_empty_plan_removes_nothing_and_succeeds() {
         let mut fired = 0;
 
-        let outcome = apply(&plan_of(Vec::new()), |_| fired += 1);
+        let outcome = apply(&plan_of(Vec::new()), Removal::Trash, |_| fired += 1);
 
         assert_eq!(outcome, CleanOutcome::default());
         assert!(outcome.is_complete(), "nothing to do is not a failure");
@@ -452,7 +618,7 @@ mod tests {
             candidate(second.to_str().expect("utf8"), 8192),
         ]);
 
-        let outcome = apply(&plan, |_| {});
+        let outcome = apply(&plan, Removal::Trash, |_| {});
 
         if !outcome.is_complete() {
             eprintln!(

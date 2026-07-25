@@ -44,7 +44,7 @@ pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, Tie
 pub use detect::{Age, Category, CategorySet, DetectOptions, Detection, UserDirs, detect};
 pub use options::ScanOptions;
 #[cfg(feature = "trash")]
-pub use trash::{CleanOutcome, TrashFailure, apply, move_to_trash};
+pub use trash::{CleanOutcome, Removal, TrashFailure, apply, move_to_trash};
 pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
 
 /// Scan `options.root` and return a size-annotated tree plus whatever was

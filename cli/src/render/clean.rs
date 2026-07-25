@@ -78,7 +78,7 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
 /// delete is acceptable; leaving the user to guess which half happened is not.
 /// So a failure names its path and what the OS said, and the closing line states
 /// plainly that something is still there.
-pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool) -> String {
+pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, purged: bool) -> String {
     let mut out = String::new();
     let attempted = outcome.removed.len() + outcome.failed.len();
 
@@ -125,7 +125,7 @@ pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool) -> String {
     // sitting directly under the failure list, reads as promising exactly the
     // items that are *not* in the trash. This is the sentence a user reads to
     // find out whether their work survived.
-    if !outcome.removed.is_empty() {
+    if !outcome.removed.is_empty() && !purged {
         let removed = outcome.removed.len();
         let (noun, verb) = if removed == 1 {
             ("candidate", "is")
@@ -492,7 +492,7 @@ mod outcome_tests {
             reclaimed: 2048,
         };
 
-        let report = render_outcome(&outcome, false);
+        let report = render_outcome(&outcome, false, false);
 
         assert!(report.contains("Removed 1 of 1"), "{report}");
         assert!(report.contains("Freed 2.0K"), "{report}");
@@ -513,7 +513,7 @@ mod outcome_tests {
             reclaimed: 0,
         };
 
-        let report = render_outcome(&outcome, false);
+        let report = render_outcome(&outcome, false, false);
 
         assert!(report.contains("Removed nothing."), "{report}");
         assert!(report.contains("2 candidates still on disk"), "{report}");
@@ -534,7 +534,7 @@ mod outcome_tests {
             reclaimed: 1024,
         };
 
-        let report = render_outcome(&outcome, false);
+        let report = render_outcome(&outcome, false, false);
 
         assert!(report.contains("1 candidate still on disk"), "{report}");
         assert!(
@@ -559,12 +559,12 @@ mod outcome_tests {
         };
 
         assert!(
-            render_outcome(&outcome, true).contains("Freed at most 4.0K"),
+            render_outcome(&outcome, true, false).contains("Freed at most 4.0K"),
             "{}",
-            render_outcome(&outcome, true)
+            render_outcome(&outcome, true, false)
         );
         assert!(
-            render_outcome(&outcome, false).contains("Freed 4.0K"),
+            render_outcome(&outcome, false, false).contains("Freed 4.0K"),
             "and without sharing the figure is exact"
         );
     }
@@ -578,7 +578,7 @@ mod outcome_tests {
         };
 
         assert!(
-            render_outcome(&outcome, false).contains("1 candidate still on disk"),
+            render_outcome(&outcome, false, false).contains("1 candidate still on disk"),
             "not `1 candidates`"
         );
     }
@@ -637,6 +637,50 @@ mod intent_tests {
 
         assert!(
             report.contains("Dry run — nothing was removed. Re-run with --apply."),
+            "{report}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+    use disk_tools_core::TrashFailure;
+    use std::path::PathBuf;
+
+    fn partial() -> CleanOutcome {
+        CleanOutcome {
+            removed: vec![PathBuf::from("/p/gone")],
+            failed: vec![TrashFailure {
+                path: PathBuf::from("/p/stuck"),
+                reason: "Permission denied".to_owned(),
+            }],
+            reclaimed: 1024,
+        }
+    }
+
+    /// The recoverability line is the whole difference between the two modes,
+    /// and after `--purge` it would be a plain lie: there is nothing in the
+    /// trash to put back.
+    #[test]
+    fn a_purged_run_never_claims_anything_can_be_put_back() {
+        let report = render_outcome(&partial(), false, true);
+
+        assert!(report.contains("1 candidate still on disk"), "{report}");
+        assert!(
+            !report.contains("trash") && !report.contains("put back"),
+            "nothing was trashed, so nothing may be described as recoverable: {report}"
+        );
+    }
+
+    /// And the trashing run still says it — the guard must not have silenced
+    /// both.
+    #[test]
+    fn a_trashed_run_still_says_what_can_be_put_back() {
+        let report = render_outcome(&partial(), false, false);
+
+        assert!(
+            report.contains("in the trash and can be put back"),
             "{report}"
         );
     }
