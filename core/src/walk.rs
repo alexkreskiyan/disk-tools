@@ -8,6 +8,8 @@ use crate::ScanOptions;
 use crate::size;
 use crate::tree::{SkipReason, SkippedEntry};
 use rayon::prelude::*;
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,12 +17,42 @@ use std::path::{Path, PathBuf};
 /// What identifies a file on disk, so two paths pointing at the same bytes can
 /// be recognised as one. Consumed by the dedup pass.
 ///
-/// Unix-only for now — `(st_dev, st_ino)`. Windows cannot supply an equivalent
-/// from a directory listing; see [`file_id`].
+/// `(st_dev, st_ino)` on Unix; `(volume serial, file id)` on Windows, where both
+/// halves come from the directory handle in [`crate::windows_dir`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FileId {
-    device: u64,
-    inode: u64,
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// What a directory listing can say about one entry that `Metadata` cannot.
+///
+/// Windows-only in practice: `Metadata` there carries neither the allocated size
+/// nor a file identity, and both are available for a whole directory from one
+/// handle. Unix needs none of this — `st_blocks` and `(dev, ino)` are already in
+/// the `Metadata` the walk has in hand.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EntryFacts {
+    pub allocated: u64,
+    pub apparent: u64,
+    pub id: FileId,
+}
+
+/// Everything a single directory listing revealed, keyed by file name.
+type DirFacts = HashMap<OsString, EntryFacts>;
+
+/// Read the per-entry facts for `dir` in one pass.
+///
+/// Empty on Unix: the walk already holds richer `Metadata` per entry, so there
+/// is nothing to add and nothing to pay for (`HashMap::new` does not allocate).
+#[cfg(windows)]
+fn dir_facts(dir: &Path) -> DirFacts {
+    crate::windows_dir::facts(dir)
+}
+
+#[cfg(not(windows))]
+fn dir_facts(_dir: &Path) -> DirFacts {
+    DirFacts::new()
 }
 
 /// One thing the walk found, before dedup attribution or aggregation.
@@ -76,7 +108,9 @@ pub(crate) fn walk(options: &ScanOptions) -> Walked {
         Err(err) => return Walked::skip(root, &err),
     };
 
-    let mut walked = match entry_for(root, &metadata) {
+    // The root has no containing listing to consult, so it takes the per-file
+    // path; it is one entry, and a directory's own size is a single block.
+    let mut walked = match entry_for(root, &metadata, None) {
         Ok(entry) => Walked {
             entries: vec![entry],
             skipped: Vec::new(),
@@ -100,6 +134,11 @@ fn walk_dir(dir: &Path, root_device: Option<u64>, options: &ScanOptions) -> Walk
         Ok(listing) => listing,
         Err(err) => return Walked::skip(dir, &err),
     };
+
+    // One directory handle answers, for every entry at once, what `Metadata`
+    // can't say on Windows: the allocated size and the file identity. Empty on
+    // Unix, where the per-entry metadata already carries both.
+    let facts = dir_facts(dir);
 
     let mut walked = Walked::default();
     let mut subdirs = Vec::new();
@@ -146,7 +185,7 @@ fn walk_dir(dir: &Path, root_device: Option<u64>, options: &ScanOptions) -> Walk
             continue;
         }
 
-        match entry_for(&path, &metadata) {
+        match entry_for(&path, &metadata, facts.get(&entry.file_name())) {
             Ok(entry) => {
                 // Descend only into a directory we could actually record. If its
                 // own measurement fails it becomes the single skip below;
@@ -175,17 +214,32 @@ fn walk_dir(dir: &Path, root_device: Option<u64>, options: &ScanOptions) -> Walk
     walked
 }
 
-fn entry_for(path: &Path, metadata: &Metadata) -> io::Result<WalkEntry> {
-    let sizes = size::measure(path, metadata)?;
+/// Build the entry, preferring what the directory listing already told us.
+///
+/// `facts` is `Some` only on Windows, and only for entries the listing covered —
+/// a file created between the listing and this call falls back to the per-file
+/// path, which is also the only path Unix ever takes.
+fn entry_for(
+    path: &Path,
+    metadata: &Metadata,
+    facts: Option<&EntryFacts>,
+) -> io::Result<WalkEntry> {
     let is_dir = metadata.is_dir();
+    let (allocated, apparent, id) = match facts {
+        Some(facts) => (facts.allocated, facts.apparent, Some(facts.id)),
+        None => {
+            let sizes = size::measure(path, metadata)?;
+            (sizes.allocated, sizes.apparent, file_id(metadata))
+        }
+    };
 
     Ok(WalkEntry {
         path: path.to_path_buf(),
-        allocated: sizes.allocated,
-        apparent: sizes.apparent,
+        allocated,
+        apparent,
         is_dir,
         // Directories can't be hardlinked, so an identity would never be used.
-        id: if is_dir { None } else { file_id(metadata) },
+        id: if is_dir { None } else { id },
     })
 }
 
@@ -282,6 +336,73 @@ mod tests {
             .filter(|e| !e.is_dir)
             .map(|e| &e.path)
             .collect()
+    }
+
+    /// The directory listing supplies a real `AllocationSize`, so a file whose
+    /// length is not a whole number of clusters must report **more** than it
+    /// holds. This is precisely what `GetCompressedFileSize` could not see: it
+    /// returns the logical length for an uncompressed file, which is why
+    /// `size::allocated` — still the fallback — reports 5,000 here.
+    ///
+    /// 5,000 bytes is deliberately past the ~1 KiB MFT record: a file small
+    /// enough to be *resident* has no cluster of its own and NTFS reports
+    /// `AllocationSize` 0 for it, which is honest but useless as a signal.
+    #[cfg(windows)]
+    #[test]
+    fn windows_allocated_comes_from_the_directory_listing() {
+        const LOGICAL: usize = 5000;
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("chunky.bin"), LOGICAL);
+
+        let walked = walk(&opts(dir.path()));
+        let file = walked
+            .entries
+            .iter()
+            .find(|e| e.path.ends_with("chunky.bin"))
+            .expect("the file was walked");
+
+        assert_eq!(file.apparent, LOGICAL as u64);
+        assert!(
+            file.allocated > file.apparent,
+            "a non-resident {LOGICAL}-byte file occupies whole clusters, so more \
+             than its length — got allocated={}",
+            file.allocated
+        );
+        assert_eq!(
+            file.allocated % 512,
+            0,
+            "AllocationSize is a multiple of the cluster size, got {}",
+            file.allocated
+        );
+    }
+
+    /// Windows entries now carry an identity — `(volume serial, file id)` from
+    /// the same listing — so the dedup pass can recognise two names for one
+    /// file. Before this, `file_id` returned `None` there and hardlinks were
+    /// counted once per link.
+    #[cfg(windows)]
+    #[test]
+    fn windows_hardlinks_share_an_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original = dir.path().join("original.bin");
+        write(&original, 5000);
+        let link = dir.path().join("link.bin");
+        if fs::hard_link(&original, &link).is_err() {
+            eprintln!("skipping: this filesystem does not support hard links");
+            return;
+        }
+
+        let walked = walk(&opts(dir.path()));
+        let ids: Vec<Option<FileId>> = walked
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.id)
+            .collect();
+
+        assert_eq!(ids.len(), 2, "both names are walked");
+        assert!(ids[0].is_some(), "Windows entries now carry an identity");
+        assert_eq!(ids[0], ids[1], "two links to one file share an identity");
     }
 
     #[test]

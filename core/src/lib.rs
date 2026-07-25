@@ -7,12 +7,23 @@
 //! The core also knows nothing about config files, config paths or terminals —
 //! it is driven entirely by an explicit [`ScanOptions`].
 
-// `deny` rather than `forbid`: Windows exposes no safe way to read a file's
-// allocated size, so `size::allocated` must call `GetCompressedFileSizeW`
-// through FFI. `forbid` cannot be lifted by an `#[allow]` — that is the whole
-// difference between the two — so the crate denies `unsafe` and that single
-// function opts out explicitly. Everywhere else, including all of Unix, this
-// still fails the build.
+// `deny` rather than `forbid`: Windows exposes neither a file's allocated size
+// nor its identity through anything safe, so both must come through FFI.
+// `forbid` cannot be lifted by an `#[allow]` — that is the whole difference
+// between the two — so the crate denies `unsafe` and the functions that need it
+// opt out one at a time, never a whole module.
+//
+// The exemptions, all `#[cfg(windows)]`:
+//   size::allocated              GetCompressedFileSizeW  — per-file fallback
+//   windows_dir::read_facts      GetFileInformationByHandleEx
+//   windows_dir::collect_batch   walking that call's output buffer
+//   windows_dir::volume_serial   GetFileInformationByHandle
+//
+// Everywhere else, including all of Unix, `unsafe` still fails the build. Any
+// further exemption deserves the same scrutiny these got — the buffer walk in
+// particular is the only one doing pointer arithmetic rather than a single call,
+// and is bounds-checked against the capacity we passed in rather than trusting
+// the OS to stay inside it.
 #![deny(unsafe_code)]
 
 mod dedup;
@@ -20,6 +31,8 @@ mod options;
 mod size;
 mod tree;
 mod walk;
+#[cfg(windows)]
+mod windows_dir;
 
 pub use options::ScanOptions;
 pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
