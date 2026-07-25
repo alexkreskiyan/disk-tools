@@ -93,6 +93,10 @@ pub struct CleanArgs {
     #[arg(long = "allow-dirty")]
     pub allow_dirty: bool,
 
+    /// Ignore anything smaller than this, e.g. 1M, 512K (1024-based).
+    #[arg(long = "min-size", default_value = "0", value_parser = parse_size)]
+    pub min_size: u64,
+
     /// Also offer anything untouched for this long: 90d, 6m, 1y.
     #[arg(long = "older-than", value_parser = parse_duration, value_name = "DURATION")]
     pub older_than: Option<Duration>,
@@ -153,6 +157,7 @@ impl Args {
                     },
                     safe_only: clean.safe,
                     allow_dirty: clean.allow_dirty,
+                    min_size: clean.min_size,
                 },
                 apply: clean.apply,
                 removal: if clean.purge {

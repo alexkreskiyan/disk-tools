@@ -126,6 +126,14 @@ pub struct CleanPlan {
     /// far the most expensive thing here (measured at ~23 ms per repository).
     /// A count is what was wanted; a count is what this is.
     pub filtered_out: usize,
+
+    /// How many candidates fell below [`CleanOptions::min_size`].
+    ///
+    /// Counted separately from `filtered_out` because the two are different
+    /// answers to "why is it not here": one needs confirmation, the other is
+    /// small. Merging them would let the report offer `--safe` as the remedy for
+    /// something `--safe` had nothing to do with.
+    pub too_small: usize,
 }
 
 /// Everything a cleanup needs to know.
@@ -140,6 +148,18 @@ pub struct CleanOptions {
 
     /// `--allow-dirty`: relax the git guard. **Never** the denylist.
     pub allow_dirty: bool,
+
+    /// `--min-size`: do not offer anything smaller than this.
+    ///
+    /// **Unlike the scan's flag of the same name, this narrows the plan itself**
+    /// rather than only the printout. It has to: the cleanup report is not a
+    /// view of a tree, it is the list of what `--apply` will remove, and a report
+    /// showing two entries while the removal takes a hundred and fifty is the
+    /// exact mismatch every other rule here exists to prevent.
+    ///
+    /// `reclaimable` therefore drops with it, which is correct — it is what
+    /// *would* be freed, not what might have been.
+    pub min_size: u64,
 }
 
 /// Decide what could be removed, and what that would free.
@@ -173,6 +193,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
     let mut candidates = Vec::new();
     let mut excluded = Vec::new();
     let mut filtered_out = 0;
+    let mut too_small = 0;
     // One `git status` per repository, not per candidate: a tree of sibling
     // Rust projects would otherwise spawn a process for each, and a workspace
     // whose members share a repository would ask the same question repeatedly.
@@ -192,6 +213,13 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
                 path: detection.path,
                 reason: ExcludeReason::DirtyRepo,
             });
+            continue;
+        }
+
+        // The user's own narrowings, both after the refusals above so that a
+        // denied or guarded path is still reported as such.
+        if detection.allocated < options.min_size {
+            too_small += 1;
             continue;
         }
 
@@ -233,6 +261,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
         reclaimable,
         excluded,
         filtered_out,
+        too_small,
     }
 }
 
@@ -1016,6 +1045,81 @@ mod tests {
             safe.filtered_out, 2,
             "and the two confirm-tier ones are counted, not silently gone"
         );
+    }
+
+    /// The flag exists because a real run produced 151 candidates of which 150
+    /// were tiny `__pycache__` directories inside one virtualenv — a report a
+    /// user is meant to read before deleting, 99% of which said nothing.
+    ///
+    /// Unlike the scan's flag of the same name, this narrows **the plan**, not
+    /// the printout: what is shown is what `--apply` removes, and the total
+    /// moves with it.
+    #[test]
+    fn min_size_narrows_the_plan_and_the_total() {
+        let fixture = tree(dir(
+            "/p",
+            vec![
+                dir(
+                    "/p/big",
+                    vec![dir(
+                        "/p/big/node_modules",
+                        vec![file("/p/big/node_modules/lib.bin", 2_000_000)],
+                    )],
+                ),
+                dir("/p/small", vec![dir("/p/small/__pycache__", vec![])]),
+            ],
+        ));
+
+        let everything = plan(&fixture, &opts());
+        assert_eq!(everything.candidates.len(), 2);
+        assert_eq!(everything.too_small, 0, "no threshold, nothing below it");
+
+        let filtered = plan(
+            &fixture,
+            &CleanOptions {
+                min_size: 1_048_576,
+                ..opts()
+            },
+        );
+
+        assert_eq!(paths(&filtered), vec![Path::new("/p/big/node_modules")]);
+        assert_eq!(filtered.too_small, 1, "and the one dropped is counted");
+        assert_eq!(
+            filtered.reclaimable,
+            filtered.candidates.iter().map(|c| c.allocated).sum::<u64>(),
+            "the total is what would actually be removed, not what might have been"
+        );
+        assert!(filtered.reclaimable < everything.reclaimable);
+    }
+
+    /// The two narrowings are counted apart, because the remedy differs: one is
+    /// answered by dropping `--safe`, the other by lowering `--min-size`.
+    #[test]
+    fn the_two_user_filters_are_counted_separately() {
+        let fixture = tree(dir(
+            "/p",
+            vec![
+                dir(
+                    "/p/node_modules",
+                    vec![file("/p/node_modules/x.bin", 2_000_000)],
+                ),
+                aged(file("/p/ancient.bin", 2_000_000), 900 * DAY),
+                dir("/p/tiny", vec![dir("/p/tiny/__pycache__", vec![])]),
+            ],
+        ));
+
+        let plan = plan(
+            &fixture,
+            &CleanOptions {
+                safe_only: true,
+                min_size: 1_048_576,
+                ..aging(90 * DAY)
+            },
+        );
+
+        assert_eq!(paths(&plan), vec![Path::new("/p/node_modules")]);
+        assert_eq!(plan.filtered_out, 1, "the aged one needed confirmation");
+        assert_eq!(plan.too_small, 1, "the small one was simply small");
     }
 
     /// `--safe` is a **silent** filter, on purpose. `excluded` answers "the tool

@@ -112,7 +112,7 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
 | `DetectOptions` / `Detection` | `core/src/detect.rs` | The rules' input and output. `age: Option<Age>` pairs the threshold with `now` so it cannot be half-armed |
-| `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason |
+| `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason; `filtered_out` / `too_small` count the user's own narrowings |
 | `CleanOutcome` | `core/src/trash.rs` | `removed` / `failed` / `reclaimed` — never a `Result` |
 | `SkippedEntry` / `SkipReason` | `core/src/tree.rs` | Failures returned **as data** — the core never prints |
 | `RenderOptions` | `cli/src/render/tree.rs` | Display-only knobs |

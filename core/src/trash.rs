@@ -288,6 +288,7 @@ mod tests {
             reclaimable,
             excluded: Vec::new(),
             filtered_out: 0,
+            too_small: 0,
         }
     }
 

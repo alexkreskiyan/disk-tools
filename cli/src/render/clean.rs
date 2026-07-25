@@ -65,6 +65,19 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
         );
     }
 
+    if plan.too_small > 0 {
+        // A separate line from the `--safe` one above, and deliberately so: the
+        // remedy differs. Offering `--safe` as the answer to "where did the rest
+        // go" when the answer is `--min-size` would send the user at the wrong
+        // flag, the same way an undifferentiated exclusion list would.
+        let noun = if plan.too_small == 1 {
+            "candidate is"
+        } else {
+            "candidates are"
+        };
+        let _ = writeln!(out, "\n{} more {noun} below --min-size.", plan.too_small);
+    }
+
     if !plan.candidates.is_empty() && intent == Intent::DryRun {
         let _ = writeln!(out, "\nDry run — nothing was removed. Re-run with --apply.");
     }
@@ -264,6 +277,7 @@ mod tests {
             reclaimable,
             excluded: Vec::new(),
             filtered_out: 0,
+            too_small: 0,
         }
     }
 
@@ -601,6 +615,7 @@ mod intent_tests {
             reclaimable: 2048,
             excluded: Vec::new(),
             filtered_out: 0,
+            too_small: 0,
         }
     }
 
@@ -682,6 +697,81 @@ mod purge_tests {
         assert!(
             report.contains("in the trash and can be put back"),
             "{report}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod min_size_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The line has to name its own remedy. Folding it into the `--safe` message
+    /// would point the user at a flag that has nothing to do with why the entry
+    /// is missing.
+    #[test]
+    fn candidates_below_the_threshold_are_counted_with_their_own_reason() {
+        let mut plan = CleanPlan {
+            candidates: vec![Candidate {
+                path: PathBuf::from("/p/node_modules"),
+                category: Category::NodeModules,
+                tier: Tier::Auto,
+                allocated: 2_000_000,
+                shared: false,
+            }],
+            reclaimable: 2_000_000,
+            excluded: Vec::new(),
+            filtered_out: 0,
+            too_small: 150,
+        };
+
+        let report = render_clean(&plan, None, Intent::DryRun);
+
+        assert!(
+            report.contains("150 more candidates are below --min-size"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("--safe"),
+            "the remedy is the size flag, not the tier one: {report}"
+        );
+
+        // And with both narrowings in effect, both are stated.
+        plan.filtered_out = 3;
+        let both = render_clean(&plan, Some(3), Intent::DryRun);
+        assert!(
+            both.contains("3 more candidates need confirmation"),
+            "{both}"
+        );
+        assert!(both.contains("150 more candidates are below"), "{both}");
+    }
+
+    #[test]
+    fn nothing_below_the_threshold_says_nothing() {
+        let plan = CleanPlan {
+            candidates: Vec::new(),
+            reclaimable: 0,
+            excluded: Vec::new(),
+            filtered_out: 0,
+            too_small: 0,
+        };
+
+        assert!(!render_clean(&plan, None, Intent::DryRun).contains("--min-size"));
+    }
+
+    #[test]
+    fn one_below_the_threshold_reads_singular() {
+        let plan = CleanPlan {
+            candidates: Vec::new(),
+            reclaimable: 0,
+            excluded: Vec::new(),
+            filtered_out: 0,
+            too_small: 1,
+        };
+
+        assert!(
+            render_clean(&plan, None, Intent::DryRun).contains("1 more candidate is below"),
+            "not `1 more candidates are`"
         );
     }
 }

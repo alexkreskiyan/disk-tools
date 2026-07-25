@@ -196,6 +196,28 @@ non-regenerable items is said back to you before it acts. Use `--safe` if you
 want only the regenerable ones. (The concept asks for a per-target prompt here;
 that is a v0.3 question.)
 
+### Cutting the noise
+
+A cleanup of a Python project can turn up a hundred and fifty `__pycache__`
+directories of a few kilobytes each, burying the two entries that actually
+matter. `--min-size` drops them:
+
+```console
+$ disk-tools clean ~/code --min-size 1M
+    2.0M  node-modules  auto  ~/code/proj/node_modules
+
+Reclaimable: 2.0M
+
+150 more candidates are below --min-size.
+```
+
+**This narrows the plan, not just the display.** `scan --min-size` hides rows
+while the totals stay whole; here the report *is* the list of what `--apply` will
+remove, so showing two entries and removing a hundred and fifty would be exactly
+the mismatch every other rule here exists to prevent. The count of what was
+dropped is printed, and it is a separate line from `--safe`'s — the two have
+different remedies.
+
 ### Purge
 
 The trash is not free. On macOS every removal is an `osascript` round-trip to
@@ -258,6 +280,7 @@ conclude anything.
 |------|--------|
 | `--apply` | **Actually remove**, to the OS trash. Without it nothing is touched |
 | `--safe` | Offer only the `auto` tier — regenerable output, nothing needing confirmation |
+| `--min-size <SIZE>` | Ignore anything smaller. **Narrows the plan, not just the printout** — unlike `scan`'s flag of the same name, what is shown is what `--apply` removes |
 | `--purge` | Delete **permanently** instead of trashing. Nothing can be put back; requires `--apply` |
 | `--allow-dirty` | Include build output whose project has uncommitted changes. Relaxes **only** the git guard |
 | `--older-than <DURATION>` | Also offer anything untouched for this long: `90d`, `2w`, `6m`, `1y`. A bare number is rejected — `90` could mean seconds as easily as days. `m` is 30 days, `y` is 365 |
