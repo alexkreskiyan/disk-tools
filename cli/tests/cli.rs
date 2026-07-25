@@ -56,10 +56,22 @@ fn missing_path_errors_and_does_not_scan_cwd() {
         "no path must exit non-zero, got {:?}",
         output.status
     );
+    assert_eq!(output.status.code(), Some(2), "a usage error, not a crash");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.to_lowercase().contains("usage"),
-        "a missing path should print usage, got:\n{stderr}"
+        "a bare invocation should print usage, got:\n{stderr}"
+    );
+    // The point of printing help rather than an error: it says what to type.
+    for verb in ["scan", "clean"] {
+        assert!(
+            stderr.contains(verb),
+            "and it should list `{verb}`, got:\n{stderr}"
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stdout).is_empty(),
+        "nothing was scanned, so stdout stays empty"
     );
 }
 
@@ -69,7 +81,7 @@ fn nonexistent_path_errors_early() {
     let dir = tempfile::tempdir().expect("tempdir");
     let missing = dir.path().join("does-not-exist");
 
-    let output = run(&[missing.to_str().expect("utf8 path")]);
+    let output = run(&["scan", missing.to_str().expect("utf8 path")]);
 
     assert!(
         !output.status.success(),
@@ -87,7 +99,7 @@ fn nonexistent_path_errors_early() {
 fn valid_path_exits_zero() {
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let output = run(&[dir.path().to_str().expect("utf8 path")]);
+    let output = run(&["scan", dir.path().to_str().expect("utf8 path")]);
 
     assert!(
         output.status.success(),
@@ -101,7 +113,7 @@ fn valid_path_exits_zero() {
 fn valid_path_produces_empty_stderr() {
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let output = run(&[dir.path().to_str().expect("utf8 path")]);
+    let output = run(&["scan", dir.path().to_str().expect("utf8 path")]);
 
     assert!(
         output.stderr.is_empty(),
@@ -130,7 +142,7 @@ fn nonexistent_path_exits_with_code_2() {
     let dir = tempfile::tempdir().expect("tempdir");
     let missing = dir.path().join("does-not-exist");
 
-    let output = run(&[missing.to_str().expect("utf8 path")]);
+    let output = run(&["scan", missing.to_str().expect("utf8 path")]);
 
     assert_eq!(
         output.status.code(),
@@ -152,7 +164,7 @@ fn json_flag_emits_valid_json_to_stdout() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("a.bin"), b"hello").expect("write file");
 
-    let output = run(&["--json", dir.path().to_str().expect("utf8 path")]);
+    let output = run(&["scan", "--json", dir.path().to_str().expect("utf8 path")]);
 
     assert!(
         output.status.success(),
@@ -184,8 +196,8 @@ fn json_sizes_match_the_human_reports_numbers_for_the_same_scan() {
     std::fs::write(dir.path().join("big.bin"), vec![b'x'; 1_048_576]).expect("write file");
     let root = dir.path().to_str().expect("utf8 path");
 
-    let json_output = run(&["--json", "--apparent", root]);
-    let human_output = run(&["--apparent", root]);
+    let json_output = run(&["scan", "--json", "--apparent", root]);
+    let human_output = run(&["scan", "--apparent", root]);
 
     assert!(json_output.status.success(), "{:?}", json_output.status);
     assert!(human_output.status.success(), "{:?}", human_output.status);
@@ -243,7 +255,7 @@ fn json_includes_a_skipped_entry_from_a_real_unreadable_directory() {
         return;
     }
 
-    let output = run(&["--json", dir.path().to_str().expect("utf8 path")]);
+    let output = run(&["scan", "--json", dir.path().to_str().expect("utf8 path")]);
 
     // Restore before any assertion can panic, so the tempdir can clean up.
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
@@ -285,7 +297,7 @@ fn json_stdout_stays_clean_progress_to_stderr() {
         return;
     }
 
-    let output = run(&["--json", dir.path().to_str().expect("utf8 path")]);
+    let output = run(&["scan", "--json", dir.path().to_str().expect("utf8 path")]);
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
 
     // stdout is valid JSON and carries none of the summary prose.
@@ -323,7 +335,7 @@ fn tree_mode_summary_goes_to_stderr_report_stays_on_stdout() {
         return;
     }
 
-    let output = run(&[dir.path().to_str().expect("utf8 path")]);
+    let output = run(&["scan", dir.path().to_str().expect("utf8 path")]);
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
 
     assert!(
@@ -370,7 +382,7 @@ fn piped_stderr_carries_only_the_summary_no_spinner_control_bytes() {
         return;
     }
 
-    let output = run(&[dir.path().to_str().expect("utf8 path")]);
+    let output = run(&["scan", dir.path().to_str().expect("utf8 path")]);
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
 
     assert!(
@@ -393,7 +405,7 @@ fn piped_stderr_carries_only_the_summary_no_spinner_control_bytes() {
 fn closed_stdout_pipe_exits_quietly_instead_of_panicking() {
     let dir = many_files_dir(3000);
 
-    let output = run_with_stdout_closed_early(&[dir.path().to_str().expect("utf8 path")]);
+    let output = run_with_stdout_closed_early(&["scan", dir.path().to_str().expect("utf8 path")]);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -413,7 +425,8 @@ fn closed_stdout_pipe_exits_quietly_instead_of_panicking() {
 fn closed_stdout_pipe_in_json_mode_exits_quietly() {
     let dir = many_files_dir(3000);
 
-    let output = run_with_stdout_closed_early(&["--json", dir.path().to_str().expect("utf8 path")]);
+    let output =
+        run_with_stdout_closed_early(&["scan", "--json", dir.path().to_str().expect("utf8 path")]);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -455,8 +468,8 @@ fn verbose_flag_lists_every_skip_past_the_preview_cap() {
     }
 
     let root = dir.path().to_str().expect("utf8 path");
-    let default_output = run(&[root]);
-    let verbose_output = run(&["--verbose", root]);
+    let default_output = run(&["scan", root]);
+    let verbose_output = run(&["scan", "--verbose", root]);
 
     for locked in &locked_dirs {
         std::fs::set_permissions(locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
@@ -532,7 +545,7 @@ fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, u64)> {
 fn bare_path_still_scans_exactly_as_before() {
     let dir = many_files_dir(20);
 
-    let output = run(&[dir.path().to_str().expect("utf8 path")]);
+    let output = run(&["scan", dir.path().to_str().expect("utf8 path")]);
 
     assert!(output.status.success(), "{:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -5,29 +5,45 @@
 //! `--help` lists them, and consumed by the renderer (Task 7) and JSON output
 //! (Task 8).
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use disk_tools_core::{Age, CleanOptions, DetectOptions, Removal, ScanOptions, UserDirs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// disk-tools — find what's eating your disk.
 #[derive(Parser, Debug)]
-// The default-subcommand pattern (D3): `disk-tools <PATH>` keeps working
-// verbatim, and `disk-tools clean <PATH>` is a subcommand beside it. The flag
-// stops clap treating a subcommand name as a value for the positional.
-#[command(version, about, args_conflicts_with_subcommands = true)]
+// Three verbs, no privileged one. `disk-tools <PATH>` used to scan, which made
+// scanning the default and everything else a subcommand — readable while there
+// was one other verb, lopsided once there are three. A bare `disk-tools` now
+// prints help and exits 2, which keeps the guarantee that mattered about the old
+// shape: the working directory is never scanned by accident.
+#[command(version, about, arg_required_else_help = true)]
 pub struct Args {
-    // `Option` only because a subcommand replaces it; `Args::resolve` rejects
-    // the case where neither is given, so a bare `disk-tools` still cannot scan
-    // the working directory by accident.
-    //
-    // A plain comment, not a doc comment: clap turns doc comments into help
-    // text, and a note to whoever maintains this is not something a user should
-    // meet in `--help`. The same reason the strings below are spelled out rather
-    // than marked up — `--help` is a terminal, not a rendered page.
+    /// List every skipped entry instead of just the first ten.
+    ///
+    /// Global rather than per-command: it is about diagnostics, not about any
+    /// one report.
+    #[arg(short = 'v', long, global = true)]
+    pub verbose: bool,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Measure a directory and print a size-sorted tree.
+    Scan(ScanArgs),
+
+    /// Find removable junk. Dry-run by default — nothing is deleted without --apply.
+    Clean(CleanArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ScanArgs {
     /// Directory (or file) to scan. Always explicit — never defaults to the current directory.
     #[arg(value_name = "PATH")]
-    pub root: Option<PathBuf>,
+    pub root: PathBuf,
 
     /// Show at most this many entries.
     #[arg(short = 'n', long = "number")]
@@ -52,19 +68,6 @@ pub struct Args {
     /// Emit JSON instead of the tree report.
     #[arg(long)]
     pub json: bool,
-
-    /// List every skipped entry instead of just the first ten.
-    #[arg(short = 'v', long)]
-    pub verbose: bool,
-
-    #[command(subcommand)]
-    pub command: Option<Command>,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum Command {
-    /// Find removable junk. Dry-run by default — nothing is deleted without --apply.
-    Clean(CleanArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -98,7 +101,12 @@ pub struct CleanArgs {
 /// What the parsed arguments actually asked for.
 #[derive(Debug)]
 pub enum Mode {
-    Scan(ScanOptions),
+    Scan {
+        options: ScanOptions,
+        /// `-n`: display-only, so it never reaches the core.
+        number: Option<usize>,
+        json: bool,
+    },
     Clean {
         scan: ScanOptions,
         clean: CleanOptions,
@@ -108,21 +116,31 @@ pub enum Mode {
 }
 
 impl Args {
-    /// Work out which of the two things was asked for, or produce the usage
-    /// error clap would have.
+    /// Turn the parsed arguments into what the core needs.
     ///
-    /// The bare form's `PATH` cannot be a required positional once a subcommand
-    /// can stand in its place, so the requirement is enforced here instead. It
-    /// still surfaces as clap's own `MissingRequiredArgument` with clap's usage
-    /// text and exit code — the guarantee being protected is that
-    /// `disk-tools` alone never scans the working directory.
+    /// Infallible now that every verb is a subcommand: clap requires the path
+    /// each one declares, and a bare `disk-tools` is caught by
+    /// `arg_required_else_help` before this is reached. The old shape had to
+    /// raise its own `MissingRequiredArgument` here, because a positional that a
+    /// subcommand might replace cannot be marked required.
     ///
     /// `now` and `user_dirs` are passed in because the core will not look them
     /// up: it reads no clock and no environment (`ScanOptions`'s contract), so
     /// supplying them is the frontend's job.
-    pub fn resolve(self, now: SystemTime, user_dirs: UserDirs) -> Result<Mode, clap::Error> {
+    pub fn resolve(self, now: SystemTime, user_dirs: UserDirs) -> Mode {
         match self.command {
-            Some(Command::Clean(clean)) => Ok(Mode::Clean {
+            Command::Scan(scan) => Mode::Scan {
+                options: ScanOptions {
+                    root: scan.root,
+                    min_size: scan.min_size,
+                    depth: scan.depth,
+                    apparent: scan.apparent,
+                    one_file_system: scan.one_file_system,
+                },
+                number: scan.number,
+                json: scan.json,
+            },
+            Command::Clean(clean) => Mode::Clean {
                 scan: ScanOptions {
                     root: clean.path,
                     ..ScanOptions::default()
@@ -142,19 +160,6 @@ impl Args {
                 } else {
                     Removal::Trash
                 },
-            }),
-            None => match self.root {
-                Some(root) => Ok(Mode::Scan(ScanOptions {
-                    root,
-                    min_size: self.min_size,
-                    depth: self.depth,
-                    apparent: self.apparent,
-                    one_file_system: self.one_file_system,
-                })),
-                None => Err(Args::command().error(
-                    clap::error::ErrorKind::MissingRequiredArgument,
-                    "a PATH is required — disk-tools never scans the current directory by default",
-                )),
             },
         }
     }
@@ -245,17 +250,23 @@ mod tests {
     }
 
     /// Parse and resolve in one step, with fixed stand-ins for the two things
-    /// the frontend supplies. Three tests below call this instead of the
-    /// `into_scan_options` that preceded it: the assertions are unchanged, only
-    /// the route to the `ScanOptions` moved when `PATH` stopped being a
-    /// required positional.
+    /// the frontend supplies.
     fn resolved(args: &[&str]) -> Result<Mode, clap::Error> {
-        parse(args)?.resolve(SystemTime::UNIX_EPOCH, UserDirs::default())
+        Ok(parse(args)?.resolve(SystemTime::UNIX_EPOCH, UserDirs::default()))
+    }
+
+    /// `-n` never reaches the core, so it is read off the resolved mode rather
+    /// than off `ScanOptions`.
+    fn number_of(args: &[&str]) -> Option<usize> {
+        match resolved(args).expect("resolve") {
+            Mode::Scan { number, .. } => number,
+            Mode::Clean { .. } => panic!("expected a scan"),
+        }
     }
 
     fn scan_options(args: &[&str]) -> ScanOptions {
         match resolved(args).expect("resolve") {
-            Mode::Scan(options) => options,
+            Mode::Scan { options, .. } => options,
             Mode::Clean { scan, .. } => scan,
         }
     }
@@ -263,59 +274,73 @@ mod tests {
     #[test]
     fn path_maps_to_scan_options_root() {
         assert_eq!(
-            scan_options(&["/some/path"]).root,
+            scan_options(&["scan", "/some/path"]).root,
             PathBuf::from("/some/path")
         );
     }
 
     #[test]
     fn missing_path_is_a_usage_error() {
-        // A missing path is refused before anything is scanned, so the CWD is
-        // never scanned by accident. Since a subcommand can stand in for the
-        // positional, clap cannot mark it required and `resolve` raises clap's
-        // own error instead — same kind, same usage text, same exit code.
-        let err = resolved(&[]).expect_err("no path must fail");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        // A bare `disk-tools` prints help rather than scanning anything. The
+        // guarantee is unchanged from when this was a required positional — the
+        // working directory is never scanned by accident — but the shape is
+        // friendlier: help, and clap's usage exit code.
+        let err = parse(&[]).expect_err("a bare invocation must not scan");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_eq!(err.exit_code(), 2, "still a usage error, not a success");
+
+        // And each verb keeps its own required path.
+        for verb in ["scan", "clean"] {
+            let err = parse(&[verb]).expect_err("{verb} needs a path");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{verb} must demand a path"
+            );
+        }
     }
 
     #[test]
     fn min_size_suffix_parsing() {
         assert_eq!(
-            parse(&["/x", "--min-size", "1M"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1M"]).min_size,
             1_048_576
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "512K"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "512K"]).min_size,
             524_288
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "1048576"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1048576"]).min_size,
             1_048_576
         );
         // Default when the flag is absent.
-        assert_eq!(parse(&["/x"]).unwrap().min_size, 0);
+        assert_eq!(scan_options(&["scan", "/x"]).min_size, 0);
     }
 
     #[test]
     fn min_size_rejects_garbage() {
-        assert!(parse(&["/x", "--min-size", "1Q"]).is_err());
-        assert!(parse(&["/x", "--min-size", "12x"]).is_err());
-        assert!(parse(&["/x", "--min-size", "abc"]).is_err());
+        assert!(parse(&["scan", "/x", "--min-size", "1Q"]).is_err());
+        assert!(parse(&["scan", "/x", "--min-size", "12x"]).is_err());
+        assert!(parse(&["scan", "/x", "--min-size", "abc"]).is_err());
     }
 
     #[test]
     fn min_size_explicit_zero() {
-        assert_eq!(parse(&["/x", "--min-size", "0"]).unwrap().min_size, 0);
+        assert_eq!(scan_options(&["scan", "/x", "--min-size", "0"]).min_size, 0);
     }
 
     #[test]
     fn min_size_is_case_insensitive() {
         assert_eq!(
-            parse(&["/x", "--min-size", "1m"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1m"]).min_size,
             1_048_576
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "2g"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "2g"]).min_size,
             2u64 << 30
         );
     }
@@ -323,7 +348,7 @@ mod tests {
     #[test]
     fn min_size_trims_surrounding_whitespace() {
         assert_eq!(
-            parse(&["/x", "--min-size", " 1M "]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", " 1M "]).min_size,
             1_048_576
         );
     }
@@ -331,11 +356,11 @@ mod tests {
     #[test]
     fn min_size_g_and_t_multipliers() {
         assert_eq!(
-            parse(&["/x", "--min-size", "2G"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "2G"]).min_size,
             2u64 << 30
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "1T"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1T"]).min_size,
             1u64 << 40
         );
     }
@@ -345,35 +370,35 @@ mod tests {
         // KiB/MiB/GiB/TiB and their non-"i" long forms must all match the same
         // 1024-based multiplier as the single-letter suffix.
         assert_eq!(
-            parse(&["/x", "--min-size", "1KB"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1KB"]).min_size,
             1 << 10
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "1KiB"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1KiB"]).min_size,
             1 << 10
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "1MB"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1MB"]).min_size,
             1 << 20
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "1MiB"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1MiB"]).min_size,
             1 << 20
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "1GB"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1GB"]).min_size,
             1 << 30
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "1GiB"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1GiB"]).min_size,
             1 << 30
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "1TB"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1TB"]).min_size,
             1 << 40
         );
         assert_eq!(
-            parse(&["/x", "--min-size", "1TiB"]).unwrap().min_size,
+            scan_options(&["scan", "/x", "--min-size", "1TiB"]).min_size,
             1 << 40
         );
     }
@@ -383,7 +408,7 @@ mod tests {
         // The digit run alone (~1e20) already exceeds u64::MAX (~1.8e19), so
         // this exercises the `digits.parse()` failure path, distinct from the
         // `checked_mul` overflow below.
-        let err = parse(&["/x", "--min-size", "99999999999999999999T"])
+        let err = parse(&["scan", "/x", "--min-size", "99999999999999999999T"])
             .expect_err("digit overflow must not panic");
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
@@ -393,31 +418,53 @@ mod tests {
         // The digits (2e10) fit comfortably in a u64 on their own; only the
         // `* 1<<40` multiplication overflows, exercising `checked_mul` rather
         // than the digit-parse failure above.
-        let err = parse(&["/x", "--min-size", "20000000000T"])
+        let err = parse(&["scan", "/x", "--min-size", "20000000000T"])
             .expect_err("multiplication overflow must not panic");
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
     fn number_flag_parses_short_and_long() {
-        assert_eq!(parse(&["/x", "-n", "5"]).unwrap().number, Some(5));
-        assert_eq!(parse(&["/x", "--number", "5"]).unwrap().number, Some(5));
-        assert_eq!(parse(&["/x"]).unwrap().number, None);
+        assert_eq!(number_of(&["scan", "/x", "-n", "5"]), Some(5));
+        assert_eq!(number_of(&["scan", "/x", "--number", "5"]), Some(5));
+        assert_eq!(number_of(&["scan", "/x"]), None);
     }
 
     #[test]
     fn flags_map_onto_scan_options() {
-        let opts = scan_options(&["/x", "--depth", "3", "--apparent", "--one-file-system"]);
+        let opts = scan_options(&[
+            "scan",
+            "/x",
+            "--depth",
+            "3",
+            "--apparent",
+            "--one-file-system",
+        ]);
         assert_eq!(opts.depth, Some(3));
         assert!(opts.apparent);
         assert!(opts.one_file_system);
     }
 
+    /// The scan flags moved under `scan` when it stopped being the default verb,
+    /// so this now asserts where they actually live — a flag documented only on
+    /// a page the user has no reason to open is not documented.
     #[test]
     fn help_lists_all_flags() {
         use clap::CommandFactory;
 
-        let help = Args::command().render_long_help().to_string();
+        let top = Args::command().render_long_help().to_string();
+        for verb in ["scan", "clean"] {
+            assert!(
+                top.contains(verb),
+                "top-level help must list {verb}:\n{top}"
+            );
+        }
+
+        let scan_help = Args::command()
+            .find_subcommand_mut("scan")
+            .expect("the scan subcommand exists")
+            .render_long_help()
+            .to_string();
         for flag in [
             "-n",
             "--min-size",
@@ -427,8 +474,8 @@ mod tests {
             "--json",
         ] {
             assert!(
-                help.contains(flag),
-                "--help must mention {flag}, got:\n{help}"
+                scan_help.contains(flag),
+                "`scan --help` must mention {flag}, got:\n{scan_help}"
             );
         }
     }
@@ -438,7 +485,7 @@ mod tests {
     fn clean_options(args: &[&str]) -> CleanOptions {
         match resolved(args).expect("resolve") {
             Mode::Clean { clean, .. } => clean,
-            Mode::Scan(_) => panic!("expected the clean subcommand"),
+            Mode::Scan { .. } => panic!("expected the clean subcommand"),
         }
     }
 
@@ -485,8 +532,7 @@ mod tests {
 
         let mode = parse(&["clean", "/x", "--older-than", "1d"])
             .expect("parse")
-            .resolve(now, dirs.clone())
-            .expect("resolve");
+            .resolve(now, dirs.clone());
 
         let Mode::Clean { clean, .. } = mode else {
             panic!("expected the clean subcommand");
@@ -499,7 +545,7 @@ mod tests {
     /// regression proof for "identical to v0.1".
     #[test]
     fn a_bare_path_is_still_a_scan() {
-        assert!(matches!(resolved(&["/x"]), Ok(Mode::Scan(_))));
+        assert!(matches!(resolved(&["scan", "/x"]), Ok(Mode::Scan { .. })));
     }
 
     /// `--purge` alone would read as "prepare to delete permanently" and do

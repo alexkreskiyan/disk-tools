@@ -24,40 +24,36 @@ use std::time::{Duration, SystemTime};
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    // The display-only knobs are the CLI's own; copy them before `resolve`
-    // consumes the parsed args into what the core needs.
-    let json = args.json;
     let verbose = args.verbose;
-    let render_options = RenderOptions {
-        number: args.number,
-        depth: args.depth,
-        min_size: args.min_size,
-        apparent: args.apparent,
-        width: terminal_width(),
-    };
 
     // The core reads no clock and no environment, so both are resolved here and
     // handed over. Once, at the top, so every rule sees the same "now".
     match args.resolve(SystemTime::now(), env::user_dirs()) {
-        Ok(Mode::Scan(options)) => run_scan(options, json, verbose, &render_options),
-        Ok(Mode::Clean {
+        Mode::Scan {
+            options,
+            number,
+            json,
+        } => run_scan(options, number, json, verbose),
+        Mode::Clean {
             scan,
             clean,
             apply,
             removal,
-        }) => run_clean(scan, clean, apply, removal, verbose),
-        // clap's own formatting and exit code — a usage error looks the same
-        // whether clap raised it or we did.
-        Err(err) => err.exit(),
+        } => run_clean(scan, clean, apply, removal, verbose),
     }
 }
 
-fn run_scan(
-    options: ScanOptions,
-    json: bool,
-    verbose: bool,
-    render_options: &RenderOptions,
-) -> ExitCode {
+fn run_scan(options: ScanOptions, number: Option<usize>, json: bool, verbose: bool) -> ExitCode {
+    // Display-only knobs, built here because terminal width is the frontend's
+    // business and the core neither has it nor wants it.
+    let render_options = RenderOptions {
+        number,
+        depth: options.depth,
+        min_size: options.min_size,
+        apparent: options.apparent,
+        width: terminal_width(),
+    };
+
     let Some(tree) = scan_or_report(&options, "Scanning…") else {
         return ExitCode::from(2);
     };
@@ -71,7 +67,7 @@ fn run_scan(
             }
         }
     } else {
-        render_tree(&tree, render_options)
+        render_tree(&tree, &render_options)
     };
 
     emit(&report, &tree, verbose)

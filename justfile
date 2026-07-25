@@ -15,7 +15,7 @@ default:
 build:
     cargo build --workspace
 
-# Run the CLI, e.g. `just run ~/Downloads --json`.
+# Run the CLI, e.g. `just run scan ~/Downloads --json`.
 run *ARGS:
     cargo run -p disk-tools -- {{ARGS}}
 
@@ -127,8 +127,8 @@ bench DIR:
         # Single quotes survive hyperfine's own argument splitting under -N, so
         # a fixture path containing spaces still reaches the tool as one arg.
         hyperfine -N --warmup 5 --runs 20 --output=null \
-            -n "disk-tools --depth 0"   "'$bin' '$path' --depth 0" \
-            -n "disk-tools (full tree)" "'$bin' '$path'" \
+            -n "disk-tools --depth 0"   "'$bin' scan '$path' --depth 0" \
+            -n "disk-tools (full tree)" "'$bin' scan '$path'" \
             -n "du -sh"                 "du -sh '$path'" \
             -n "diskus"                 "diskus '$path'"
     done
@@ -170,4 +170,4 @@ bench-memory DIR *ARGS:
     set -euo pipefail
     cargo build --release
     if /usr/bin/time -l true 2>/dev/null; then flag=-l; else flag=-v; fi
-    /usr/bin/time "$flag" ./target/release/disk-tools "{{DIR}}" {{ARGS}} > /dev/null
+    /usr/bin/time "$flag" ./target/release/disk-tools scan "{{DIR}}" {{ARGS}} > /dev/null

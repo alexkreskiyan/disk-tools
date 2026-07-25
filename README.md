@@ -42,14 +42,22 @@ workspace manifest).
 ## Usage
 
 ```
-disk-tools [OPTIONS] <PATH>
+disk-tools <COMMAND> [OPTIONS] <PATH>
 ```
+
+Three verbs, and a bare `disk-tools` prints help rather than guessing:
+
+| | |
+|---|---|
+| `disk-tools scan <PATH>` | measure and report |
+| `disk-tools clean <PATH>` | find removable junk |
+| `disk-tools ui <PATH>` | interactive browser — *planned, v0.4* |
 
 The path is **always explicit** — `disk-tools` never scans the current directory by
 accident.
 
 ```console
-$ disk-tools project
+$ disk-tools scan project
     6.8M  project                                      ████████████████████ 100%
     5.7M    node_modules                                  █████████████████  85%
     4.0M      bundle.pack                                    ██████████████  70%
@@ -71,7 +79,7 @@ is 70% of `node_modules`, which is in turn 85% of `project`.
 Just the top level:
 
 ```console
-$ disk-tools project --depth 1
+$ disk-tools scan project --depth 1
     6.8M  project                                      ████████████████████ 100%
     5.7M    node_modules                                  █████████████████  85%
  1000.0K    assets                                                      ███  14%
@@ -82,7 +90,7 @@ $ disk-tools project --depth 1
 Only what is 1 MiB or larger:
 
 ```console
-$ disk-tools project --min-size 1M
+$ disk-tools scan project --min-size 1M
     6.8M  project                                      ████████████████████ 100%
     5.7M    node_modules                                  █████████████████  85%
     4.0M      bundle.pack                                    ██████████████  70%
@@ -93,7 +101,7 @@ $ disk-tools project --min-size 1M
 Machine-readable output:
 
 ```console
-$ disk-tools project --json | jq '.root.allocated'
+$ disk-tools scan project --json | jq '.root.allocated'
 7077888
 ```
 
@@ -101,7 +109,7 @@ Anything the scan could not read is reported after the tree — a count plus the
 first ten paths, or all of them under `--verbose`:
 
 ```console
-$ disk-tools project --depth 1
+$ disk-tools scan project --depth 1
     6.8M  project                                      ████████████████████ 100%
     ...
       0B    locked                                                            0%
@@ -230,6 +238,8 @@ conclude anything.
 
 ## Flags
 
+`disk-tools scan <PATH>`:
+
 | Flag | Effect | Scope |
 |------|--------|-------|
 | `<PATH>` | Directory (or file) to scan. Required — never defaults to the CWD | scan |
@@ -239,10 +249,10 @@ conclude anything.
 | `--apparent` | Rank and report **apparent** size instead of allocated | display |
 | `--one-file-system` | Stop at filesystem boundaries instead of descending into other mounts (**Unix only** — see limitations) | scan |
 | `--json` | Emit JSON instead of the tree report | display |
-| `-v`, `--verbose` | List every skipped entry instead of just the first ten | display |
+| `-v`, `--verbose` | List every skipped entry instead of just the first ten. **Global** — works with any verb | display |
 | `-h`, `--help` / `-V`, `--version` | Print help / version | — |
 
-`disk-tools clean <PATH>` takes its own flags:
+`disk-tools clean <PATH>` takes its own:
 
 | Flag | Effect |
 |------|--------|
@@ -283,7 +293,7 @@ apply to the tree report only.
 So `disk-tools <path> --json > out.json` yields valid JSON, and the spinner is
 suppressed entirely when stderr is not a terminal.
 
-Closing the pipe early — `disk-tools ~ | head` — is treated as a normal end of
+Closing the pipe early — `disk-tools scan ~ | head` — is treated as a normal end of
 output: the scan stops quietly and exits `0`, like any other Unix filter.
 
 ## Benchmarks

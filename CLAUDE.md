@@ -45,7 +45,7 @@ rather than as ad-hoc commands.
 | `just smoke-trash` | The `#[ignore]`d tests that move real files to the OS trash, in both crates |
 | `just coverage-branch` | Nightly-only branch coverage; advisory, mirrored by a non-blocking CI job |
 | `just check` | `cargo check --workspace --all-targets` — CI runs it pinned to MSRV 1.85 |
-| `just run <ARGS>` | Run the CLI, e.g. `just run ~/Downloads --json` |
+| `just run <ARGS>` | Run the CLI, e.g. `just run scan ~/Downloads --json` |
 | `just release` | Optimized host build → `target/release/disk-tools` |
 | `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` / `just bench-phases <path>` / `just bench-stat <dir>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
@@ -81,7 +81,7 @@ disc-tools/
 ├── cli/                # disk-tools (bin) — CLI frontend
 │   ├── Cargo.toml      # clap, terminal_size, serde_json, indicatif, unicode-width
 │   ├── src/
-│   │   ├── main.rs     # mode dispatch; scan/plan/apply; spinner + bar to stderr
+│   │   ├── main.rs     # verb dispatch (scan | clean); spinner to stderr
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
 │   │   ├── env.rs      # UserDirs from the environment — what the core refuses
 │   │   └── render/
