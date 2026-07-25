@@ -26,6 +26,8 @@
 // the OS to stay inside it.
 #![deny(unsafe_code)]
 
+#[cfg(feature = "clean")]
+mod clean;
 mod dedup;
 mod options;
 mod size;
@@ -34,6 +36,8 @@ mod walk;
 #[cfg(windows)]
 mod windows_dir;
 
+#[cfg(feature = "clean")]
+pub use clean::{TrashFailure, move_to_trash};
 pub use options::ScanOptions;
 pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
 

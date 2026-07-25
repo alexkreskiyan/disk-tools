@@ -42,6 +42,14 @@ jobs:
       - name: just build
         run: just build
 
+      # Moves real files into the runner's trash — safe on an ephemeral VM, and
+      # the only way to learn what each platform's backend actually does. It also
+      # exercises the one path that can still abort a cleanup: `trash` 5.2.6
+      # `unwrap()`s CoCreateInstance on its Windows delete path, so a COM-hostile
+      # runner surfaces here as a red build rather than as a user's lost run.
+      - name: just smoke-trash
+        run: just smoke-trash
+
   # `verify` runs on stable, which happily accepts APIs stabilized after our
   # MSRV — the manifest's `rust-version = "1.85"` would silently become a lie.
   # One Linux job pinned to that exact toolchain keeps it honest.

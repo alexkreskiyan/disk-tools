@@ -7,10 +7,20 @@ rust-version.workspace = true
 [dependencies]
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"], optional = true }
+# Deletions go to the OS trash, never `rm` — an unrecoverable mistake is not an
+# acceptable failure mode for a cleanup tool. Pulls only `objc2` on macOS and
+# `windows` on Windows; no dbus or portal, so headless CI works.
+trash = { version = "5.2", optional = true }
 
-# Opt-in serialization of the scan model, enabled by the CLI for `--json`.
-# Library consumers that don't need it pay nothing.
+# `serde`: opt-in serialization of the scan model, enabled by the CLI for `--json`.
+#
+# `clean`: the trash-backed removal engine. On by default so `cargo test` exercises
+# it without ceremony, but a consumer that only wants `scan()` can take
+# `default-features = false` and stop compiling `objc2` / `windows` for a
+# capability it never calls — the same bargain `serde` offers.
 [features]
+default = ["clean"]
+clean = ["dep:trash"]
 serde = ["dep:serde"]
 
 # Windows hides allocated size from `std::fs::Metadata`; `GetCompressedFileSizeW`

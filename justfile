@@ -55,6 +55,8 @@ lint:
 
 # `--all-targets` so tests and benches are checked too — an API stabilized after
 # the MSRV is just as breaking there. CI runs this under the pinned 1.85.
+
+# Type-check everything, including tests.
 check:
     cargo check --workspace --all-targets
 
@@ -114,8 +116,17 @@ bench-phases DIR:
     DT_PHASE_PATH="{{DIR}}" cargo test --release -p disk-tools-core --lib \
         -- --ignored --nocapture phase_split
 
-# Does stat-ing one directory's entries scale? Answers whether parallelising the
-# per-directory loop is worth doing, or whether the kernel serialises anyway.
+# Moves real files into your Trash — that is the point, and why the tests behind
+# it are `#[ignore]` rather than part of `just test`.
+
+# Smoke-test the OS trash backend and time it on 10,000 files.
+smoke-trash:
+    cargo test -p disk-tools-core --lib -- --ignored --nocapture trash
+
+# Answers whether parallelising the per-directory loop is worth doing, or whether
+# the kernel serialises the metadata path anyway.
+
+# Does stat-ing one directory's entries scale?
 bench-stat DIR:
     DT_PHASE_PATH="{{DIR}}" cargo test --release -p disk-tools-core --lib \
         -- --ignored --nocapture dir_stat_scaling
