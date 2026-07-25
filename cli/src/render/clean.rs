@@ -10,8 +10,24 @@
 //! "what would go".
 
 use super::tree::format_size;
-use disk_tools_core::{Candidate, Category, CleanPlan, ExcludeReason, Excluded, Tier};
+use disk_tools_core::{
+    Candidate, Category, CleanOutcome, CleanPlan, ExcludeReason, Excluded, Tier,
+};
 use std::fmt::Write;
+
+/// Why the plan is being shown.
+///
+/// The same list serves two moments, and the closing line must not. Printed
+/// before an `--apply`, "nothing was removed" is about to become false — which
+/// would make the last thing a user reads before a deletion the one sentence in
+/// the report that is a lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// A dry run: this is the whole output, and nothing will happen.
+    DryRun,
+    /// A preview: the removal follows immediately.
+    AboutToApply,
+}
 
 /// Render the plan for a human.
 ///
@@ -19,7 +35,7 @@ use std::fmt::Write;
 /// flag was not used. The core does not record them — that is deliberate, since
 /// `--safe` is the user's own narrowing rather than a refusal — so the count is
 /// passed in by the caller, which plans a second time to obtain it.
-pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>) -> String {
+pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Intent) -> String {
     let mut out = String::new();
 
     if plan.candidates.is_empty() {
@@ -49,8 +65,77 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>) -> String {
         );
     }
 
-    if !plan.candidates.is_empty() {
+    if !plan.candidates.is_empty() && intent == Intent::DryRun {
         let _ = writeln!(out, "\nDry run — nothing was removed. Re-run with --apply.");
+    }
+
+    out
+}
+
+/// Report what a cleanup actually did.
+///
+/// The concept's rule is that there is no partial **silent** delete. A partial
+/// delete is acceptable; leaving the user to guess which half happened is not.
+/// So a failure names its path and what the OS said, and the closing line states
+/// plainly that something is still there.
+pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool) -> String {
+    let mut out = String::new();
+    let attempted = outcome.removed.len() + outcome.failed.len();
+
+    if outcome.removed.is_empty() {
+        let _ = writeln!(out, "Removed nothing.");
+    } else {
+        // "At most" whenever something removed held content reachable from
+        // outside it — the same hedge the dry run's total carries, because the
+        // figure has exactly the same softness. Saying it carefully in the
+        // preview and flatly in the outcome would be one run disagreeing with
+        // itself, and the flat version is the wrong one.
+        let freed = if shared_removed {
+            format!("Freed at most {}", format_size(outcome.reclaimed))
+        } else {
+            format!("Freed {}", format_size(outcome.reclaimed))
+        };
+        let _ = writeln!(
+            out,
+            "Removed {} of {attempted}. {freed}.",
+            outcome.removed.len()
+        );
+    }
+
+    if outcome.failed.is_empty() {
+        return out;
+    }
+
+    let _ = writeln!(out, "\nNot removed:");
+    for failure in &outcome.failed {
+        let _ = writeln!(out, "  {} — {}", failure.path.display(), failure.reason);
+    }
+
+    let count = outcome.failed.len();
+    let noun = if count == 1 {
+        "candidate"
+    } else {
+        "candidates"
+    };
+    let _ = writeln!(out, "\n{count} {noun} still on disk.");
+
+    // The recoverability claim names what it covers, and appears only when
+    // something was actually removed. Printed unconditionally it is a plain
+    // falsehood after a run that trashed nothing — and "everything above",
+    // sitting directly under the failure list, reads as promising exactly the
+    // items that are *not* in the trash. This is the sentence a user reads to
+    // find out whether their work survived.
+    if !outcome.removed.is_empty() {
+        let removed = outcome.removed.len();
+        let (noun, verb) = if removed == 1 {
+            ("candidate", "is")
+        } else {
+            ("candidates", "are")
+        };
+        let _ = writeln!(
+            out,
+            "The other {removed} {noun} {verb} in the trash and can be put back."
+        );
     }
 
     out
@@ -194,6 +279,7 @@ mod tests {
                 candidate("/p/old.bin", Category::Old, Tier::Confirm, 1_048_576),
             ]),
             None,
+            Intent::DryRun,
         );
 
         // Path, category and tier for each, then the total.
@@ -217,7 +303,7 @@ mod tests {
         let mut shared = candidate("/p/node_modules", Category::NodeModules, Tier::Auto, 2048);
         shared.shared = true;
 
-        let report = render_clean(&plan(vec![shared]), None);
+        let report = render_clean(&plan(vec![shared]), None, Intent::DryRun);
 
         assert!(
             report.contains("(shared)"),
@@ -243,6 +329,7 @@ mod tests {
                 2048,
             )]),
             None,
+            Intent::DryRun,
         );
 
         assert!(report.contains("Reclaimable: 2.0K"), "{report}");
@@ -254,7 +341,7 @@ mod tests {
 
     #[test]
     fn empty_plan_renders_a_plain_message() {
-        let report = render_clean(&plan(Vec::new()), None);
+        let report = render_clean(&plan(Vec::new()), None, Intent::DryRun);
 
         assert_eq!(report, "Nothing to clean.\n");
     }
@@ -269,7 +356,7 @@ mod tests {
             reason: ExcludeReason::Denylisted,
         }];
 
-        let report = render_clean(&empty, None);
+        let report = render_clean(&empty, None, Intent::DryRun);
 
         assert!(report.contains("Nothing to clean."), "{report}");
         assert!(report.contains("/Windows/target"), "{report}");
@@ -290,7 +377,7 @@ mod tests {
             },
         ];
 
-        let report = render_clean(&with_both, None);
+        let report = render_clean(&with_both, None, Intent::DryRun);
         let denied = report
             .lines()
             .find(|line| line.contains("/Windows/target"))
@@ -326,6 +413,7 @@ mod tests {
                 2048,
             )]),
             Some(3),
+            Intent::DryRun,
         );
 
         assert!(
@@ -345,6 +433,7 @@ mod tests {
                 1,
             )]),
             Some(0),
+            Intent::DryRun,
         );
 
         assert!(
@@ -359,7 +448,7 @@ mod tests {
     fn counts_are_singular_where_they_should_be() {
         let mut shared = candidate("/p/nm", Category::NodeModules, Tier::Auto, 2048);
         shared.shared = true;
-        let report = render_clean(&plan(vec![shared]), Some(1));
+        let report = render_clean(&plan(vec![shared]), Some(1), Intent::DryRun);
 
         assert!(report.contains("1 candidate shares"), "{report}");
         assert!(report.contains("1 more candidate need"), "{report}");
@@ -378,5 +467,175 @@ mod tests {
         }
         assert_eq!(tier(Tier::Auto), "auto");
         assert_eq!(tier(Tier::Confirm), "confirm");
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use disk_tools_core::TrashFailure;
+    use std::path::PathBuf;
+
+    fn failure(path: &str) -> TrashFailure {
+        TrashFailure {
+            path: PathBuf::from(path),
+            reason: "Permission denied".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_complete_run_states_what_it_freed() {
+        let outcome = CleanOutcome {
+            removed: vec![PathBuf::from("/p/node_modules")],
+            failed: Vec::new(),
+            reclaimed: 2048,
+        };
+
+        let report = render_outcome(&outcome, false);
+
+        assert!(report.contains("Removed 1 of 1"), "{report}");
+        assert!(report.contains("Freed 2.0K"), "{report}");
+        assert!(
+            !report.contains("still on disk"),
+            "nothing failed, so nothing is left: {report}"
+        );
+    }
+
+    /// The sentence a user reads to find out whether their work survived. After
+    /// a run that removed nothing it must not claim anything is recoverable —
+    /// there is nothing in the trash to put back.
+    #[test]
+    fn a_run_that_removed_nothing_promises_nothing() {
+        let outcome = CleanOutcome {
+            removed: Vec::new(),
+            failed: vec![failure("/p/one"), failure("/p/two")],
+            reclaimed: 0,
+        };
+
+        let report = render_outcome(&outcome, false);
+
+        assert!(report.contains("Removed nothing."), "{report}");
+        assert!(report.contains("2 candidates still on disk"), "{report}");
+        assert!(
+            !report.contains("in the trash"),
+            "nothing was trashed, so nothing may be described as recoverable: {report}"
+        );
+    }
+
+    /// And when something *was* removed, the claim has to name what it covers —
+    /// it sits directly under the failure list, where "everything above" would
+    /// read as promising exactly the items that are still on disk.
+    #[test]
+    fn a_partial_run_says_which_items_are_recoverable() {
+        let outcome = CleanOutcome {
+            removed: vec![PathBuf::from("/p/gone")],
+            failed: vec![failure("/p/stuck")],
+            reclaimed: 1024,
+        };
+
+        let report = render_outcome(&outcome, false);
+
+        assert!(report.contains("1 candidate still on disk"), "{report}");
+        assert!(
+            report.contains("The other 1 candidate is in the trash"),
+            "the recoverable set is named, not implied: {report}"
+        );
+        assert!(
+            !report.contains("Everything above"),
+            "which is exactly the phrasing that would have been wrong: {report}"
+        );
+    }
+
+    /// The freed figure carries the same hedge the dry-run total did. Stating it
+    /// carefully before and flatly after would be one run disagreeing with
+    /// itself, and the flat version is the wrong one.
+    #[test]
+    fn a_shared_removal_reports_the_freed_total_as_an_upper_bound() {
+        let outcome = CleanOutcome {
+            removed: vec![PathBuf::from("/p/node_modules")],
+            failed: Vec::new(),
+            reclaimed: 4096,
+        };
+
+        assert!(
+            render_outcome(&outcome, true).contains("Freed at most 4.0K"),
+            "{}",
+            render_outcome(&outcome, true)
+        );
+        assert!(
+            render_outcome(&outcome, false).contains("Freed 4.0K"),
+            "and without sharing the figure is exact"
+        );
+    }
+
+    #[test]
+    fn counts_are_singular_where_they_should_be() {
+        let outcome = CleanOutcome {
+            removed: Vec::new(),
+            failed: vec![failure("/p/one")],
+            reclaimed: 0,
+        };
+
+        assert!(
+            render_outcome(&outcome, false).contains("1 candidate still on disk"),
+            "not `1 candidates`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn one_candidate() -> CleanPlan {
+        CleanPlan {
+            candidates: vec![Candidate {
+                path: PathBuf::from("/p/node_modules"),
+                category: Category::NodeModules,
+                tier: Tier::Auto,
+                allocated: 2048,
+                shared: false,
+            }],
+            reclaimable: 2048,
+            excluded: Vec::new(),
+        }
+    }
+
+    /// The regression this enum exists to prevent, and the reason it is worth an
+    /// enum rather than a `bool`.
+    ///
+    /// Shown before an `--apply`, "nothing was removed" is about to become
+    /// false — making the last sentence a user reads before a deletion the one
+    /// line in the report that is a lie. It was written that way first, and only
+    /// caught by running the binary, because every test called `render_clean`
+    /// directly and none knew about the `--apply` path.
+    #[test]
+    fn a_preview_does_not_claim_nothing_was_removed() {
+        let report = render_clean(&one_candidate(), None, Intent::AboutToApply);
+
+        assert!(
+            report.contains("/p/node_modules"),
+            "the preview still lists what is about to go: {report}"
+        );
+        assert!(
+            !report.contains("Dry run"),
+            "but must not say a dry run happened, because one is not: {report}"
+        );
+        assert!(
+            !report.contains("nothing was removed"),
+            "nor that nothing was removed, moments before removing it: {report}"
+        );
+    }
+
+    /// And the dry run still says so — the guard must not have silenced both.
+    #[test]
+    fn a_dry_run_still_says_it_removed_nothing() {
+        let report = render_clean(&one_candidate(), None, Intent::DryRun);
+
+        assert!(
+            report.contains("Dry run — nothing was removed. Re-run with --apply."),
+            "{report}"
+        );
     }
 }

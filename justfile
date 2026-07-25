@@ -147,9 +147,14 @@ bench-phases DIR:
 # Moves real files into your Trash — that is the point, and why the tests behind
 # it are `#[ignore]` rather than part of `just test`.
 
+# Both crates: the core's wrapper and `apply`, and the CLI's end-to-end
+# `--apply`. The second line is not optional — the CLI test is the only one that
+# proves the whole path from a typed flag to a file in the Trash.
+
 # Smoke-test the OS trash backend and time it on 10,000 files.
 smoke-trash:
     cargo test -p disk-tools-core --lib -- --ignored --nocapture trash
+    cargo test -p disk-tools --test cli -- --ignored --nocapture apply
 
 # Answers whether parallelising the per-directory loop is worth doing, or whether
 # the kernel serialises the metadata path anyway.

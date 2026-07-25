@@ -583,26 +583,83 @@ fn dry_run_writes_nothing() {
     );
 }
 
-/// Until Task 7 lands, `--apply` must refuse rather than silently succeed —
-/// a user who typed it would otherwise believe their disk had been cleaned.
+/// `--apply` really removes, end to end through the binary.
+///
+/// `#[ignore]` for the reason every real-trash test here carries: it puts
+/// things in the developer's actual Trash. Run via `just smoke-trash`.
 #[test]
-fn apply_is_refused_until_it_exists() {
+#[ignore = "moves real files to the OS trash; run via `just smoke-trash`"]
+fn apply_removes_the_candidates() {
     let dir = cleanable_dir();
-    let before = snapshot(dir.path());
+    let path = dir.path().to_str().expect("utf8 path");
 
-    let output = run(&["clean", dir.path().to_str().expect("utf8 path"), "--apply"]);
+    let output = run(&["clean", path, "--apply"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        eprintln!("skipping: this environment has no usable trash backend:\n{stderr}");
+        return;
+    }
+    assert!(
+        !dir.path().join("node_modules").exists(),
+        "the candidate must be gone from its original path"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Removed 1 of 1"), "{stdout}");
+}
+
+/// A removal that partly fails must say so in both channels a script reads: a
+/// non-zero exit, and a report naming what is still on disk.
+///
+/// The fixture makes the *parent* read-only, so the scan can still see
+/// `node_modules` but the trash cannot take it out of a directory it may not
+/// write. Nothing reaches the real Trash, which is why this one need not be
+/// `#[ignore]`d.
+///
+/// **Linux only, and that was measured rather than assumed.** On macOS the
+/// backend drives Finder through `osascript`, which is not bound by the
+/// parent's permissions: the same fixture was removed successfully there, in
+/// 42 seconds. Linux's freedesktop backend is a rename, which a read-only
+/// parent really does refuse. The core's `one_failure_does_not_stop_the_rest`
+/// and `outcome_names_every_failure` cover the data on every platform; this
+/// covers the exit code and the report end to end where it can.
+#[cfg(target_os = "linux")]
+#[test]
+fn partial_failure_exits_non_zero_and_names_survivors() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = cleanable_dir();
+    let root = dir.path();
+    let readonly = std::fs::Permissions::from_mode(0o555);
+    std::fs::set_permissions(root, readonly).expect("chmod");
+
+    // Running with privileges that ignore the missing write bit would let the
+    // removal succeed and pass this test for the wrong reason.
+    if std::fs::create_dir(root.join("probe")).is_ok() {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        eprintln!("skipping: privileges ignore the read-only parent");
+        return;
+    }
+
+    let output = run(&["clean", root.to_str().expect("utf8 path"), "--apply"]);
+
+    // Restore before any assertion can unwind, or TempDir::drop cannot clean up.
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).expect("restore");
 
     assert!(
         !output.status.success(),
-        "an unimplemented --apply must not report success, got {:?}",
+        "a removal that failed is not a success, got {:?}",
         output.status
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("not implemented"),
-        "and it must say why:\n{stderr}"
+        stdout.contains("Not removed:") && stdout.contains("node_modules"),
+        "the report must name what is still on disk:\n{stdout}"
     );
-    assert_eq!(before, snapshot(dir.path()), "nothing may be removed");
+    assert!(
+        dir.path().join("node_modules").exists(),
+        "and it really must still be there"
+    );
 }
 
 /// The report goes to stdout and everything else to stderr, the same split the

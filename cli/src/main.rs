@@ -10,9 +10,9 @@ mod render;
 
 use args::{Args, Mode, validate_root};
 use clap::Parser;
-use disk_tools_core::{CleanOptions, ScanOptions, ScanTree, plan, scan};
+use disk_tools_core::{CleanOptions, CleanPlan, ScanOptions, ScanTree, Tier, apply, plan, scan};
 use indicatif::ProgressBar;
-use render::clean::render_clean;
+use render::clean::{Intent, render_clean, render_outcome};
 use render::json::render_json;
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
@@ -71,20 +71,15 @@ fn run_scan(
 }
 
 fn run_clean(options: ScanOptions, clean: CleanOptions, apply: bool, verbose: bool) -> ExitCode {
-    if apply {
-        // Task 7 implements removal. Until then the flag must not look like it
-        // worked: silently accepting an argument whose entire purpose is
-        // deletion, and then doing nothing, is the one behaviour that cannot
-        // ship — a user would believe their disk had been cleaned.
-        eprintln!("disk-tools: --apply is not implemented yet; nothing was removed");
-        return ExitCode::FAILURE;
-    }
-
     // The git guard runs a `git status` per repository, so a tree of many
     // projects spends real time after the walk finishes.
     let Some(tree) = scan_or_report(&options, "Scanning…") else {
         return ExitCode::from(2);
     };
+
+    if apply {
+        return remove(&plan(&tree, &clean), &tree, verbose);
+    }
 
     let report = {
         let planned = plan(&tree, &clean);
@@ -113,10 +108,60 @@ fn run_clean(options: ScanOptions, clean: CleanOptions, apply: bool, verbose: bo
                 .len()
                 .saturating_sub(planned.candidates.len())
         });
-        render_clean(&planned, hidden)
+        render_clean(&planned, hidden, Intent::DryRun)
     };
 
     emit(&report, &tree, verbose)
+}
+
+/// The one path in this program that deletes anything.
+///
+/// The plan is printed **before** it is carried out, so the last thing a user
+/// sees before the removal is the list of what is about to go — the same report
+/// a dry run would have given them.
+fn remove(planned: &CleanPlan, tree: &ScanTree, verbose: bool) -> ExitCode {
+    if planned.candidates.is_empty() {
+        return emit(&render_clean(planned, None, Intent::DryRun), tree, verbose);
+    }
+
+    // To stderr: this is context for the operation, not the report. It also
+    // keeps stdout to the outcome alone for anything reading it.
+    eprint!("{}", render_clean(planned, None, Intent::AboutToApply));
+    let confirm = planned
+        .candidates
+        .iter()
+        .filter(|c| c.tier == Tier::Confirm)
+        .count();
+    if confirm > 0 {
+        // The concept asks for per-target confirmation on this tier; v0.2's
+        // confirmation is having read the list above and typed `--apply`. Saying
+        // the number out loud is what keeps that from being a blind yes.
+        eprintln!("{confirm} of these are not regenerable — removing anyway, as asked.");
+    }
+
+    // A bar rather than a spinner: the total is known, and on Windows a single
+    // candidate can take seconds (Task 1 measured 3.1 s for 10,000 files).
+    let bar = ProgressBar::new(planned.candidates.len() as u64);
+    let outcome = apply(planned, |candidate| {
+        bar.set_message(candidate.path.display().to_string());
+        bar.inc(1);
+    });
+    bar.finish_and_clear();
+
+    // Whether the freed figure needs the same hedge the dry run's total carried:
+    // a removed candidate that shares content with something outside it did not
+    // free everything its size claimed.
+    let shared_removed = planned
+        .candidates
+        .iter()
+        .any(|c| c.shared && outcome.removed.contains(&c.path));
+
+    let code = emit(&render_outcome(&outcome, shared_removed), tree, verbose);
+    if !outcome.is_complete() {
+        // A partial removal is not a success, whatever else went right.
+        return ExitCode::FAILURE;
+    }
+    code
 }
 
 /// Scan, with a spinner, or report why the root is unusable.
