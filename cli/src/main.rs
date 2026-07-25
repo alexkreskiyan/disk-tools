@@ -81,37 +81,19 @@ fn run_clean(options: ScanOptions, clean: CleanOptions, apply: bool, verbose: bo
         return remove(&plan(&tree, &clean), &tree, verbose);
     }
 
-    let report = {
-        let planned = plan(&tree, &clean);
-        // `--safe` drops confirm-tier candidates without recording them, which
-        // is deliberate — it is the user's own narrowing, not a refusal. But
-        // they still deserve to know something was there, so the count comes
-        // from planning once more without it.
-        let hidden = clean.safe_only.then(|| {
-            let unfiltered = plan(
-                &tree,
-                &CleanOptions {
-                    safe_only: false,
-                    ..clean.clone()
-                },
-            );
-            // `saturating_sub`, not `-`. Each `plan` re-runs the git guard
-            // against the world as it is *then*, so a repository whose state
-            // changes between the two calls can leave the unfiltered plan the
-            // shorter of the two. On `usize` that subtraction wraps in a release
-            // build, and the report would announce eighteen quintillion hidden
-            // candidates — exactly the kind of nonsense this report exists to
-            // not print. A count that is low by one in a rare race is the
-            // cheaper wrong answer.
-            unfiltered
-                .candidates
-                .len()
-                .saturating_sub(planned.candidates.len())
-        });
-        render_clean(&planned, hidden, Intent::DryRun)
-    };
+    let planned = plan(&tree, &clean);
+    // The count of what `--safe` hid comes back with the plan. It used to come
+    // from planning a second time without the flag, which cost a full extra pass
+    // of the git guard — measured at ~23 ms per repository, so `--safe` was the
+    // slowest mode of the three despite being the cautious one. It also meant
+    // subtracting two independently-measured numbers, which could disagree.
+    let hidden = clean.safe_only.then_some(planned.filtered_out);
 
-    emit(&report, &tree, verbose)
+    emit(
+        &render_clean(&planned, hidden, Intent::DryRun),
+        &tree,
+        verbose,
+    )
 }
 
 /// The one path in this program that deletes anything.

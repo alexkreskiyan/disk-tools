@@ -194,6 +194,7 @@ mod tests {
             candidates,
             reclaimable,
             excluded: Vec::new(),
+            filtered_out: 0,
         }
     }
 

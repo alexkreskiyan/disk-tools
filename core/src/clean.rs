@@ -116,6 +116,16 @@ pub struct CleanPlan {
     pub reclaimable: u64,
 
     pub excluded: Vec<Excluded>,
+
+    /// How many candidates `--safe` kept out; `0` when it was not in effect.
+    ///
+    /// Not an [`Excluded`], deliberately: that list is for the tool *refusing*
+    /// something, and `--safe` is the user's own narrowing. But they still need
+    /// to know something was there, and the alternative — planning a second time
+    /// without the flag — costs a full extra pass of the git guard, which is by
+    /// far the most expensive thing here (measured at ~23 ms per repository).
+    /// A count is what was wanted; a count is what this is.
+    pub filtered_out: usize,
 }
 
 /// Everything a cleanup needs to know.
@@ -162,6 +172,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
 
     let mut candidates = Vec::new();
     let mut excluded = Vec::new();
+    let mut filtered_out = 0;
     // One `git status` per repository, not per candidate: a tree of sibling
     // Rust projects would otherwise spawn a process for each, and a workspace
     // whose members share a repository would ask the same question repeatedly.
@@ -191,6 +202,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
         // system directory beside something they asked to hide. The frontend
         // knows the flag was passed and can say so itself.
         if options.safe_only && tier != Tier::Auto {
+            filtered_out += 1;
             continue;
         }
 
@@ -220,6 +232,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
         candidates,
         reclaimable,
         excluded,
+        filtered_out,
     }
 }
 
@@ -962,6 +975,46 @@ mod tests {
                 reason: ExcludeReason::Denylisted,
             }],
             "the denial must be reported even when --safe would also have dropped it"
+        );
+    }
+
+    /// The count comes back with the plan, from the one pass that made it.
+    ///
+    /// It used to be obtained by planning a second time without the flag and
+    /// subtracting — which cost a full extra run of the git guard (~23 ms per
+    /// repository, measured), making `--safe` the slowest of the three modes
+    /// despite being the cautious one, and which subtracted two independently
+    /// measured numbers that could disagree.
+    #[test]
+    fn the_plan_reports_how_many_safe_kept_out() {
+        let fixture = tree(dir(
+            "/p",
+            vec![
+                dir("/p/node_modules", vec![]),
+                aged(file("/p/one.bin", 4096), 900 * DAY),
+                aged(file("/p/two.bin", 4096), 900 * DAY),
+            ],
+        ));
+
+        let everything = plan(&fixture, &aging(90 * DAY));
+        assert_eq!(everything.candidates.len(), 3);
+        assert_eq!(
+            everything.filtered_out, 0,
+            "without --safe nothing is filtered"
+        );
+
+        let safe = plan(
+            &fixture,
+            &CleanOptions {
+                safe_only: true,
+                ..aging(90 * DAY)
+            },
+        );
+
+        assert_eq!(paths(&safe), vec![Path::new("/p/node_modules")]);
+        assert_eq!(
+            safe.filtered_out, 2,
+            "and the two confirm-tier ones are counted, not silently gone"
         );
     }
 

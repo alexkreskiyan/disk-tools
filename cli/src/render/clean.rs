@@ -263,6 +263,7 @@ mod tests {
             candidates,
             reclaimable,
             excluded: Vec::new(),
+            filtered_out: 0,
         }
     }
 
@@ -599,6 +600,7 @@ mod intent_tests {
             }],
             reclaimable: 2048,
             excluded: Vec::new(),
+            filtered_out: 0,
         }
     }
 
