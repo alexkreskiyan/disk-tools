@@ -41,7 +41,7 @@ mod walk;
 mod windows_dir;
 
 pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, Tier, plan};
-pub use detect::{Category, CategorySet, DetectOptions, Detection, UserDirs, detect};
+pub use detect::{Age, Category, CategorySet, DetectOptions, Detection, UserDirs, detect};
 pub use options::ScanOptions;
 #[cfg(feature = "trash")]
 pub use trash::{TrashFailure, move_to_trash};

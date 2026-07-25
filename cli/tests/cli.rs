@@ -496,3 +496,198 @@ fn verbose_flag_lists_every_skip_past_the_preview_cap() {
         );
     }
 }
+
+// ---- the clean subcommand ------------------------------------------------
+
+/// A fixture with one obvious candidate and nothing else interesting.
+fn cleanable_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("node_modules")).expect("mkdir");
+    std::fs::write(dir.path().join("node_modules/lib.bin"), vec![b'x'; 4096]).expect("write");
+    dir
+}
+
+/// Every path under `root`, with its length — enough to catch a creation, a
+/// deletion or a truncation.
+fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in std::fs::read_dir(&path).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let metadata = entry.metadata().expect("metadata");
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            }
+            out.push((entry.path(), metadata.len()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The v0.1 surface is a contract: adding a subcommand beside the bare path
+/// must not change what the bare path does.
+#[test]
+fn bare_path_still_scans_exactly_as_before() {
+    let dir = many_files_dir(20);
+
+    let output = run(&[dir.path().to_str().expect("utf8 path")]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("file-00000.bin"),
+        "the tree report is unchanged:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Reclaimable"),
+        "a plain scan must not print a cleanup report:\n{stdout}"
+    );
+}
+
+#[test]
+fn clean_without_a_path_exits_two() {
+    let output = run(&["clean"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a missing path is a usage error, got {:?}",
+        output.status
+    );
+}
+
+/// The load-bearing safety property: the default does nothing at all.
+#[test]
+fn dry_run_writes_nothing() {
+    let dir = cleanable_dir();
+    let before = snapshot(dir.path());
+
+    let output = run(&["clean", dir.path().to_str().expect("utf8 path")]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("node_modules"),
+        "the fixture must actually match, or this proves nothing:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Dry run"),
+        "and the report must say it removed nothing:\n{stdout}"
+    );
+    assert_eq!(
+        before,
+        snapshot(dir.path()),
+        "a dry run must leave the tree byte-identical"
+    );
+}
+
+/// Until Task 7 lands, `--apply` must refuse rather than silently succeed —
+/// a user who typed it would otherwise believe their disk had been cleaned.
+#[test]
+fn apply_is_refused_until_it_exists() {
+    let dir = cleanable_dir();
+    let before = snapshot(dir.path());
+
+    let output = run(&["clean", dir.path().to_str().expect("utf8 path"), "--apply"]);
+
+    assert!(
+        !output.status.success(),
+        "an unimplemented --apply must not report success, got {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not implemented"),
+        "and it must say why:\n{stderr}"
+    );
+    assert_eq!(before, snapshot(dir.path()), "nothing may be removed");
+}
+
+/// The report goes to stdout and everything else to stderr, the same split the
+/// scan report keeps.
+#[test]
+fn clean_report_is_on_stdout() {
+    let dir = cleanable_dir();
+
+    let output = run(&["clean", dir.path().to_str().expect("utf8 path")]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Reclaimable"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Reclaimable"),
+        "the report must not be duplicated on stderr:\n{stderr}"
+    );
+}
+
+/// Backdate `path` so the age rule really has something to find. `FileTimes`
+/// is the only portable way to build an "old" fixture — otherwise the test
+/// would need a threshold of zero, which matches the fixture's own root and
+/// hides everything beneath it.
+fn backdate(path: &Path, age: std::time::Duration) {
+    let file = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for set_times");
+    let when = std::time::SystemTime::now() - age;
+    file.set_times(std::fs::FileTimes::new().set_modified(when))
+        .expect("set mtime");
+}
+
+/// `--safe` drops confirm-tier candidates without recording them in the plan —
+/// deliberately, since it is the user's own narrowing. The report is the only
+/// place they learn something was there, so the count has to be right.
+#[test]
+fn safe_reports_how_many_candidates_it_hid() {
+    const YEAR: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+    let dir = cleanable_dir();
+    for name in ["ancient-one.bin", "ancient-two.bin"] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"old").expect("write");
+        backdate(&path, YEAR);
+    }
+    let path = dir.path().to_str().expect("utf8 path");
+
+    let everything = run(&["clean", path, "--older-than", "90d"]);
+    let stdout = String::from_utf8_lossy(&everything.stdout);
+    assert!(
+        stdout.contains("ancient-one.bin") && stdout.contains("node_modules"),
+        "the fixture must offer both tiers, or this proves nothing:\n{stdout}"
+    );
+
+    let safe = run(&["clean", path, "--older-than", "90d", "--safe"]);
+    let stdout = String::from_utf8_lossy(&safe.stdout);
+
+    assert!(
+        stdout.contains("node_modules"),
+        "the auto-tier candidate survives --safe:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("ancient-one.bin"),
+        "the confirm-tier ones do not:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("2 more candidates need confirmation"),
+        "and the report says exactly how many were hidden:\n{stdout}"
+    );
+}
+
+#[test]
+fn clean_on_a_missing_path_exits_two() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("nope");
+
+    let output = run(&["clean", missing.to_str().expect("utf8 path")]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unusable root is reported before anything is scanned, got {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does not exist"), "{stderr}");
+}

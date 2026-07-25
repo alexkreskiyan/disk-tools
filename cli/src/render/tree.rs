@@ -208,7 +208,7 @@ fn size_of(node: &ScanNode, apparent: bool) -> u64 {
 }
 
 /// Human-readable, 1024-based — the same scale `--min-size`'s parser accepts.
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];
     if bytes < 1024 {
         return format!("{bytes}B");

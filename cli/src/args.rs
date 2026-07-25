@@ -5,17 +5,25 @@
 //! `--help` lists them, and consumed by the renderer (Task 7) and JSON output
 //! (Task 8).
 
-use clap::Parser;
-use disk_tools_core::ScanOptions;
+use clap::{CommandFactory, Parser, Subcommand};
+use disk_tools_core::{Age, CleanOptions, DetectOptions, ScanOptions, UserDirs};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// disk-tools — find what's eating your disk.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+// The default-subcommand pattern (D3): `disk-tools <PATH>` keeps working
+// verbatim, and `disk-tools clean <PATH>` is a subcommand beside it. The flag
+// stops clap treating a subcommand name as a value for the positional.
+#[command(version, about, args_conflicts_with_subcommands = true)]
 pub struct Args {
     /// Directory (or file) to scan. Always explicit — never defaults to the CWD.
+    ///
+    /// `Option` only because a subcommand replaces it; [`Args::resolve`] rejects
+    /// the case where neither is given, so a bare `disk-tools` still cannot scan
+    /// the working directory by accident.
     #[arg(value_name = "PATH")]
-    pub root: PathBuf,
+    pub root: Option<PathBuf>,
 
     /// Show at most this many entries.
     #[arg(short = 'n', long = "number")]
@@ -44,21 +52,97 @@ pub struct Args {
     /// List every skipped entry instead of just the first ten.
     #[arg(short = 'v', long)]
     pub verbose: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Find removable junk. **Dry-run by default** — nothing is deleted without
+    /// `--apply`.
+    Clean(CleanArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CleanArgs {
+    /// Directory to examine.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+
+    /// Only offer regenerable safe-list categories; skip anything needing
+    /// per-item confirmation.
+    #[arg(long)]
+    pub safe: bool,
+
+    /// Actually remove the candidates, to the OS trash.
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Include build output whose project has uncommitted changes.
+    #[arg(long = "allow-dirty")]
+    pub allow_dirty: bool,
+
+    /// Also offer anything untouched for this long, e.g. `90d`, `6m`, `1y`.
+    #[arg(long = "older-than", value_parser = parse_duration)]
+    pub older_than: Option<Duration>,
+}
+
+/// What the parsed arguments actually asked for.
+#[derive(Debug)]
+pub enum Mode {
+    Scan(ScanOptions),
+    Clean {
+        scan: ScanOptions,
+        clean: CleanOptions,
+        apply: bool,
+    },
 }
 
 impl Args {
-    /// Extract the scan-affecting arguments as the core's [`ScanOptions`]. The
-    /// display-only flags (`number`, `json`) stay behind — the core neither
-    /// knows nor cares about them. Consumes `self`: once the options are built
-    /// the CLI has no further use for the parsed args, so `root` moves rather
-    /// than clones.
-    pub fn into_scan_options(self) -> ScanOptions {
-        ScanOptions {
-            root: self.root,
-            min_size: self.min_size,
-            depth: self.depth,
-            apparent: self.apparent,
-            one_file_system: self.one_file_system,
+    /// Work out which of the two things was asked for, or produce the usage
+    /// error clap would have.
+    ///
+    /// The bare form's `PATH` cannot be a required positional once a subcommand
+    /// can stand in its place, so the requirement is enforced here instead. It
+    /// still surfaces as clap's own `MissingRequiredArgument` with clap's usage
+    /// text and exit code — the guarantee being protected is that
+    /// `disk-tools` alone never scans the working directory.
+    ///
+    /// `now` and `user_dirs` are passed in because the core will not look them
+    /// up: it reads no clock and no environment (`ScanOptions`'s contract), so
+    /// supplying them is the frontend's job.
+    pub fn resolve(self, now: SystemTime, user_dirs: UserDirs) -> Result<Mode, clap::Error> {
+        match self.command {
+            Some(Command::Clean(clean)) => Ok(Mode::Clean {
+                scan: ScanOptions {
+                    root: clean.path,
+                    ..ScanOptions::default()
+                },
+                clean: CleanOptions {
+                    detect: DetectOptions {
+                        age: clean.older_than.map(|older_than| Age { older_than, now }),
+                        user_dirs,
+                        ..DetectOptions::default()
+                    },
+                    safe_only: clean.safe,
+                    allow_dirty: clean.allow_dirty,
+                },
+                apply: clean.apply,
+            }),
+            None => match self.root {
+                Some(root) => Ok(Mode::Scan(ScanOptions {
+                    root,
+                    min_size: self.min_size,
+                    depth: self.depth,
+                    apparent: self.apparent,
+                    one_file_system: self.one_file_system,
+                })),
+                None => Err(Args::command().error(
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    "a PATH is required — disk-tools never scans the current directory by default",
+                )),
+            },
         }
     }
 }
@@ -87,6 +171,48 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size `{s}` overflows 64 bits"))
 }
 
+/// Parse a duration like `90d` / `6m` / `1y`.
+///
+/// A `value_parser` like [`parse_size`], for the same reason: a malformed value
+/// becomes a clean usage error rather than a panic.
+///
+/// **A bare number is rejected.** `--older-than 90` could as reasonably mean
+/// seconds as days, and guessing wrong on the input to a deletion rule is not a
+/// guess worth making.
+///
+/// `m` is 30 days and `y` is 365 — approximations, and stated here because `m`
+/// could otherwise be read as minutes. Nothing shorter than a day is offered:
+/// this rule exists to find things untouched for a long time.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    const DAY: u64 = 24 * 60 * 60;
+
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (digits, unit) = s.split_at(split);
+    let value: u64 = digits.parse().map_err(|_| {
+        format!("invalid duration `{s}`: expected a number with d/w/m/y, e.g. `90d`")
+    })?;
+
+    let days: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "d" => 1,
+        "w" => 7,
+        "m" => 30,
+        "y" => 365,
+        "" => {
+            return Err(format!(
+                "duration `{s}` needs a unit: d (days), w (weeks), m (months), y (years)"
+            ));
+        }
+        other => return Err(format!("unknown duration suffix `{other}` in `{s}`")),
+    };
+
+    value
+        .checked_mul(days)
+        .and_then(|days| days.checked_mul(DAY))
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("duration `{s}` is too large"))
+}
+
 /// Fail before scanning if the root is missing or unreadable, so the user gets
 /// a clear error up front instead of an empty scan.
 pub fn validate_root(root: &Path) -> Result<(), String> {
@@ -105,17 +231,37 @@ mod tests {
         Args::try_parse_from(std::iter::once("disk-tools").chain(args.iter().copied()))
     }
 
+    /// Parse and resolve in one step, with fixed stand-ins for the two things
+    /// the frontend supplies. Three tests below call this instead of the
+    /// `into_scan_options` that preceded it: the assertions are unchanged, only
+    /// the route to the `ScanOptions` moved when `PATH` stopped being a
+    /// required positional.
+    fn resolved(args: &[&str]) -> Result<Mode, clap::Error> {
+        parse(args)?.resolve(SystemTime::UNIX_EPOCH, UserDirs::default())
+    }
+
+    fn scan_options(args: &[&str]) -> ScanOptions {
+        match resolved(args).expect("resolve") {
+            Mode::Scan(options) => options,
+            Mode::Clean { scan, .. } => scan,
+        }
+    }
+
     #[test]
     fn path_maps_to_scan_options_root() {
-        let args = parse(&["/some/path"]).expect("parse");
-        assert_eq!(args.into_scan_options().root, PathBuf::from("/some/path"));
+        assert_eq!(
+            scan_options(&["/some/path"]).root,
+            PathBuf::from("/some/path")
+        );
     }
 
     #[test]
     fn missing_path_is_a_usage_error() {
-        // clap rejects a missing required positional before main runs, so the
-        // CWD is never scanned by accident.
-        let err = parse(&[]).expect_err("no path must fail");
+        // A missing path is refused before anything is scanned, so the CWD is
+        // never scanned by accident. Since a subcommand can stand in for the
+        // positional, clap cannot mark it required and `resolve` raises clap's
+        // own error instead — same kind, same usage text, same exit code.
+        let err = resolved(&[]).expect_err("no path must fail");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
@@ -248,9 +394,7 @@ mod tests {
 
     #[test]
     fn flags_map_onto_scan_options() {
-        let opts = parse(&["/x", "--depth", "3", "--apparent", "--one-file-system"])
-            .unwrap()
-            .into_scan_options();
+        let opts = scan_options(&["/x", "--depth", "3", "--apparent", "--one-file-system"]);
         assert_eq!(opts.depth, Some(3));
         assert!(opts.apparent);
         assert!(opts.one_file_system);
@@ -272,6 +416,156 @@ mod tests {
             assert!(
                 help.contains(flag),
                 "--help must mention {flag}, got:\n{help}"
+            );
+        }
+    }
+
+    // ---- the clean subcommand -------------------------------------------
+
+    fn clean_options(args: &[&str]) -> CleanOptions {
+        match resolved(args).expect("resolve") {
+            Mode::Clean { clean, .. } => clean,
+            Mode::Scan(_) => panic!("expected the clean subcommand"),
+        }
+    }
+
+    #[test]
+    fn clean_subcommand_parses_its_flags() {
+        let mode = resolved(&[
+            "clean",
+            "/x",
+            "--safe",
+            "--allow-dirty",
+            "--older-than",
+            "90d",
+            "--apply",
+        ])
+        .expect("parse");
+
+        let Mode::Clean { scan, clean, apply } = mode else {
+            panic!("expected the clean subcommand");
+        };
+        assert_eq!(scan.root, PathBuf::from("/x"));
+        assert!(clean.safe_only);
+        assert!(clean.allow_dirty);
+        assert!(apply);
+        assert_eq!(
+            clean.detect.age.expect("age armed").older_than,
+            Duration::from_secs(90 * 24 * 60 * 60)
+        );
+    }
+
+    /// The core looks up neither the clock nor the environment, so if these two
+    /// do not arrive intact the `user-caches` rule matches nothing and two
+    /// denylist entries go unenforced — silently, and only on a real machine.
+    #[test]
+    fn the_supplied_clock_and_directories_reach_the_core() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_750_000_000);
+        let dirs = UserDirs {
+            home: Some(PathBuf::from("/home/me")),
+            local_app_data: Some(PathBuf::from("/local")),
+            app_data: Some(PathBuf::from("/roaming")),
+        };
+
+        let mode = parse(&["clean", "/x", "--older-than", "1d"])
+            .expect("parse")
+            .resolve(now, dirs.clone())
+            .expect("resolve");
+
+        let Mode::Clean { clean, .. } = mode else {
+            panic!("expected the clean subcommand");
+        };
+        assert_eq!(clean.detect.user_dirs, dirs);
+        assert_eq!(clean.detect.age.expect("age armed").now, now);
+    }
+
+    /// The bare form must be untouched by the subcommand's arrival — this is the
+    /// regression proof for "identical to v0.1".
+    #[test]
+    fn a_bare_path_is_still_a_scan() {
+        assert!(matches!(resolved(&["/x"]), Ok(Mode::Scan(_))));
+    }
+
+    #[test]
+    fn older_than_parses_duration_suffixes() {
+        const DAY: u64 = 24 * 60 * 60;
+
+        let age = |arg: &str| {
+            clean_options(&["clean", "/x", "--older-than", arg])
+                .detect
+                .age
+                .expect("age armed")
+                .older_than
+        };
+
+        assert_eq!(age("1d"), Duration::from_secs(DAY));
+        assert_eq!(age("2w"), Duration::from_secs(14 * DAY));
+        assert_eq!(age("6m"), Duration::from_secs(180 * DAY));
+        assert_eq!(age("1y"), Duration::from_secs(365 * DAY));
+        // Case-insensitive, like `--min-size`.
+        assert_eq!(age("90D"), Duration::from_secs(90 * DAY));
+    }
+
+    #[test]
+    fn older_than_rejects_garbage() {
+        for bad in ["12x", "abc", "d", "-1d"] {
+            assert!(
+                parse(&["clean", "/x", "--older-than", bad]).is_err(),
+                "`{bad}` must be a usage error"
+            );
+        }
+    }
+
+    /// `90` could mean seconds or days. A deletion rule is not the place to
+    /// guess, so the unit is required rather than defaulted.
+    #[test]
+    fn older_than_rejects_a_bare_number() {
+        let err = parse(&["clean", "/x", "--older-than", "90"])
+            .expect_err("a bare number must not be accepted");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn older_than_overflow_is_a_clean_error_not_a_panic() {
+        let err = parse(&["clean", "/x", "--older-than", "99999999999999999999y"])
+            .expect_err("overflow must not panic");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// D9: absent flag means the age rule does not run at all.
+    #[test]
+    fn absent_older_than_is_none() {
+        assert!(
+            clean_options(&["clean", "/x"]).detect.age.is_none(),
+            "no --older-than must leave the age rule unarmed"
+        );
+    }
+
+    #[test]
+    fn clean_without_a_path_is_a_usage_error() {
+        let err = parse(&["clean"]).expect_err("clean needs a path");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn help_documents_both_forms() {
+        use clap::CommandFactory;
+
+        let help = Args::command().render_long_help().to_string();
+        assert!(
+            help.contains("clean"),
+            "--help must list the subcommand:\n{help}"
+        );
+
+        let clean_help = Args::command()
+            .find_subcommand_mut("clean")
+            .expect("the clean subcommand exists")
+            .render_long_help()
+            .to_string();
+        for flag in ["--safe", "--apply", "--allow-dirty", "--older-than"] {
+            assert!(
+                clean_help.contains(flag),
+                "`clean --help` must mention {flag}, got:\n{clean_help}"
             );
         }
     }
