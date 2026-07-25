@@ -63,7 +63,8 @@ disc-tools/
 │       ├── walk.rs     # read_dir + rayon par_iter recursion, skip collection
 │       ├── size.rs     # allocated (blocks*512 | GetCompressedFileSizeW) + apparent
 │       ├── dedup.rs    # hardlink identity → lexicographically-first attribution
-│       └── tree.rs     # ScanNode / ScanTree / SkippedEntry / SkipReason + aggregation
+│       ├── tree.rs     # ScanNode / ScanTree / SkippedEntry / SkipReason + aggregation
+│       └── windows_dir.rs  # cfg(windows): AllocationSize + file id per directory
 ├── cli/                # disk-tools (bin) — CLI frontend
 │   ├── Cargo.toml      # clap, terminal_size, serde_json, indicatif, unicode-width
 │   ├── src/
@@ -104,6 +105,12 @@ Invariants worth keeping in mind:
   output only; directory sizes stay full-subtree (du semantics).
 - **stdout is for the report, stderr for everything else** — that is what keeps
   `--json` pipe-clean.
+- **Windows reads its facts from the directory, not from each file.** Allocated
+  size and file identity both come from one `GetFileInformationByHandleEx` call
+  per directory; `size.rs` is only the fallback there. Unix takes the per-file
+  path and is unchanged.
+- **`deny(unsafe_code)` is exempted per function, never per module** — four
+  `#[cfg(windows)]` functions, each listed in `core/src/lib.rs`.
 
 ## Configuration
 

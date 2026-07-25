@@ -67,9 +67,23 @@ mod tests {
     }
 
     // Only the hardlink fixtures (all `#[cfg(unix)]`) inspect file entries.
-    #[cfg(unix)]
     fn file_entries(entries: &[WalkEntry]) -> impl Iterator<Item = &WalkEntry> {
         entries.iter().filter(|e| !e.is_dir)
+    }
+
+    /// Create a hard link, or report that this filesystem cannot.
+    ///
+    /// NTFS supports hard links without special privileges, but ReFS and FAT do
+    /// not — and a test that quietly passes because its fixture failed to build
+    /// is worse than no test.
+    fn try_hard_link(original: &Path, link: &Path) -> bool {
+        match fs::hard_link(original, link) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("skipping: this filesystem has no hard links ({err})");
+                false
+            }
+        }
     }
 
     /// Map of every entry's path to its `allocated`, for comparing whole trees.
@@ -80,7 +94,9 @@ mod tests {
             .collect()
     }
 
-    #[cfg(unix)]
+    /// Runs on **both** platforms since Windows entries gained an identity —
+    /// this is the end-to-end proof that dedup fires there, where the walk-level
+    /// `windows_hardlinks_share_an_identity` only proves the input.
     #[test]
     fn hardlink_counted_once() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -88,7 +104,9 @@ mod tests {
         fs::create_dir(root.join("a")).expect("mkdir");
         fs::create_dir(root.join("b")).expect("mkdir");
         write(&root.join("a/original.bin"), 4096);
-        fs::hard_link(root.join("a/original.bin"), root.join("b/link.bin")).expect("hard_link");
+        if !try_hard_link(&root.join("a/original.bin"), &root.join("b/link.bin")) {
+            return;
+        }
 
         let mut walked = walk(&opts(root));
         // Both links measured the same bytes before attribution.
@@ -114,7 +132,9 @@ mod tests {
         assert_eq!(nonzero, 1, "one link keeps the bytes, the other is zeroed");
     }
 
-    #[cfg(unix)]
+    /// Also cross-platform now: the lex-first rule is what makes directory
+    /// totals reproducible under a parallel walk, and it must hold wherever
+    /// identity does.
     #[test]
     fn hardlink_attributed_to_lexicographically_first_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -125,7 +145,9 @@ mod tests {
         let first = root.join("a/first.bin");
         let second = root.join("z/second.bin");
         write(&first, 4096);
-        fs::hard_link(&first, &second).expect("hard_link");
+        if !try_hard_link(&first, &second) {
+            return;
+        }
 
         let mut walked = walk(&opts(root));
         attribute(&mut walked.entries);

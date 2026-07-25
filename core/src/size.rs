@@ -4,11 +4,11 @@
 //! `apparent` is what `ls` shows, `allocated` is what you'd actually get back by
 //! deleting it. They diverge for sparse and compressed files.
 //!
-//! **The two are equal for ordinary files on Windows.** `st_blocks` on Unix is
-//! true allocation, rounded up to a block; `GetCompressedFileSize` is only the
-//! *compressed or sparse* size, and falls back to the logical length for
-//! everything else. Slack space is therefore invisible on Windows — see
-//! [`allocated`]'s note for what it would take to fix.
+//! **On Windows this module is the fallback, not the main path.** The walk gets
+//! both numbers from the directory listing (see [`crate::windows_dir`]), which
+//! is the only place a real `AllocationSize` is available; what remains here is
+//! used when the listing did not cover an entry. See [`allocated`] for why the
+//! path-based API cannot answer the question on its own.
 
 use std::fs::Metadata;
 use std::io;
@@ -101,18 +101,16 @@ fn verbatim_if_long(path: &Path) -> std::borrow::Cow<'_, Path> {
 /// place the crate reaches for FFI — hence the scoped `allow` against the
 /// crate-wide `deny(unsafe_code)`.
 ///
-/// **Known gap.** `GetCompressedFileSize` returns the true on-disk size only
-/// for compressed and sparse files; for an ordinary file it is documented to
-/// return "the actual file size, the same as the value returned by a call to
-/// `GetFileSize`". So a 1-byte file reports 1 byte here where Unix reports a
-/// whole block, and slack space never shows up in a Windows scan.
+/// **This is a fallback.** `GetCompressedFileSize` returns the true on-disk size
+/// only for compressed and sparse files; for an ordinary file it is documented
+/// to return "the actual file size, the same as the value returned by a call to
+/// `GetFileSize`", so a 1-byte file reports 1 byte here where Unix reports a
+/// whole block.
 ///
-/// The true figure is `AllocationSize`, reachable two ways, both rejected for
-/// v0.1: `GetFileInformationByHandleEx(FileStandardInfo)` needs an open handle
-/// *per file* — the exact syscall cost this module exists to avoid — while
-/// `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` yields it per
-/// directory entry, one handle per *directory*, which would fit the walk but
-/// means replacing `read_dir` on Windows with a second enumeration path.
+/// The real figure is `AllocationSize`, which [`crate::windows_dir`] now reads
+/// for every entry of a directory at once. This path survives for the entries
+/// that listing misses — a file created between the listing and the walk
+/// reaching it — where an approximate size beats none.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn allocated(path: &Path, _metadata: &Metadata) -> io::Result<u64> {
