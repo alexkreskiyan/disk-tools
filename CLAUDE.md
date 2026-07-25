@@ -40,7 +40,7 @@ rather than as ad-hoc commands.
 | `just check` | `cargo check --workspace --all-targets` — CI runs it pinned to MSRV 1.85 |
 | `just run <ARGS>` | Run the CLI, e.g. `just run ~/Downloads --json` |
 | `just release` | Optimized host build → `target/release/disk-tools` |
-| `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` / `just bench-phases <path>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
+| `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` / `just bench-phases <path>` / `just bench-stat <dir>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
 CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` on Linux, macOS
 and Windows, plus a Linux job pinned to MSRV 1.85 running `just check`. It calls the

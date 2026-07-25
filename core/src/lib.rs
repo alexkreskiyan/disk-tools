@@ -114,4 +114,71 @@ mod tests {
             tree.allocated
         );
     }
+
+    /// Diagnostic: does stat-ing the entries of **one** directory scale?
+    ///
+    /// The walk parallelises across subdirectories but not within one, so a wide
+    /// flat directory runs single-threaded. Before changing that, this asks
+    /// whether the kernel would even allow a speed-up, or whether the metadata
+    /// path serialises anyway — in which case parallelising the loop buys
+    /// nothing and costs contention.
+    ///
+    /// Passes alternate (seq, par, seq, par, …) so cache warming cannot bias
+    /// whichever runs second, and the best of each is reported.
+    ///
+    /// ```text
+    /// just bench-stat /tmp/flat-dir
+    /// ```
+    #[test]
+    #[ignore = "diagnostic: needs DT_PHASE_PATH, prints timings, asserts nothing"]
+    fn dir_stat_scaling() {
+        use rayon::prelude::*;
+
+        let root = std::env::var("DT_PHASE_PATH")
+            .expect("set DT_PHASE_PATH to a directory holding many files");
+        let paths: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+
+        // Summing the lengths keeps the optimiser from eliding the stat calls.
+        let sequential = || {
+            let start = Instant::now();
+            let total: u64 = paths
+                .iter()
+                .filter_map(|p| std::fs::symlink_metadata(p).ok())
+                .map(|m| m.len())
+                .sum();
+            (start.elapsed(), total)
+        };
+        let parallel = || {
+            let start = Instant::now();
+            let total: u64 = paths
+                .par_iter()
+                .filter_map(|p| std::fs::symlink_metadata(p).ok())
+                .map(|m| m.len())
+                .sum();
+            (start.elapsed(), total)
+        };
+
+        let mut best_seq = std::time::Duration::MAX;
+        let mut best_par = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let (seq, a) = sequential();
+            let (par, b) = parallel();
+            assert_eq!(a, b, "both passes must see the same bytes");
+            best_seq = best_seq.min(seq);
+            best_par = best_par.min(par);
+        }
+
+        println!("\n{root} — {} entries in one directory", paths.len());
+        println!("  sequential {best_seq:>9.1?}");
+        println!("  parallel   {best_par:>9.1?}");
+        println!(
+            "  speed-up   {:.2}x on {} threads",
+            best_seq.as_secs_f64() / best_par.as_secs_f64(),
+            rayon::current_num_threads()
+        );
+    }
 }

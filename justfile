@@ -114,6 +114,12 @@ bench-phases DIR:
     DT_PHASE_PATH="{{DIR}}" cargo test --release -p disk-tools-core --lib \
         -- --ignored --nocapture phase_split
 
+# Does stat-ing one directory's entries scale? Answers whether parallelising the
+# per-directory loop is worth doing, or whether the kernel serialises anyway.
+bench-stat DIR:
+    DT_PHASE_PATH="{{DIR}}" cargo test --release -p disk-tools-core --lib \
+        -- --ignored --nocapture dir_stat_scaling
+
 # Peak RSS of one scan of DIR (AC3 of the v0.1 spec's Task 11).
 bench-memory DIR *ARGS:
     #!/usr/bin/env bash

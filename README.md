@@ -215,6 +215,7 @@ rather than as ad-hoc commands.
 | `just bench <dir>` | Benchmark against `du -sh` and `diskus` (needs `hyperfine`, `diskus`) |
 | `just bench-memory <path>` | Peak RSS of one scan |
 | `just bench-phases <path>` | Where a scan spends its time, by phase |
+| `just bench-stat <dir>` | Whether stat-ing one directory's entries scales |
 
 CI runs `just verify` and `just build` on Linux, macOS and Windows, plus a
 Linux job pinned to the MSRV running `just check`
