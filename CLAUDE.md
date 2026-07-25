@@ -145,7 +145,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 | `kb/specs/` | Feature specs (`/write-spec`) | `2026.07` |
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07` |
-| `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07` |
+| `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
 | `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07` |
 
 Files are always written under a `<YYYY.MM>/` folder — never directly under `kb/<folder>/`. Filenames begin with `<YYYY.MM.DD>-` and never include the folder name.
