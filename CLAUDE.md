@@ -142,7 +142,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
 | `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.25` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
-| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07` |
+| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.25` |
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07` |
 | `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
