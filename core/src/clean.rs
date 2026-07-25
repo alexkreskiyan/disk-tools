@@ -1,168 +1,980 @@
-//! Removing things, safely.
+//! Deciding what may be removed, and what removing it would free.
 //!
-//! Everything this crate deletes goes to the **OS trash**, never `rm`. A cleanup
-//! tool that is wrong once should cost its user a trip to the Trash, not their
-//! data — so the recoverable operation is the only one offered.
+//! **Nothing here touches the filesystem.** [`plan`] reads a [`ScanTree`] and
+//! returns a decision, which is what makes every rule below testable against a
+//! hand-built tree: a denylist bug should cost a failing test, not a directory.
+//! Removal lives in [`crate::trash`], the only module that needs the `trash`
+//! crate — so planning is available even to a consumer who cannot apply.
 //!
-//! Failures travel as data, the way [`crate::ScanTree::skipped`] does: one path
-//! that cannot be trashed must not abort the rest, and the caller needs to know
-//! precisely what survived. The `Result` here is therefore a *per-item* outcome,
-//! not an error to propagate.
+//! Three of v0.2's four safety mechanisms are decided here: the never-touch
+//! denylist, the two tiers, and `--safe`. The fourth, the git guard, joins the
+//! same pipeline in Task 5.
 
+use crate::detect::{Category, DetectOptions, UserDirs, detect};
+use crate::paths::{is_within, normalize_lexically, under_root};
+use crate::tree::{ScanNode, ScanTree};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Why one path could not be moved to the trash.
+/// Directories that are never candidates, whatever matched them, named
+/// relative to the filesystem root.
 ///
-/// Carries the reason as a `String` rather than the backend's error type: the
-/// core stays free of a public dependency on `trash`, and the frontend needs
-/// something printable rather than something matchable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrashFailure {
-    /// The path that could not be trashed.
-    pub path: PathBuf,
-    /// What the operating system said, in a form fit to show a user.
-    pub reason: String,
+/// Root-relative rather than absolute so that `Windows` protects a system
+/// installed on `D:` exactly as it protects one on `C:`; a hardcoded
+/// `C:\Windows` would quietly cover only the common case.
+///
+/// **Not gated per platform**, deliberately. Over-denying costs a user one
+/// directory they could have cleaned; under-denying costs them a system
+/// directory. Given that asymmetry the whole list applies everywhere, which also
+/// means every entry is exercised on every CI runner rather than only on the one
+/// platform that has it.
+const DENIED_ROOTS: &[&[&str]] = &[
+    &["System"],
+    // No tilde: this is the *system* cache. `~/Library/Caches` is a candidate
+    // (§8.3), and telling the two apart is the whole point of deriving the
+    // user's roots from a known home.
+    &["Library", "Caches"],
+    &["Windows"],
+    &["Program Files"],
+    &["Program Files (x86)"],
+];
+
+/// Directory names that may never be auto-tier, however they were matched.
+///
+/// Recreating a virtualenv is less deterministic than a lockfile install, so it
+/// is the user's call every time (concept §4).
+const CONFIRM_ONLY_NAMES: &[&str] = &["venv", ".venv"];
+
+/// How eligible a candidate is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Tier {
+    /// Regenerable, so removable without per-item confirmation.
+    Auto,
+    /// Needs the user to say yes to this specific path.
+    Confirm,
 }
 
-/// Move `path` to the OS trash.
+/// One thing the plan proposes to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Candidate {
+    pub path: PathBuf,
+    pub category: Category,
+    pub tier: Tier,
+
+    /// Attributed bytes — what removing this would free, before the question
+    /// [`Self::shared`] asks.
+    pub allocated: u64,
+
+    /// This holds content reachable from outside it, so `allocated` is an upper
+    /// bound rather than a promise.
+    ///
+    /// Exact on Unix. On Windows only sharing *within the scan* is visible, so
+    /// the absence of this marker there is **not** evidence of unshared content
+    /// (D10) — a report must not imply otherwise.
+    pub shared: bool,
+}
+
+/// Why something that matched is not in the plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ExcludeReason {
+    /// On the never-touch denylist. No flag overrides this.
+    Denylisted,
+}
+
+/// Something a rule matched and the plan then refused.
 ///
-/// A directory goes as a whole; the backend does not descend, so the cost is the
-/// filesystem's rename or copy, not one operation per entry — 10,000 files trash
-/// as fast as one.
+/// Recorded rather than dropped: a user who expected a directory to appear needs
+/// to know why it did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Excluded {
+    pub path: PathBuf,
+    pub reason: ExcludeReason,
+}
+
+/// What a cleanup would do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CleanPlan {
+    /// Sorted by path, so two runs over one tree produce identical plans.
+    pub candidates: Vec<Candidate>,
+
+    /// The sum of the candidates' `allocated`. An **upper bound** whenever any
+    /// candidate is `shared`.
+    pub reclaimable: u64,
+
+    pub excluded: Vec<Excluded>,
+}
+
+/// Everything a cleanup needs to know.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanOptions {
+    /// Which rules run, and against what — categories, the age rule, and where
+    /// this user's directories are.
+    pub detect: DetectOptions,
+
+    /// `--safe`: admit auto-tier candidates only.
+    pub safe_only: bool,
+
+    /// `--allow-dirty`: relax the git guard. **Never** the denylist.
+    ///
+    /// **Currently inert.** The guard itself arrives in Task 5; until then
+    /// setting this changes nothing, and a caller must not read its presence as
+    /// "the guard exists and can be relaxed". Carried now so the option struct
+    /// does not change shape underneath the CLI mid-version.
+    pub allow_dirty: bool,
+}
+
+/// Decide what could be removed, and what that would free.
 ///
-/// Every failure the backend *reports* comes back as `Err`: a missing path, a
-/// permission problem, a volume with no trash. Callers collect these and carry on.
+/// Pure: it reads a [`ScanTree`] and returns a decision, touching no filesystem.
+/// That is what makes every rule below testable against a hand-built tree — a
+/// denylist bug should cost a failing test, not a directory.
 ///
-/// **Known upstream gap.** On Windows, `trash` 5.2.6 calls
-/// `CoCreateInstance(...).unwrap()` on its delete path (`src/windows.rs:42`) where
-/// its other operations use `?`. If COM cannot be initialised — a service or
-/// session-0 process, some sandboxed runners — that panics instead of returning,
-/// and no wrapper here can convert it. `just smoke-trash` runs in CI on all three
-/// platforms precisely so this shows up as a red build rather than as a user's
-/// aborted cleanup.
-pub fn move_to_trash(path: &Path) -> Result<(), TrashFailure> {
-    trash::delete(path).map_err(|err| TrashFailure {
-        path: path.to_path_buf(),
-        reason: err.to_string(),
-    })
+/// The order is the safety model:
+///
+/// 1. the rules propose ([`crate::detect`]);
+/// 2. the **denylist** removes, unconditionally — no flag overrides it, and what
+///    it removes is reported rather than dropped;
+/// 3. each survivor gets a tier, virtualenvs demoted whatever their category;
+/// 4. `--safe` keeps only auto-tier;
+/// 5. candidates whose content is reachable from outside them are marked, so
+///    the total can be read as the upper bound it is.
+pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
+    let denied = denylist(&options.detect.user_dirs);
+    let groups = link_groups_by_path(tree);
+    let nodes = nodes_by_path(tree);
+
+    let mut candidates = Vec::new();
+    let mut excluded = Vec::new();
+
+    for detection in detect(tree, &options.detect) {
+        if is_denied(&detection.path, &denied) {
+            excluded.push(Excluded {
+                path: detection.path,
+                reason: ExcludeReason::Denylisted,
+            });
+            continue;
+        }
+
+        let tier = tier_for(&detection.path, detection.category);
+        // Not recorded in `excluded`, deliberately. That list answers "the tool
+        // refused something you might have expected"; `--safe` is the user's own
+        // narrowing, and putting the two in one list would show a protected
+        // system directory beside something they asked to hide. The frontend
+        // knows the flag was passed and can say so itself.
+        if options.safe_only && tier != Tier::Auto {
+            continue;
+        }
+
+        let shared = nodes
+            .get(detection.path.as_path())
+            .is_some_and(|node| holds_shared_content(node, &detection.path, &groups));
+
+        candidates.push(Candidate {
+            path: detection.path,
+            category: detection.category,
+            tier,
+            allocated: detection.allocated,
+            shared,
+        });
+    }
+
+    // The walk is parallel and its order is not guaranteed; a plan that lists
+    // the same paths in a different order every run cannot be reviewed.
+    candidates.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+    excluded.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+
+    // No candidate nests inside another (`detect` never descends into a match),
+    // so summing counts no byte twice.
+    let reclaimable = candidates.iter().map(|c| c.allocated).sum();
+
+    CleanPlan {
+        candidates,
+        reclaimable,
+        excluded,
+    }
+}
+
+/// The never-touch roots, absolute ones resolved against this user's directories.
+fn denylist(user_dirs: &UserDirs) -> Vec<PathBuf> {
+    let mut denied = Vec::new();
+    if let Some(home) = &user_dirs.home {
+        denied.push(home.join("Library").join("Application Support"));
+    }
+    if let Some(app_data) = &user_dirs.app_data {
+        denied.push(app_data.clone());
+    }
+    denied
+}
+
+/// Is this path protected?
+///
+/// Checked in **both** its raw and its lexically-resolved form, because either
+/// alone leaks. `Path` cannot resolve `..`, so `/home/me/../../System` would
+/// slip past a literal comparison; and resolving *instead of* comparing would
+/// lose `/System/../Users/x`, which matches `System` literally and stops
+/// matching once resolved. Taking the union means the denylist only ever grows,
+/// which is the only direction it may move.
+fn is_denied(path: &Path, absolute: &[PathBuf]) -> bool {
+    matches_denylist(path, absolute) || matches_denylist(&normalize_lexically(path), absolute)
+}
+
+fn matches_denylist(path: &Path, absolute: &[PathBuf]) -> bool {
+    DENIED_ROOTS.iter().any(|root| under_root(path, root))
+        || absolute.iter().any(|root| is_within(path, root))
+}
+
+/// Auto for the safe-list categories, confirm for anything judged by age — and
+/// confirm for a virtualenv whatever its category said.
+///
+/// The demotion changes nothing today: no category matches a `venv/`, so the
+/// only way one reaches a plan is the age rule, which is already confirm. It
+/// exists so that a category added later cannot silently make virtualenvs
+/// removable without asking.
+fn tier_for(path: &Path, category: Category) -> Tier {
+    if path
+        .file_name()
+        .is_some_and(|name| CONFIRM_ONLY_NAMES.iter().any(|deny| name == *deny))
+    {
+        return Tier::Confirm;
+    }
+
+    match category {
+        Category::Old => Tier::Confirm,
+        Category::RustTarget | Category::NodeModules | Category::Pycache | Category::UserCaches => {
+            Tier::Auto
+        }
+    }
+}
+
+/// Every path that shares an inode with another path in this scan, mapped to
+/// the group it belongs to.
+fn link_groups_by_path(tree: &ScanTree) -> HashMap<&Path, &[PathBuf]> {
+    let mut by_path = HashMap::new();
+    for group in &tree.link_groups {
+        for path in group {
+            by_path.insert(path.as_path(), group.as_slice());
+        }
+    }
+    by_path
+}
+
+fn nodes_by_path(tree: &ScanTree) -> HashMap<&Path, &ScanNode> {
+    let mut by_path = HashMap::new();
+    collect_nodes(&tree.root, &mut by_path);
+    by_path
+}
+
+fn collect_nodes<'a>(node: &'a ScanNode, out: &mut HashMap<&'a Path, &'a ScanNode>) {
+    out.insert(node.path.as_path(), node);
+    for child in &node.children {
+        collect_nodes(child, out);
+    }
+}
+
+/// Would deleting `candidate` actually free its bytes, or is its content
+/// reachable from somewhere else?
+///
+/// Two signals answer that between them (D10), and a file trips either:
+///
+/// 1. **A partner inside this scan but outside the candidate.** Exact, and
+///    available on both platforms, since `FileId` exists on Windows too.
+/// 2. **`links` greater than the group holding it** — a name for the same inode
+///    that the scan never saw. A file in no group counts as a group of one, so a
+///    twin outside the scanned tree is caught here. Unix only: `links` is `None`
+///    on Windows, and `None` means *unknown*, never `1`.
+fn holds_shared_content(
+    node: &ScanNode,
+    candidate: &Path,
+    groups: &HashMap<&Path, &[PathBuf]>,
+) -> bool {
+    if !node.is_dir {
+        let group = groups.get(node.path.as_path()).copied().unwrap_or_default();
+        // A file in no group still owns its single name.
+        let group_size = group.len().max(1);
+
+        if group.iter().any(|partner| !is_within(partner, candidate)) {
+            return true;
+        }
+        if node.links.is_some_and(|links| links as usize > group_size) {
+            return true;
+        }
+    }
+
+    node.children
+        .iter()
+        .any(|child| holds_shared_content(child, candidate, groups))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use crate::detect::Age;
+    use std::time::{Duration, SystemTime};
 
-    /// Trash `path`, or report that this environment cannot.
-    ///
-    /// Returns `false` after printing a notice, so a smoke test bails instead of
-    /// failing where no backend exists — the rule the permission fixtures follow,
-    /// since a test that passes because its fixture failed to build is worse than
-    /// no test. Shared by both smoke tests so the branch has one implementation
-    /// and one test rather than duplicated prose in each.
-    fn trashed_or_skipped(path: &Path) -> bool {
-        match move_to_trash(path) {
-            Ok(()) => true,
-            Err(failure) => {
-                eprintln!(
-                    "skipping: this environment has no usable trash backend ({})",
-                    failure.reason
-                );
-                false
-            }
+    // ---- fixtures --------------------------------------------------------
+    //
+    // Hand-built trees throughout: `plan` is pure, so none of these rules need
+    // a filesystem to be exercised — which is the point of the split. The one
+    // test that does touch disk is `plan_writes_nothing`, and it does so to
+    // prove the opposite.
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_750_000_000)
+    }
+
+    fn file(path: &str, allocated: u64) -> ScanNode {
+        ScanNode {
+            path: PathBuf::from(path),
+            allocated,
+            apparent: allocated,
+            is_dir: false,
+            modified: Some(now()),
+            links: Some(1),
+            children: Vec::new(),
         }
     }
 
-    /// Covers the skip branch itself, which the `#[ignore]`d smoke tests never
-    /// reach: every platform CI runs on turns out to *have* a trash backend, so
-    /// the "no backend" arm would otherwise be reasoned about and never executed.
-    ///
-    /// A path that cannot be trashed stands in for a missing backend because the
-    /// branch cannot tell them apart — both arrive as `Err`. That is the point:
-    /// whatever the cause, it must produce a skip rather than a failure.
-    #[test]
-    fn an_unusable_backend_skips_rather_than_fails() {
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        assert!(
-            !trashed_or_skipped(&dir.path().join("cannot-be-trashed.bin")),
-            "a backend failure must report a skip, not panic or fail the test"
-        );
+    fn dir(path: &str, children: Vec<ScanNode>) -> ScanNode {
+        ScanNode {
+            path: PathBuf::from(path),
+            allocated: 4096 + children.iter().map(|c| c.allocated).sum::<u64>(),
+            apparent: 4096,
+            is_dir: true,
+            modified: Some(now()),
+            links: None,
+            children,
+        }
     }
 
-    /// The failure path, exercised without needing a working trash backend: a
-    /// path that does not exist cannot be trashed anywhere.
-    ///
-    /// This is the criterion that matters most for the design — one bad entry in
-    /// a cleanup run must come back as data the caller can report, never a panic
-    /// that takes the whole process with it.
-    #[test]
-    fn trash_failure_is_reported_as_data() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("does-not-exist.bin");
+    fn tree(root: ScanNode) -> ScanTree {
+        ScanTree {
+            root,
+            skipped: Vec::new(),
+            link_groups: Vec::new(),
+        }
+    }
 
-        let failure = move_to_trash(&missing).expect_err("a missing path cannot be trashed");
+    fn opts() -> CleanOptions {
+        CleanOptions::default()
+    }
+
+    /// Options with a home, which is what makes the user-scoped rules — both the
+    /// `user-caches` category and the denylist's `Application Support` — live.
+    fn with_home(home: &str) -> CleanOptions {
+        CleanOptions {
+            detect: DetectOptions {
+                user_dirs: UserDirs {
+                    home: Some(PathBuf::from(home)),
+                    ..UserDirs::default()
+                },
+                ..DetectOptions::default()
+            },
+            ..CleanOptions::default()
+        }
+    }
+
+    fn aging(older_than: Duration) -> CleanOptions {
+        CleanOptions {
+            detect: DetectOptions {
+                age: Some(Age {
+                    older_than,
+                    now: now(),
+                }),
+                ..DetectOptions::default()
+            },
+            ..CleanOptions::default()
+        }
+    }
+
+    fn aged(mut node: ScanNode, age: Duration) -> ScanNode {
+        node.modified = Some(now() - age);
+        node
+    }
+
+    fn paths(plan: &CleanPlan) -> Vec<&Path> {
+        plan.candidates.iter().map(|c| c.path.as_path()).collect()
+    }
+
+    /// A `node_modules` holding one file, ready to be given hardlink partners.
+    fn candidate_with_a_file(file_path: &str, links: Option<u32>) -> ScanNode {
+        let mut inner = file(file_path, 8192);
+        inner.links = links;
+        dir("/p/node_modules", vec![inner])
+    }
+
+    // ---- the denylist ----------------------------------------------------
+
+    /// One case per entry. This is the mechanism with no override — `--safe`
+    /// narrows the plan, `--allow-dirty` relaxes the git guard, and neither
+    /// touches this — so each entry gets its own assertion rather than a
+    /// representative sample.
+    #[test]
+    fn denylisted_paths_are_never_candidates() {
+        let cases = [
+            "/System/node_modules",
+            "/Library/Caches/node_modules",
+            "/Windows/node_modules",
+            "/Program Files/node_modules",
+            "/Program Files (x86)/node_modules",
+            "/home/me/Library/Application Support/node_modules",
+        ];
+
+        for case in cases {
+            let parent = PathBuf::from(case);
+            let parent = parent.parent().expect("has a parent").to_owned();
+            let plan = plan(
+                &tree(dir(
+                    parent.to_str().expect("utf8"),
+                    vec![dir(case, vec![file(&format!("{case}/big.bin"), 1_000_000)])],
+                )),
+                &with_home("/home/me"),
+            );
+
+            assert!(
+                plan.candidates.is_empty(),
+                "{case} must never be a candidate, got {:?}",
+                paths(&plan)
+            );
+            assert_eq!(plan.reclaimable, 0, "{case} must contribute nothing");
+        }
+    }
+
+    /// Windows' roaming profile is a denylist root in its own right — it is not
+    /// derivable from `%LOCALAPPDATA%`, so a `UserDirs` that omits it leaves the
+    /// entry unenforced.
+    #[test]
+    fn the_roaming_profile_is_denied_when_known() {
+        let options = CleanOptions {
+            detect: DetectOptions {
+                user_dirs: UserDirs {
+                    app_data: Some(PathBuf::from("/users/me/AppData/Roaming")),
+                    ..UserDirs::default()
+                },
+                ..DetectOptions::default()
+            },
+            ..CleanOptions::default()
+        };
+
+        let plan = plan(
+            &tree(dir(
+                "/users/me/AppData/Roaming",
+                vec![dir("/users/me/AppData/Roaming/node_modules", vec![])],
+            )),
+            &options,
+        );
+
+        assert!(plan.candidates.is_empty(), "{:?}", paths(&plan));
+    }
+
+    /// Nothing is dropped in silence: a user who expected a directory in the
+    /// plan has to be able to see why it is absent.
+    #[test]
+    fn a_denylisted_path_is_reported_with_its_reason() {
+        let plan = plan(
+            &tree(dir("/Windows", vec![dir("/Windows/node_modules", vec![])])),
+            &opts(),
+        );
 
         assert_eq!(
-            failure.path, missing,
-            "the failure names the path it was given"
+            plan.excluded,
+            vec![Excluded {
+                path: PathBuf::from("/Windows/node_modules"),
+                reason: ExcludeReason::Denylisted,
+            }]
         );
+    }
+
+    /// The tilde distinction under load. `~/Library/Caches` is itself a
+    /// candidate; the identically-named system directory is not, and a
+    /// `node_modules` sitting inside it — which *does* match a rule — is denied
+    /// rather than cleaned.
+    #[test]
+    fn the_denylist_beats_a_safe_list_match() {
+        let plan = plan(
+            &tree(dir(
+                "/",
+                vec![
+                    dir(
+                        "/Library",
+                        vec![dir(
+                            "/Library/Caches",
+                            vec![dir("/Library/Caches/node_modules", vec![])],
+                        )],
+                    ),
+                    dir(
+                        "/home/me",
+                        vec![dir(
+                            "/home/me/Library",
+                            vec![dir("/home/me/Library/Caches", vec![])],
+                        )],
+                    ),
+                ],
+            )),
+            &with_home("/home/me"),
+        );
+
+        assert_eq!(
+            paths(&plan),
+            vec![Path::new("/home/me/Library/Caches")],
+            "the user's cache is a candidate; the system's contents are denied"
+        );
+        assert_eq!(
+            plan.excluded,
+            vec![Excluded {
+                path: PathBuf::from("/Library/Caches/node_modules"),
+                reason: ExcludeReason::Denylisted,
+            }],
+            "and the denial is reported rather than silent"
+        );
+    }
+
+    /// `Path` does not resolve `..`, and the scan carries whatever the user
+    /// typed: `disk-tools clean /home/me/../../System` would reach every node
+    /// under `/System` with the traversal still in its path. Compared
+    /// literally, the denylist would never fire.
+    #[test]
+    fn a_parent_traversal_cannot_escape_the_denylist() {
+        let plan = plan(
+            &tree(dir(
+                "/home/me/../../System",
+                vec![dir("/home/me/../../System/node_modules", vec![])],
+            )),
+            &opts(),
+        );
+
         assert!(
-            !failure.reason.is_empty(),
-            "the failure carries something showable, got an empty reason"
+            plan.candidates.is_empty(),
+            "a traversal into a protected root must still be denied, got {:?}",
+            paths(&plan)
+        );
+        assert_eq!(plan.excluded.len(), 1, "and reported");
+    }
+
+    /// The other direction: a path that matches an entry *literally* must stay
+    /// denied even though resolving it walks back out. Checking only the
+    /// resolved form would lose this one, which is why both are checked.
+    #[test]
+    fn resolving_a_path_can_never_lift_a_denial() {
+        assert!(
+            is_denied(Path::new("/System/../Users/me/node_modules"), &[]),
+            "the raw form is under a denied root, so the denial stands"
         );
     }
 
-    /// The happy path, against the **real** trash.
-    ///
-    /// `#[ignore]` because it moves a file into the developer's actual Trash;
-    /// running it on every `just test` would litter it. Run deliberately with
-    /// `just smoke-trash`.
-    ///
-    /// An environment with no trash backend skips loudly instead of failing —
-    /// see [`trashed_or_skipped`].
-    #[test]
-    #[ignore = "moves a real file to the OS trash; run via `just smoke-trash`"]
-    fn trashing_a_file_removes_the_original() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let victim = dir.path().join("smoke-test.bin");
-        std::fs::write(&victim, b"disk-tools smoke test").expect("write file");
+    // ---- tiers -----------------------------------------------------------
 
-        if trashed_or_skipped(&victim) {
-            assert!(
-                !victim.exists(),
-                "a trashed file must be gone from its original path: {}",
-                victim.display()
+    #[test]
+    fn safe_list_categories_are_auto_tier() {
+        let plan = plan(
+            &tree(dir(
+                "/p",
+                vec![
+                    file("/p/Cargo.toml", 100),
+                    dir("/p/__pycache__", vec![]),
+                    dir("/p/node_modules", vec![]),
+                    dir("/p/target", vec![]),
+                ],
+            )),
+            &opts(),
+        );
+
+        assert_eq!(plan.candidates.len(), 3, "{:?}", paths(&plan));
+        assert!(
+            plan.candidates.iter().all(|c| c.tier == Tier::Auto),
+            "regenerable output needs no per-item confirmation: {:?}",
+            plan.candidates
+        );
+    }
+
+    #[test]
+    fn old_matches_are_confirm_tier() {
+        let plan = plan(
+            &tree(dir(
+                "/p",
+                vec![aged(file("/p/ancient.bin", 4096), 900 * DAY)],
+            )),
+            &aging(90 * DAY),
+        );
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].tier, Tier::Confirm);
+        assert_eq!(plan.candidates[0].category, Category::Old);
+    }
+
+    /// Recreating a virtualenv is less deterministic than a lockfile install, so
+    /// it is the user's call every time — whatever rule found it.
+    #[test]
+    fn virtualenvs_are_confirm_tier() {
+        for name in ["venv", ".venv"] {
+            let path = format!("/p/{name}");
+            let plan = plan(
+                &tree(dir("/p", vec![aged(dir(&path, vec![]), 900 * DAY)])),
+                &aging(90 * DAY),
             );
+
+            assert_eq!(plan.candidates.len(), 1, "{name}: {:?}", paths(&plan));
+            assert_eq!(plan.candidates[0].tier, Tier::Confirm, "{name}");
         }
     }
 
-    /// Answers the concept's warning that trashing a large tree "can be slow or
-    /// fail on some volumes" — the number Task 7 needs to decide whether progress
-    /// reporting is decoration or a requirement.
-    ///
-    /// Prints rather than asserts: there is no threshold worth failing a build
-    /// over, only a figure worth recording.
+    /// The demotion must beat the category, not merely coincide with it — this
+    /// drives the branch with a category that would otherwise be auto-tier.
     #[test]
-    #[ignore = "creates and trashes 10,000 files; run via `just smoke-trash`"]
-    fn trashing_a_large_tree_is_timed() {
-        const FILES: usize = 10_000;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let tree = dir.path().join("large-tree");
-        std::fs::create_dir(&tree).expect("mkdir");
-        for i in 0..FILES {
-            std::fs::write(tree.join(format!("file-{i:05}.bin")), b"x").expect("write file");
-        }
+    fn a_virtualenv_is_demoted_even_when_its_category_is_auto() {
+        assert_eq!(
+            tier_for(Path::new("/p/venv"), Category::NodeModules),
+            Tier::Confirm,
+            "the name wins over a category that would otherwise be auto"
+        );
+        assert_eq!(
+            tier_for(Path::new("/p/node_modules"), Category::NodeModules),
+            Tier::Auto,
+            "and an ordinary auto-tier match is unaffected"
+        );
+    }
 
-        let start = Instant::now();
-        let trashed = trashed_or_skipped(&tree);
-        let elapsed = start.elapsed();
+    #[test]
+    fn safe_flag_admits_only_auto_tier() {
+        let fixture = tree(dir(
+            "/p",
+            vec![
+                dir("/p/node_modules", vec![]),
+                aged(file("/p/ancient.bin", 4096), 900 * DAY),
+            ],
+        ));
+        let mut options = aging(90 * DAY);
 
-        if trashed {
-            println!("\ntrashed {FILES} files in one call: {elapsed:.1?}");
-            assert!(
-                !tree.exists(),
-                "the tree must be gone from its original path"
-            );
+        let both = plan(&fixture, &options);
+        assert_eq!(both.candidates.len(), 2, "{:?}", paths(&both));
+
+        options.safe_only = true;
+        let safe = plan(&fixture, &options);
+
+        assert_eq!(paths(&safe), vec![Path::new("/p/node_modules")]);
+        assert_eq!(
+            safe.reclaimable, 4096,
+            "the excluded confirm-tier bytes leave the total too"
+        );
+    }
+
+    /// The denylist runs **before** `--safe`, and this is the only combination
+    /// that can tell: a confirm-tier match inside a protected root. Every other
+    /// case looks identical whichever order the two run in — with `--safe` off
+    /// the filter is a no-op, and an auto-tier match passes the filter anyway.
+    ///
+    /// Get the order wrong and the path is dropped by the filter before the
+    /// denylist ever sees it, so it vanishes from `excluded` too — the tool
+    /// silently declining to mention that it protected something.
+    #[test]
+    fn the_denylist_beats_the_safe_filter() {
+        let options = CleanOptions {
+            safe_only: true,
+            ..aging(90 * DAY)
+        };
+
+        let plan = plan(
+            &tree(dir(
+                "/Library/Caches",
+                vec![aged(file("/Library/Caches/ancient.bin", 4096), 900 * DAY)],
+            )),
+            &options,
+        );
+
+        assert!(plan.candidates.is_empty(), "{:?}", paths(&plan));
+        assert_eq!(
+            plan.excluded,
+            vec![Excluded {
+                path: PathBuf::from("/Library/Caches/ancient.bin"),
+                reason: ExcludeReason::Denylisted,
+            }],
+            "the denial must be reported even when --safe would also have dropped it"
+        );
+    }
+
+    /// `--safe` is a **silent** filter, on purpose. `excluded` answers "the tool
+    /// refused something you might have expected"; this is the user's own
+    /// narrowing, and listing the two together would put a protected system
+    /// directory beside something they asked to hide.
+    #[test]
+    fn the_safe_filter_records_nothing() {
+        let options = CleanOptions {
+            safe_only: true,
+            ..aging(90 * DAY)
+        };
+
+        let plan = plan(
+            &tree(dir(
+                "/p",
+                vec![aged(file("/p/ancient.bin", 4096), 900 * DAY)],
+            )),
+            &options,
+        );
+
+        assert!(plan.candidates.is_empty());
+        assert!(
+            plan.excluded.is_empty(),
+            "a user-requested filter is not a refusal, got {:?}",
+            plan.excluded
+        );
+    }
+
+    // ---- totals ----------------------------------------------------------
+
+    #[test]
+    fn reclaimable_is_the_sum_of_candidate_allocated() {
+        let plan = plan(
+            &tree(dir(
+                "/p",
+                vec![
+                    dir(
+                        "/p/a",
+                        vec![dir(
+                            "/p/a/node_modules",
+                            vec![file("/p/a/node_modules/x.bin", 100_000)],
+                        )],
+                    ),
+                    dir(
+                        "/p/b",
+                        vec![dir(
+                            "/p/b/node_modules",
+                            vec![file("/p/b/node_modules/y.bin", 200_000)],
+                        )],
+                    ),
+                ],
+            )),
+            &opts(),
+        );
+
+        assert_eq!(plan.candidates.len(), 2);
+        assert_eq!(
+            plan.reclaimable,
+            plan.candidates.iter().map(|c| c.allocated).sum::<u64>()
+        );
+        // Each candidate's own subtree total, so the sum is 2×(dir + file).
+        assert_eq!(plan.reclaimable, (4096 + 100_000) + (4096 + 200_000));
+    }
+
+    #[test]
+    fn empty_tree_yields_empty_plan() {
+        let plan = plan(&tree(dir("/p", vec![])), &opts());
+
+        assert!(plan.candidates.is_empty());
+        assert!(plan.excluded.is_empty());
+        assert_eq!(plan.reclaimable, 0);
+    }
+
+    #[test]
+    fn plan_is_deterministic_across_runs() {
+        let fixture = tree(dir(
+            "/p",
+            vec![
+                dir("/p/z", vec![dir("/p/z/node_modules", vec![])]),
+                dir("/p/a", vec![dir("/p/a/node_modules", vec![])]),
+                dir("/p/m", vec![dir("/p/m/__pycache__", vec![])]),
+            ],
+        ));
+
+        let first = plan(&fixture, &opts());
+        assert_eq!(first, plan(&fixture, &opts()));
+
+        let mut sorted = first.candidates.clone();
+        sorted.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+        assert_eq!(first.candidates, sorted, "candidates are ordered by path");
+    }
+
+    // ---- the shared marker -----------------------------------------------
+
+    #[test]
+    fn unshared_candidate_is_not_marked() {
+        let plan = plan(
+            &tree(dir(
+                "/p",
+                vec![candidate_with_a_file("/p/node_modules/lib.bin", Some(1))],
+            )),
+            &opts(),
+        );
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(
+            !plan.candidates[0].shared,
+            "content with one name is not shared, and the total is exact"
+        );
+    }
+
+    /// Case 2 of §8.3 — the one that over-reports. The keeper is inside the
+    /// candidate but another name for the same inode lives outside it, so
+    /// deleting the candidate frees nothing.
+    #[test]
+    fn partner_outside_the_candidate_marks_it_shared() {
+        let mut fixture = tree(dir(
+            "/p",
+            vec![
+                candidate_with_a_file("/p/node_modules/lib.bin", Some(2)),
+                file("/p/keep/lib.bin", 0),
+            ],
+        ));
+        fixture.link_groups = vec![vec![
+            PathBuf::from("/p/keep/lib.bin"),
+            PathBuf::from("/p/node_modules/lib.bin"),
+        ]];
+
+        let plan = plan(&fixture, &opts());
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(
+            plan.candidates[0].shared,
+            "a partner outside the candidate makes the total an upper bound"
+        );
+    }
+
+    /// The counterweight: without it the marker could simply fire on anything
+    /// hardlinked, and a `node_modules` full of internal links would be reported
+    /// as freeing nothing when it frees everything.
+    #[test]
+    fn hardlinks_entirely_inside_the_candidate_are_not_marked() {
+        let mut first = file("/p/node_modules/a.bin", 8192);
+        first.links = Some(2);
+        let mut second = file("/p/node_modules/b.bin", 0);
+        second.links = Some(2);
+
+        let mut fixture = tree(dir("/p", vec![dir("/p/node_modules", vec![first, second])]));
+        fixture.link_groups = vec![vec![
+            PathBuf::from("/p/node_modules/a.bin"),
+            PathBuf::from("/p/node_modules/b.bin"),
+        ]];
+
+        let plan = plan(&fixture, &opts());
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(
+            !plan.candidates[0].shared,
+            "both names go with the candidate, so the bytes really are freed"
+        );
+    }
+
+    /// The signal that catches a package manager hardlinking into a store
+    /// outside the scanned tree — the case that matters most in practice. The
+    /// scan sees one name; `links` says there are two.
+    #[cfg(unix)]
+    #[test]
+    fn links_exceeding_the_group_marks_an_out_of_scan_partner() {
+        let plan = plan(
+            &tree(dir(
+                "/p",
+                vec![candidate_with_a_file("/p/node_modules/lib.bin", Some(2))],
+            )),
+            &opts(),
+        );
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(
+            plan.candidates[0].shared,
+            "two names but one in the scan means the other is outside it"
+        );
+    }
+
+    /// The honest gap (D10). `links` is `None` on Windows, and `None` means
+    /// *unknown*, never `1` — but unknown cannot be reported as shared either,
+    /// so an out-of-scan partner goes unseen there. A test pins it so nobody
+    /// later reads the absent marker as a guarantee.
+    #[test]
+    fn an_absent_link_count_does_not_mark() {
+        let plan = plan(
+            &tree(dir(
+                "/p",
+                vec![candidate_with_a_file("/p/node_modules/lib.bin", None)],
+            )),
+            &opts(),
+        );
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(
+            !plan.candidates[0].shared,
+            "the gap is in the signal, not a claim about the content"
+        );
+    }
+
+    /// Sharing can sit anywhere under a candidate, not just at its top level —
+    /// the marker walks the whole subtree.
+    #[test]
+    fn a_partner_deep_inside_the_candidate_is_still_found() {
+        let mut deep = file("/p/node_modules/pkg/dist/lib.bin", 8192);
+        deep.links = Some(2);
+
+        let mut fixture = tree(dir(
+            "/p",
+            vec![dir(
+                "/p/node_modules",
+                vec![dir(
+                    "/p/node_modules/pkg",
+                    vec![dir("/p/node_modules/pkg/dist", vec![deep])],
+                )],
+            )],
+        ));
+        fixture.link_groups = vec![vec![
+            PathBuf::from("/elsewhere/lib.bin"),
+            PathBuf::from("/p/node_modules/pkg/dist/lib.bin"),
+        ]];
+
+        let plan = plan(&fixture, &opts());
+
+        assert!(plan.candidates[0].shared);
+    }
+
+    // ---- purity ----------------------------------------------------------
+
+    /// The strongest statement available that the default is safe: a real
+    /// fixture, listed before and after, unchanged.
+    #[test]
+    fn plan_writes_nothing() {
+        let dir_handle = tempfile::tempdir().expect("tempdir");
+        let root = dir_handle.path();
+        std::fs::create_dir(root.join("node_modules")).expect("mkdir");
+        std::fs::write(root.join("node_modules/lib.bin"), b"payload").expect("write");
+
+        let before = snapshot(root);
+        let scanned = crate::scan(&crate::ScanOptions {
+            root: root.to_path_buf(),
+            ..crate::ScanOptions::default()
+        });
+
+        let plan = plan(&scanned, &opts());
+
+        assert!(
+            !plan.candidates.is_empty(),
+            "the fixture must match, or this proves nothing"
+        );
+        assert_eq!(
+            before,
+            snapshot(root),
+            "planning must not create, remove or alter anything"
+        );
+    }
+
+    /// Every path under `root`, with its length — enough to catch a creation,
+    /// a deletion or a truncation.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, u64)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let entries = std::fs::read_dir(&path).expect("read_dir");
+            for entry in entries {
+                let entry = entry.expect("entry");
+                let metadata = entry.metadata().expect("metadata");
+                if metadata.is_dir() {
+                    stack.push(entry.path());
+                }
+                out.push((entry.path(), metadata.len()));
+            }
         }
+        out.sort();
+        out
     }
 }

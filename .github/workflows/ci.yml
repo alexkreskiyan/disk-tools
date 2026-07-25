@@ -63,3 +63,23 @@ jobs:
       - uses: extractions/setup-just@v4
       - name: just check
         run: just check
+
+  # Branch coverage needs `-Z coverage-options=branch`, which is nightly-only —
+  # so this job cannot gate a merge without pinning the project to nightly.
+  # It reports and does not block: line coverage (which `verify` can measure
+  # anywhere) hides exactly the case that matters here, a condition whose two
+  # arms are both on the same line.
+  coverage:
+    name: branch coverage (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: extractions/setup-just@v4
+      - name: just coverage-branch
+        run: just coverage-branch

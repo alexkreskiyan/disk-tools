@@ -63,6 +63,24 @@ lint:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
+# `core/Cargo.toml` promises a scan-only consumer can drop `clean` and stop
+# compiling `objc2`/`windows` for a capability it never calls. Nothing enforced
+# that until this recipe: the default build never exercises the cfg-gated paths,
+# so the promise could rot unnoticed.
+
+# Type-check the core without its default features.
+check-minimal:
+    cargo check -p disk-tools-core --no-default-features --all-targets
+
+# Nightly-only (`-Z coverage-options=branch`), so it is not part of `verify` and
+# does not gate CI. Worth having anyway: line coverage counts a line with two
+# branches as covered once either runs, which hides precisely the half-tested
+# conditions the safety rules are made of.
+
+# Branch coverage report; needs a nightly toolchain and cargo-llvm-cov.
+coverage-branch:
+    cargo +nightly llvm-cov --workspace --all-features --branch --summary-only
+
 # `--all-targets` so tests and benches are checked too — an API stabilized after
 # the MSRV is just as breaking there. CI runs this under the pinned 1.85.
 
@@ -73,8 +91,8 @@ check:
 # CI runs this recipe on all three platforms, so anything added here is
 # enforced there too.
 
-# Pre-commit gate: formatting, lints, docs, tests.
-verify: fmt-check lint doc test
+# Pre-commit gate: formatting, lints, docs, feature minimality, tests.
+verify: fmt-check lint doc check-minimal test
 
 # =============================================================================
 # Benchmarks

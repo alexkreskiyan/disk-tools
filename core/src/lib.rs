@@ -26,21 +26,24 @@
 // the OS to stay inside it.
 #![deny(unsafe_code)]
 
-#[cfg(feature = "clean")]
 mod clean;
 mod dedup;
 mod detect;
 mod options;
+mod paths;
 mod size;
+#[cfg(feature = "trash")]
+mod trash;
 mod tree;
 mod walk;
 #[cfg(windows)]
 mod windows_dir;
 
-#[cfg(feature = "clean")]
-pub use clean::{TrashFailure, move_to_trash};
+pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, Tier, plan};
 pub use detect::{Category, CategorySet, DetectOptions, Detection, UserDirs, detect};
 pub use options::ScanOptions;
+#[cfg(feature = "trash")]
+pub use trash::{TrashFailure, move_to_trash};
 pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
 
 /// Scan `options.root` and return a size-annotated tree plus whatever was

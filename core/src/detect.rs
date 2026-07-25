@@ -15,8 +15,9 @@
 //! Nothing here removes, ranks or excludes anything. It reports what matched;
 //! the denylist, the tiers and the totals belong to the cleanup engine.
 
+use crate::paths::same_path;
 use crate::tree::{ScanNode, ScanTree};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 /// Why a path was picked out.
@@ -94,6 +95,12 @@ pub struct UserDirs {
     pub home: Option<PathBuf>,
     /// `%LOCALAPPDATA%` on Windows. `None` elsewhere.
     pub local_app_data: Option<PathBuf>,
+    /// `%APPDATA%` — the *roaming* profile, on Windows. `None` elsewhere.
+    ///
+    /// Not derivable from [`Self::local_app_data`]: the two are siblings, but a
+    /// roaming profile can be redirected to a network share independently. It is
+    /// here because it is a **denylist** root (§8.3), never a candidate one.
+    pub app_data: Option<PathBuf>,
 }
 
 impl UserDirs {
@@ -107,7 +114,7 @@ impl UserDirs {
     /// The tilde matters and is the whole point — `~/Library/Caches` is a
     /// candidate, `/Library/Caches` is on the denylist (§8.3). Deriving these
     /// from a known home is what keeps the two apart.
-    fn cache_roots(&self) -> Vec<PathBuf> {
+    pub(crate) fn cache_roots(&self) -> Vec<PathBuf> {
         let mut roots = Vec::new();
         if let Some(home) = &self.home {
             roots.push(home.join(".cache"));
@@ -265,43 +272,6 @@ fn old(node: &ScanNode, options: &DetectOptions) -> Option<Category> {
 
     // "Older or exactly equal" — the boundary is inclusive.
     (modified <= threshold).then_some(Category::Old)
-}
-
-/// Do these two paths name the same directory?
-///
-/// Compared component-wise, so `Path`'s own normalisation of separators and `.`
-/// components applies — and never through `canonicalize()`, which this project
-/// does not call.
-///
-/// **ASCII-case-insensitive on Windows**, where the filesystem is: a home
-/// resolved as `C:\Users\Me\AppData\Local` must still match a scan that walked
-/// `c:\users\me\appdata\local`, or the cache root goes unrecognised. Folding is
-/// ASCII-only rather than NTFS's full Unicode upcase tables, so a non-ASCII
-/// name differing in case still misses — the same as before this existed, so
-/// strictly an improvement and never a new false match.
-#[cfg(windows)]
-fn same_path(a: &Path, b: &Path) -> bool {
-    let mut left = a.components();
-    let mut right = b.components();
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return true,
-            (Some(l), Some(r)) if l.as_os_str().eq_ignore_ascii_case(r.as_os_str()) => {}
-            _ => return false,
-        }
-    }
-}
-
-/// Exact elsewhere, deliberately.
-///
-/// macOS is usually case-insensitive but APFS can be formatted either way, and
-/// Linux is case-sensitive outright. Folding case on a case-sensitive volume
-/// would make two genuinely different directories compare equal — and this
-/// comparison decides whether something becomes a deletion candidate, so the
-/// wrong direction to err in is obvious.
-#[cfg(not(windows))]
-fn same_path(a: &Path, b: &Path) -> bool {
-    a == b
 }
 
 fn has_sibling(siblings: &[ScanNode], name: &str) -> bool {

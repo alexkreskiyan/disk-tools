@@ -14,13 +14,16 @@ trash = { version = "5.2", optional = true }
 
 # `serde`: opt-in serialization of the scan model, enabled by the CLI for `--json`.
 #
-# `clean`: the trash-backed removal engine. On by default so `cargo test` exercises
-# it without ceremony, but a consumer that only wants `scan()` can take
-# `default-features = false` and stop compiling `objc2` / `windows` for a
-# capability it never calls — the same bargain `serde` offers.
+# `trash`: the ability to actually remove something. On by default so `cargo test`
+# exercises it without ceremony; without it a consumer still gets `scan()` **and**
+# `plan()` — deciding what to delete needs nothing from the backend — and stops
+# compiling `objc2` / `windows` for a capability it never calls.
+#
+# `just check-minimal` keeps that promise honest; nothing else exercises this
+# configuration.
 [features]
-default = ["clean"]
-clean = ["dep:trash"]
+default = ["trash"]
+trash = ["dep:trash"]
 serde = ["dep:serde"]
 
 # Windows hides allocated size from `std::fs::Metadata`; `GetCompressedFileSizeW`
