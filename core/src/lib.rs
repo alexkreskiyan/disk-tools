@@ -51,11 +51,15 @@ pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
 /// as a [`SkippedEntry`] in [`ScanTree::skipped`], not an error.
 pub fn scan(options: &ScanOptions) -> ScanTree {
     let mut walked = walk::walk(options);
-    dedup::attribute(&mut walked.entries);
+    // Attribution both zeroes the duplicate links and reports which paths shared
+    // them — the second half is the only record of that sharing left once the
+    // sizes are folded away.
+    let link_groups = dedup::attribute(&mut walked.entries);
     let root = tree::aggregate(walked.entries, options.root.as_path());
     ScanTree {
         root,
         skipped: walked.skipped,
+        link_groups,
     }
 }
 
@@ -90,7 +94,7 @@ mod tests {
         let entries = walked.entries.len();
 
         let start = Instant::now();
-        dedup::attribute(&mut walked.entries);
+        let link_groups = dedup::attribute(&mut walked.entries);
         let dedup = start.elapsed();
 
         let start = Instant::now();
@@ -101,8 +105,9 @@ mod tests {
         let share = |d: std::time::Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64();
 
         println!(
-            "\n{root} — {entries} entries, {} skipped",
-            walked.skipped.len()
+            "\n{root} — {entries} entries, {} skipped, {} hardlink groups",
+            walked.skipped.len(),
+            link_groups.len()
         );
         println!("  walk       {:>9.1?}  {:>5.1}%", walk, share(walk));
         println!("  dedup      {:>9.1?}  {:>5.1}%", dedup, share(dedup));

@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// What identifies a file on disk, so two paths pointing at the same bytes can
 /// be recognised as one. Consumed by the dedup pass.
@@ -31,11 +32,17 @@ pub(crate) struct FileId {
 /// nor a file identity, and both are available for a whole directory from one
 /// handle. Unix needs none of this — `st_blocks` and `(dev, ino)` are already in
 /// the `Metadata` the walk has in hand.
+///
+/// `modified` rides along because it is in the same struct the listing already
+/// fills — free where the other two are the point. There is deliberately **no**
+/// link count here: `FILE_ID_BOTH_DIR_INFO` carries none, and obtaining one
+/// would mean a handle per file, the very cost this type exists to avoid.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EntryFacts {
     pub allocated: u64,
     pub apparent: u64,
     pub id: FileId,
+    pub modified: Option<SystemTime>,
 }
 
 /// Everything a single directory listing revealed, keyed by file name.
@@ -64,6 +71,11 @@ pub(crate) struct WalkEntry {
     pub is_dir: bool,
     /// `None` for directories, and on Windows when the OS declines to say.
     pub id: Option<FileId>,
+    /// mtime, `None` when the platform gave none.
+    pub modified: Option<SystemTime>,
+    /// How many names this inode has in total. `None` for directories and on
+    /// every platform that cannot say cheaply — see [`link_count`].
+    pub links: Option<u32>,
 }
 
 /// The walk's whole output: what it measured, and what it couldn't.
@@ -225,11 +237,24 @@ fn entry_for(
     facts: Option<&EntryFacts>,
 ) -> io::Result<WalkEntry> {
     let is_dir = metadata.is_dir();
-    let (allocated, apparent, id) = match facts {
-        Some(facts) => (facts.allocated, facts.apparent, Some(facts.id)),
+    let (allocated, apparent, id, modified) = match facts {
+        // The listing already answered all four, so nothing here calls the OS
+        // again — the reason `modified` is collected in this task rather than a
+        // later one.
+        Some(facts) => (
+            facts.allocated,
+            facts.apparent,
+            Some(facts.id),
+            facts.modified,
+        ),
         None => {
             let sizes = size::measure(path, metadata)?;
-            (sizes.allocated, sizes.apparent, file_id(metadata))
+            (
+                sizes.allocated,
+                sizes.apparent,
+                file_id(metadata),
+                metadata.modified().ok(),
+            )
         }
     };
 
@@ -240,6 +265,11 @@ fn entry_for(
         is_dir,
         // Directories can't be hardlinked, so an identity would never be used.
         id: if is_dir { None } else { id },
+        modified,
+        // A directory's `nlink` counts its subdirectories, not names for it —
+        // a different quantity entirely, and one that would make "this content
+        // is shared" fire on every directory in the tree.
+        links: if is_dir { None } else { link_count(metadata) },
     })
 }
 
@@ -294,19 +324,45 @@ fn file_id(metadata: &Metadata) -> Option<FileId> {
     })
 }
 
-/// Windows hardlinks go undeduplicated for now, and the reason is structural.
+/// `Metadata` alone cannot identify a file off Unix, and the reason is
+/// structural: `file_index` is unstable, and std hardcodes it to `None` unless
+/// the metadata came from an open handle, which a directory listing never is.
+/// The only way through `Metadata` would be an `open()` per file — precisely the
+/// syscall this walk is built to avoid.
 ///
-/// `file_index` is unstable, and — more decisively — std hardcodes it to `None`
-/// unless the metadata came from an open handle, which a directory listing
-/// never is. `number_of_links` is `None` for the same reason, so we can't even
-/// cheaply spot *which* files have links worth checking. The only way through is
-/// an `open()` per file: precisely the syscall this walk is built to avoid.
-///
-/// Task 4 can close the gap cheaply if it wants: hardlinks share a size, so it
-/// need only open handles for files whose sizes collide — a small fraction, and
-/// the same trick `fclones` uses.
+/// This is why Windows takes its identity from the directory handle instead
+/// ([`crate::windows_dir`]); the path through here is the fallback for an entry
+/// the listing missed, and such an entry simply goes undeduplicated.
 #[cfg(not(unix))]
 fn file_id(_metadata: &Metadata) -> Option<FileId> {
+    None
+}
+
+/// `st_nlink` is in the metadata the walk already fetched — free.
+///
+/// `try_from` rather than `as`: a count that does not fit is nonsense we would
+/// rather report as "unknown" than as a wrapped-around number that later reads
+/// as a hardlink group.
+#[cfg(unix)]
+fn link_count(metadata: &Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    u32::try_from(metadata.nlink()).ok()
+}
+
+/// Windows has no cheap link count, so callers get `None` and must not read
+/// that as "one".
+///
+/// `Metadata::number_of_links` is `None` for the same reason `file_index` is —
+/// it needs an open handle. Nor can [`crate::windows_dir`] help:
+/// `FILE_ID_BOTH_DIR_INFO` carries no link count at all, so unlike the allocated
+/// size and the file id there is nothing to lift out of the directory listing.
+///
+/// The consequence is bounded rather than total. `ScanTree::link_groups` still
+/// shows content shared *within* a scan on both platforms; only sharing with
+/// something outside the scanned tree is invisible here.
+#[cfg(not(unix))]
+fn link_count(_metadata: &Metadata) -> Option<u32> {
     None
 }
 
@@ -403,6 +459,190 @@ mod tests {
         assert_eq!(ids.len(), 2, "both names are walked");
         assert!(ids[0].is_some(), "Windows entries now carry an identity");
         assert_eq!(ids[0], ids[1], "two links to one file share an identity");
+    }
+
+    /// The mtime the walk reports must be the file's own, not "roughly now" —
+    /// compared against an independent `symlink_metadata` of the same path, so a
+    /// bug that stamped every entry with the scan time would fail here.
+    #[test]
+    fn modified_matches_the_files_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f.bin");
+        write(&path, 10);
+        let expected = fs::symlink_metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("this platform records mtime");
+
+        let walked = walk(&opts(dir.path()));
+        let file = walked
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .expect("the file was walked");
+
+        assert_eq!(file.modified, Some(expected));
+    }
+
+    /// A directory carries its **own** mtime, never its children's — the signal
+    /// the age rule is built on (a directory's mtime moves when its entries
+    /// change, which is exactly the "still in use" evidence wanted).
+    #[test]
+    fn a_directory_carries_its_own_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).expect("mkdir");
+        write(&sub.join("inner.bin"), 10);
+        let expected = fs::symlink_metadata(&sub)
+            .expect("stat")
+            .modified()
+            .expect("this platform records mtime");
+
+        let walked = walk(&opts(dir.path()));
+        let node = walked
+            .entries
+            .iter()
+            .find(|e| e.path == sub)
+            .expect("the directory was walked");
+
+        assert_eq!(node.modified, Some(expected));
+    }
+
+    /// No filesystem this runs on will hand back an entry without a timestamp,
+    /// so the branch is driven directly rather than faked with a fixture that
+    /// cannot exist. The rule it protects: an unknown mtime is `None`, never a
+    /// substituted "now" that would make the age rule judge a file it knows
+    /// nothing about.
+    #[test]
+    fn missing_timestamp_yields_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f.bin");
+        write(&path, 10);
+        let metadata = fs::symlink_metadata(&path).expect("stat");
+
+        let facts = EntryFacts {
+            allocated: 4096,
+            apparent: 10,
+            id: FileId {
+                device: 1,
+                inode: 2,
+            },
+            modified: None,
+        };
+
+        let entry = entry_for(&path, &metadata, Some(&facts)).expect("build entry");
+
+        assert_eq!(
+            entry.modified, None,
+            "an entry the OS gave no timestamp for must stay unknown"
+        );
+    }
+
+    /// `links` is the count of names for the inode, so a hardlinked file reports
+    /// 2 from **both** of its paths.
+    #[cfg(unix)]
+    #[test]
+    fn hardlinked_file_reports_two_links() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original = dir.path().join("original.bin");
+        let link = dir.path().join("link.bin");
+        write(&original, 4096);
+        fs::hard_link(&original, &link).expect("hard_link");
+        let lone = dir.path().join("lone.bin");
+        write(&lone, 4096);
+
+        let walked = walk(&opts(dir.path()));
+        let links_of = |path: &Path| {
+            walked
+                .entries
+                .iter()
+                .find(|e| e.path == path)
+                .unwrap_or_else(|| panic!("entry for {path:?}"))
+                .links
+        };
+
+        assert_eq!(links_of(&original), Some(2));
+        assert_eq!(links_of(&link), Some(2));
+        // A file with one name must not be swept up by the same signal.
+        assert_eq!(links_of(&lone), Some(1));
+    }
+
+    /// Directories are excluded deliberately: `st_nlink` on a directory counts
+    /// its subdirectories, which has nothing to do with shared content and would
+    /// make every directory in a tree look hardlinked.
+    #[cfg(unix)]
+    #[test]
+    fn directories_report_no_link_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("sub/deeper")).expect("mkdir");
+
+        let walked = walk(&opts(dir.path()));
+
+        for entry in walked.entries.iter().filter(|e| e.is_dir) {
+            assert_eq!(
+                entry.links, None,
+                "{:?} is a directory and must carry no link count",
+                entry.path
+            );
+        }
+    }
+
+    /// The documented Windows gap (D10): no link count, because getting one
+    /// would cost a handle per file. This pins it as a decision rather than
+    /// letting a future change quietly reintroduce that cost.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reports_no_link_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original = dir.path().join("original.bin");
+        write(&original, 5000);
+        if fs::hard_link(&original, dir.path().join("link.bin")).is_err() {
+            eprintln!("skipping: this filesystem does not support hard links");
+            return;
+        }
+
+        let walked = walk(&opts(dir.path()));
+
+        for entry in &walked.entries {
+            assert_eq!(
+                entry.links, None,
+                "{:?}: Windows must not report a link count",
+                entry.path
+            );
+        }
+    }
+
+    /// On Windows the timestamp comes out of the directory listing's
+    /// `LastWriteTime`, not from a second call per file. Checked against the
+    /// same value `Metadata` reports, to a one-second tolerance: both describe
+    /// the same instant, but they travel through different conversions.
+    #[cfg(windows)]
+    #[test]
+    fn windows_modified_comes_from_the_listing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("f.bin");
+        write(&path, 5000);
+        let expected = fs::symlink_metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+
+        let walked = walk(&opts(dir.path()));
+        let file = walked
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .expect("the file was walked");
+        let modified = file.modified.expect("the listing carries LastWriteTime");
+
+        let drift = modified
+            .duration_since(expected)
+            .or_else(|_| expected.duration_since(modified))
+            .expect("one of the two orderings holds");
+        assert!(
+            drift < std::time::Duration::from_secs(1),
+            "listing mtime {modified:?} and metadata mtime {expected:?} must agree"
+        );
     }
 
     #[test]

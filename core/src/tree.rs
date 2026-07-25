@@ -1,5 +1,6 @@
 use crate::walk::WalkEntry;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// One entry in the scanned tree — a file or a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,8 +18,65 @@ pub struct ScanNode {
 
     pub is_dir: bool,
 
+    /// This entry's own mtime — for a directory its own, never derived from its
+    /// children. `None` when the platform recorded none, which callers must read
+    /// as "unknown" rather than "old" or "new".
+    ///
+    /// Serialized as whole seconds since the Unix epoch, negative before 1970.
+    #[cfg_attr(feature = "serde", serde(with = "unix_seconds"))]
+    pub modified: Option<SystemTime>,
+
+    /// How many names this inode has in total, counting any outside the scan.
+    ///
+    /// `Some` on Unix. **`None` on Windows and for every directory** — the
+    /// Windows directory listing carries no link count and this project will not
+    /// open a handle per file to obtain one, and a directory's `nlink` counts
+    /// subdirectories, which is a different quantity entirely. `None` means
+    /// *unknown*, never `1`.
+    pub links: Option<u32>,
+
     /// Always empty for files.
     pub children: Vec<ScanNode>,
+}
+
+/// `Option<SystemTime>` on the wire as an optional count of whole seconds since
+/// the Unix epoch, negative for anything older than 1970.
+///
+/// serde's own `SystemTime` impl was not usable here on two counts: it emits a
+/// nested `{secs_since_epoch, nanos_since_epoch}` object where consumers want a
+/// number, and it **fails to serialize any pre-1970 instant** — so one file with
+/// a bad clock would turn an entire `--json` payload into an error. A scan must
+/// not be that fragile about a timestamp it merely passes through.
+///
+/// The cost is sub-second precision, which nothing here wants: the age rule this
+/// field exists for works in days.
+#[cfg(feature = "serde")]
+mod unix_seconds {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<SystemTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let seconds = value.and_then(|time| match time.duration_since(UNIX_EPOCH) {
+            Ok(since) => i64::try_from(since.as_secs()).ok(),
+            // Before 1970: the error carries the interval by which, so the sign
+            // is recovered rather than the value being lost.
+            Err(err) => i64::try_from(err.duration().as_secs()).ok().map(|s| -s),
+        });
+        serializer.serialize_some(&seconds)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<SystemTime>, D::Error> {
+        let seconds = Option::<i64>::deserialize(deserializer)?;
+        Ok(seconds.and_then(|seconds| match seconds.unsigned_abs() {
+            magnitude if seconds < 0 => UNIX_EPOCH.checked_sub(Duration::from_secs(magnitude)),
+            magnitude => UNIX_EPOCH.checked_add(Duration::from_secs(magnitude)),
+        }))
+    }
 }
 
 /// Why an entry could not be scanned.
@@ -48,6 +106,17 @@ pub struct SkippedEntry {
 pub struct ScanTree {
     pub root: ScanNode,
     pub skipped: Vec<SkippedEntry>,
+
+    /// Paths **within this scan** that share an inode — one inner vector per
+    /// group, only groups of two or more, each sorted so the first element is
+    /// the path the bytes were charged to.
+    ///
+    /// This is what makes "would deleting X actually free its bytes?" answerable
+    /// without a filesystem-wide link census: if a group has a member outside
+    /// the thing being deleted, the answer is no. Unlike [`ScanNode::links`] it
+    /// works on **both** platforms, since Windows entries carry a `FileId` too.
+    /// What it cannot see is sharing with paths outside the scanned tree.
+    pub link_groups: Vec<Vec<PathBuf>>,
 }
 
 /// Fold the flat, dedup-attributed walk entries into a size-annotated tree.
@@ -95,6 +164,11 @@ pub(crate) fn aggregate(entries: Vec<WalkEntry>, root: &Path) -> ScanNode {
             allocated: 0,
             apparent: 0,
             is_dir: false,
+            // Nothing was measured, so nothing is known — not even a guess at
+            // the root's own mtime, which would invite the age rule to judge a
+            // node the scan never saw.
+            modified: None,
+            links: None,
             children: Vec::new(),
         },
     }
@@ -126,6 +200,11 @@ fn build_node(index: usize, entries: &[WalkEntry], children: &[Vec<usize>]) -> S
         allocated,
         apparent,
         is_dir: entry.is_dir,
+        // Facts about this entry alone, so unlike the sizes they are carried
+        // across rather than folded — a directory's mtime is its own, and its
+        // children's ages say nothing about it.
+        modified: entry.modified,
+        links: entry.links,
         children: child_nodes,
     }
 }
@@ -142,6 +221,8 @@ mod tests {
             allocated: 8192,
             apparent: 8000,
             is_dir: false,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            links: Some(1),
             children: Vec::new(),
         };
 
@@ -150,6 +231,8 @@ mod tests {
             allocated: 8192,
             apparent: 8000,
             is_dir: true,
+            modified: None,
+            links: None,
             children: vec![file.clone()],
         };
 
@@ -159,6 +242,7 @@ mod tests {
                 path: PathBuf::from("root/locked"),
                 reason: SkipReason::PermissionDenied,
             }],
+            link_groups: Vec::new(),
         };
 
         assert_eq!(tree.root.path, PathBuf::from("root"));
@@ -170,6 +254,9 @@ mod tests {
         assert!(!tree.root.children[0].is_dir);
         assert_eq!(tree.root.children[0].path, PathBuf::from("root/big.bin"));
         assert!(tree.root.children[0].children.is_empty());
+
+        assert_eq!(tree.root.children[0].modified, Some(SystemTime::UNIX_EPOCH));
+        assert_eq!(tree.root.children[0].links, Some(1));
 
         assert_eq!(tree.skipped.len(), 1);
         assert_eq!(tree.skipped[0].path, PathBuf::from("root/locked"));
@@ -425,6 +512,74 @@ mod tests {
             // subtree, not its sibling's.
             assert_eq!(file_apparent(find("a")), 20_000 + 30_000);
             assert_eq!(file_apparent(find("c")), 40_000);
+        }
+
+        /// The sharing signal has to survive the whole pipeline, not just
+        /// `dedup` — this is the end of the wire, where Task 4 will read it.
+        #[test]
+        fn link_groups_reach_the_scan_tree() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            fs::create_dir(root.join("a")).expect("mkdir");
+            fs::create_dir(root.join("z")).expect("mkdir");
+            let first = root.join("a/first.bin");
+            let second = root.join("z/second.bin");
+            write(&first, 4096);
+            if fs::hard_link(&first, &second).is_err() {
+                eprintln!("skipping: this filesystem has no hard links");
+                return;
+            }
+
+            let tree = crate::scan(&opts(root));
+
+            assert_eq!(tree.link_groups, vec![vec![first, second]]);
+        }
+
+        /// The common case must stay quiet: a tree with no hardlinks reports no
+        /// groups at all, so nothing downstream is marked as shared.
+        #[test]
+        fn a_tree_without_hardlinks_has_no_link_groups() {
+            let dir = fixture();
+
+            let tree = crate::scan(&opts(dir.path()));
+
+            assert!(tree.link_groups.is_empty(), "{:?}", tree.link_groups);
+        }
+
+        /// Sizes fold upward; mtime does not. A directory judged by its
+        /// children's timestamps would make the age rule call a freshly-written
+        /// cache "old" whenever its parent had not been touched — the exact
+        /// misfire Task 3's rule must avoid.
+        #[test]
+        fn modified_is_carried_per_node_not_aggregated() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            let sub = root.join("sub");
+            fs::create_dir(&sub).expect("mkdir");
+            write(&sub.join("inner.bin"), 4096);
+
+            let tree = crate::scan(&opts(root));
+
+            let sub_node = tree
+                .root
+                .children
+                .iter()
+                .find(|c| c.path == sub)
+                .expect("sub node present");
+            let expected = fs::symlink_metadata(&sub)
+                .expect("stat")
+                .modified()
+                .expect("mtime");
+
+            assert_eq!(sub_node.modified, Some(expected));
+            assert_eq!(
+                sub_node.links, None,
+                "a directory carries no link count, whatever its subdirectories say"
+            );
+            assert!(
+                !sub_node.children.is_empty(),
+                "the fixture must actually have a child, or this proves nothing"
+            );
         }
 
         #[test]

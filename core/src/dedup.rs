@@ -2,6 +2,7 @@
 
 use crate::walk::{FileId, WalkEntry};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Charge every inode reached through several paths to just one of them, so
 /// directory totals sum to the root total instead of double-counting hardlinks.
@@ -11,10 +12,14 @@ use std::collections::HashMap;
 /// (parallel, nondeterministic) order. Every other link in the group is zeroed,
 /// both `allocated` and `apparent`, so `--apparent` totals dedup too.
 ///
-/// Entries with no identity — directories, and every file on Windows — are left
-/// untouched: each is treated as unique, so hardlinks double-count on Windows,
-/// the documented v0.1 behaviour (§8.2.3).
-pub(crate) fn attribute(entries: &mut [WalkEntry]) {
+/// Entries with no identity — directories, and any entry whose platform
+/// declines to give one — are left untouched: each is treated as unique.
+///
+/// **Returns the groups it found**, sorted, so the caller can answer a question
+/// the zeroed sizes no longer can: *which* paths share content. Nothing extra is
+/// computed for it — the grouping happens either way, and only groups of two or
+/// more are kept, so a tree without hardlinks pays a single empty `Vec`.
+pub(crate) fn attribute(entries: &mut [WalkEntry]) -> Vec<Vec<PathBuf>> {
     let mut groups: HashMap<FileId, Vec<usize>> = HashMap::new();
     for (index, entry) in entries.iter().enumerate() {
         if let Some(id) = entry.id {
@@ -22,6 +27,7 @@ pub(crate) fn attribute(entries: &mut [WalkEntry]) {
         }
     }
 
+    let mut shared = Vec::new();
     for indices in groups.values() {
         if indices.len() < 2 {
             continue; // a lone link owns its bytes already
@@ -30,18 +36,25 @@ pub(crate) fn attribute(entries: &mut [WalkEntry]) {
         // component-wise and disagrees whenever a component holds a byte below
         // `/` (0x2F) — e.g. `a-b` vs `a/c`. On Unix `OsStr::cmp` is a byte
         // compare, matching `sort(1)` and the "lexicographically first" rule.
-        // (Dedup only ever fires on Unix; elsewhere every `id` is `None`.)
-        let keeper = *indices
-            .iter()
-            .min_by(|&&a, &&b| entries[a].path.as_os_str().cmp(entries[b].path.as_os_str()))
-            .expect("group is non-empty");
+        let mut paths: Vec<PathBuf> = indices.iter().map(|&i| entries[i].path.clone()).collect();
+        paths.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+
+        // The first path is therefore the keeper, by the same comparison.
+        let keeper = paths[0].clone();
         for &index in indices {
-            if index != keeper {
+            if entries[index].path != keeper {
                 entries[index].allocated = 0;
                 entries[index].apparent = 0;
             }
         }
+        shared.push(paths);
     }
+
+    // `HashMap` iteration order is deliberately unpredictable, so the groups
+    // themselves need ordering too — the same reason the keeper is a fixed
+    // choice rather than whichever link the walk reached first.
+    shared.sort_by(|a, b| a[0].as_os_str().cmp(b[0].as_os_str()));
+    shared
 }
 
 #[cfg(test)]
@@ -231,6 +244,89 @@ mod tests {
             run(),
             run(),
             "attribution must be byte-identical across runs"
+        );
+    }
+
+    /// The groups are the sharing signal Task 4 plans with: the zeroed sizes
+    /// alone cannot say *which* paths share content, only that some do.
+    ///
+    /// Cross-platform, because `FileId` exists on Windows too — the one half of
+    /// the sharing question that is answerable on both platforms.
+    #[test]
+    fn link_groups_hold_both_paths_of_a_hardlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir(root.join("a")).expect("mkdir");
+        fs::create_dir(root.join("z")).expect("mkdir");
+        let first = root.join("a/first.bin");
+        let second = root.join("z/second.bin");
+        write(&first, 4096);
+        if !try_hard_link(&first, &second) {
+            return;
+        }
+        // An unlinked file must not appear in any group.
+        write(&root.join("lone.bin"), 4096);
+
+        let mut walked = walk(&opts(root));
+        let groups = attribute(&mut walked.entries);
+
+        assert_eq!(groups.len(), 1, "one shared inode, one group: {groups:?}");
+        assert_eq!(
+            groups[0],
+            vec![first.clone(), second.clone()],
+            "the group holds both names, keeper first"
+        );
+    }
+
+    /// Groups must be ordered as firmly as the keeper is — the walk is parallel
+    /// and `HashMap` iteration is deliberately unpredictable, so two runs would
+    /// otherwise disagree on the order of a plan built from them.
+    #[cfg(unix)]
+    #[test]
+    fn link_groups_are_deterministic_across_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for name in ["a", "m", "z"] {
+            fs::create_dir(root.join(name)).expect("mkdir");
+            let original = root.join(name).join("original.bin");
+            write(&original, 4096);
+            fs::hard_link(&original, root.join(name).join("link.bin")).expect("hard_link");
+        }
+
+        let run = || {
+            let mut walked = walk(&opts(root));
+            attribute(&mut walked.entries)
+        };
+
+        let groups = run();
+        assert_eq!(groups.len(), 3, "three independent pairs");
+        assert_eq!(
+            groups,
+            run(),
+            "group order must be byte-identical across runs"
+        );
+
+        let mut sorted = groups.clone();
+        sorted.sort_by(|a, b| a[0].as_os_str().cmp(b[0].as_os_str()));
+        assert_eq!(groups, sorted, "groups are ordered by their first path");
+    }
+
+    /// The common case: no hardlinks anywhere means nothing to report. A signal
+    /// that fired on ordinary files would mark every candidate in Task 4 as
+    /// shared and make the reclaimable total useless.
+    #[test]
+    fn no_hardlinks_yields_no_groups() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir(root.join("a")).expect("mkdir");
+        write(&root.join("a/one.bin"), 4096);
+        write(&root.join("two.bin"), 8192);
+
+        let mut walked = walk(&opts(root));
+
+        assert!(
+            attribute(&mut walked.entries).is_empty(),
+            "distinct files share nothing"
         );
     }
 

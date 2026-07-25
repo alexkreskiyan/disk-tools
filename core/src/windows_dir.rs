@@ -33,6 +33,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -46,6 +47,9 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
 /// The enumeration is finished, not broken.
 const ERROR_NO_MORE_FILES: i32 = 18;
+
+/// Seconds between the FILETIME epoch (1601-01-01) and the Unix one.
+const FILETIME_EPOCH_OFFSET: u64 = 11_644_473_600;
 
 /// 64 KiB, as `u64`s so the allocation is 8-byte aligned — the API requires
 /// each `FILE_ID_BOTH_DIR_INFO` to sit on a `DWORDLONG` boundary. A short
@@ -152,6 +156,7 @@ fn collect_batch(
                             device: volume,
                             inode: info.FileId as u64,
                         },
+                        modified: filetime(info.LastWriteTime),
                     },
                 );
             }
@@ -161,6 +166,36 @@ fn collect_batch(
             return;
         }
         offset += info.NextEntryOffset as usize;
+    }
+}
+
+/// Convert a FILETIME — 100-nanosecond ticks since 1601-01-01 — to a
+/// [`SystemTime`].
+///
+/// `None` rather than a guess whenever the value cannot be trusted: `0` is the
+/// documented "not recorded" marker, a negative tick count is meaningless, and
+/// an addition that would overflow means the value is not a real timestamp
+/// either. The scan reports "unknown" for such an entry, which the age rule then
+/// declines to match — absence of evidence, not evidence of age.
+///
+/// Pre-1970 timestamps are ordinary here (the epoch is 1601), so they subtract
+/// from [`UNIX_EPOCH`] rather than being rejected.
+fn filetime(ticks: i64) -> Option<SystemTime> {
+    let ticks = u64::try_from(ticks).ok()?;
+    if ticks == 0 {
+        return None;
+    }
+
+    let secs = ticks / 10_000_000;
+    let nanos = (ticks % 10_000_000) as u32 * 100;
+
+    match secs.checked_sub(FILETIME_EPOCH_OFFSET) {
+        Some(since_epoch) => UNIX_EPOCH.checked_add(Duration::new(since_epoch, nanos)),
+        // Before 1970: step back the whole seconds, then forward by the
+        // sub-second remainder, which still belongs after that instant.
+        None => UNIX_EPOCH
+            .checked_sub(Duration::from_secs(FILETIME_EPOCH_OFFSET - secs))
+            .and_then(|t| t.checked_add(Duration::from_nanos(nanos as u64))),
     }
 }
 
@@ -176,4 +211,67 @@ fn volume_serial(handle: &File) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok(info.dwVolumeSerialNumber as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The epoch offset is the one number in the conversion that a typo would
+    /// silently shift by decades, so it is checked against the exact tick count
+    /// Microsoft documents for 1970-01-01.
+    #[test]
+    fn the_unix_epoch_converts_to_the_unix_epoch() {
+        const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+
+        assert_eq!(filetime(UNIX_EPOCH_TICKS), Some(UNIX_EPOCH));
+    }
+
+    #[test]
+    fn sub_second_ticks_survive() {
+        const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+        // One second and a half past the Unix epoch.
+        let ticks = UNIX_EPOCH_TICKS + 15_000_000;
+
+        assert_eq!(
+            filetime(ticks),
+            Some(UNIX_EPOCH + Duration::new(1, 500_000_000)),
+            "the conversion must keep the 100 ns remainder, not truncate to seconds"
+        );
+    }
+
+    /// The FILETIME epoch is 1601, so a timestamp before 1970 is an ordinary
+    /// value here and must come back as a real instant rather than `None`.
+    #[test]
+    fn a_pre_1970_timestamp_is_representable() {
+        // Exactly one second before the Unix epoch.
+        let ticks = 116_444_736_000_000_000 - 10_000_000;
+
+        assert_eq!(filetime(ticks), Some(UNIX_EPOCH - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn unusable_values_are_none() {
+        assert_eq!(
+            filetime(0),
+            None,
+            "0 is the documented 'not recorded' marker"
+        );
+        assert_eq!(filetime(-1), None, "a negative tick count is meaningless");
+    }
+
+    /// Whether `SystemTime` can hold a year-30000 instant is platform-specific,
+    /// so this pins the two things that matter regardless: the conversion does
+    /// not panic, and an absurd input cannot wrap into a plausible date.
+    #[test]
+    fn an_absurd_tick_count_never_becomes_a_believable_time() {
+        const A_CENTURY: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+
+        if let Some(instant) = filetime(i64::MAX) {
+            assert!(
+                instant > UNIX_EPOCH + A_CENTURY,
+                "an overflowing tick count must not land near the present day"
+            );
+        }
+    }
 }

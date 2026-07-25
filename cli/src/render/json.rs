@@ -19,6 +19,7 @@ mod tests {
     use super::*;
     use disk_tools_core::{ScanNode, ScanTree, SkipReason, SkippedEntry};
     use std::path::PathBuf;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn node(path: &str, allocated: u64, apparent: u64, children: Vec<ScanNode>) -> ScanNode {
         ScanNode {
@@ -26,21 +27,34 @@ mod tests {
             allocated,
             apparent,
             is_dir: !children.is_empty(),
+            modified: None,
+            links: None,
             children,
+        }
+    }
+
+    /// Wraps a root, so the model can grow without every fixture below changing
+    /// — `ScanTree` gained a field between v0.1 and v0.2 alone.
+    fn tree(root: ScanNode) -> ScanTree {
+        tree_with(root, Vec::new())
+    }
+
+    fn tree_with(root: ScanNode, skipped: Vec<SkippedEntry>) -> ScanTree {
+        ScanTree {
+            root,
+            skipped,
+            link_groups: Vec::new(),
         }
     }
 
     #[test]
     fn json_round_trips() {
-        let tree = ScanTree {
-            root: node(
-                "root",
-                8192,
-                8000,
-                vec![node("root/a.bin", 4096, 4000, vec![])],
-            ),
-            skipped: Vec::new(),
-        };
+        let tree = tree(node(
+            "root",
+            8192,
+            8000,
+            vec![node("root/a.bin", 4096, 4000, vec![])],
+        ));
 
         let json = render_json(&tree).expect("serialize");
         let parsed: ScanTree = serde_json::from_str(&json).expect("parse back");
@@ -49,10 +63,7 @@ mod tests {
 
     #[test]
     fn json_carries_scan_numbers() {
-        let tree = ScanTree {
-            root: node("root", 123_456, 120_000, vec![]),
-            skipped: Vec::new(),
-        };
+        let tree = tree(node("root", 123_456, 120_000, vec![]));
 
         let value: serde_json::Value =
             serde_json::from_str(&render_json(&tree).expect("serialize")).expect("parse");
@@ -63,13 +74,13 @@ mod tests {
 
     #[test]
     fn json_includes_skipped() {
-        let tree = ScanTree {
-            root: node("root", 0, 0, vec![]),
-            skipped: vec![SkippedEntry {
+        let tree = tree_with(
+            node("root", 0, 0, vec![]),
+            vec![SkippedEntry {
                 path: PathBuf::from("root/locked"),
                 reason: SkipReason::PermissionDenied,
             }],
-        };
+        );
 
         let value: serde_json::Value =
             serde_json::from_str(&render_json(&tree).expect("serialize")).expect("parse");
@@ -84,26 +95,23 @@ mod tests {
     /// catches a dedup/reorder bug that a flat, single-child fixture couldn't.
     #[test]
     fn json_round_trips_nested_children_preserving_order_and_values() {
-        let tree = ScanTree {
-            root: node(
-                "root",
-                90_000,
-                89_000,
-                vec![
-                    node(
-                        "root/b_mid",
-                        50_000,
-                        49_000,
-                        vec![
-                            node("root/b_mid/two", 20_000, 19_500, vec![]),
-                            node("root/b_mid/one", 30_000, 29_500, vec![]),
-                        ],
-                    ),
-                    node("root/a_leaf", 40_000, 40_000, vec![]),
-                ],
-            ),
-            skipped: Vec::new(),
-        };
+        let tree = tree(node(
+            "root",
+            90_000,
+            89_000,
+            vec![
+                node(
+                    "root/b_mid",
+                    50_000,
+                    49_000,
+                    vec![
+                        node("root/b_mid/two", 20_000, 19_500, vec![]),
+                        node("root/b_mid/one", 30_000, 29_500, vec![]),
+                    ],
+                ),
+                node("root/a_leaf", 40_000, 40_000, vec![]),
+            ],
+        ));
 
         let json = render_json(&tree).expect("serialize");
         let parsed: ScanTree = serde_json::from_str(&json).expect("parse back");
@@ -126,9 +134,9 @@ mod tests {
     /// `{"Other": "..."}` object. Only `PermissionDenied` was covered before.
     #[test]
     fn skip_reason_not_found_and_other_round_trip_with_the_right_wire_shape() {
-        let tree = ScanTree {
-            root: node("root", 0, 0, vec![]),
-            skipped: vec![
+        let tree = tree_with(
+            node("root", 0, 0, vec![]),
+            vec![
                 SkippedEntry {
                     path: PathBuf::from("root/vanished"),
                     reason: SkipReason::NotFound,
@@ -138,7 +146,7 @@ mod tests {
                     reason: SkipReason::Other("disk on fire".to_owned()),
                 },
             ],
-        };
+        );
 
         let json = render_json(&tree).expect("serialize");
 
@@ -165,10 +173,7 @@ mod tests {
     /// still serialize — the numeric fields are `0`, not omitted or null.
     #[test]
     fn empty_tree_serializes() {
-        let tree = ScanTree {
-            root: node("root", 0, 0, vec![]),
-            skipped: Vec::new(),
-        };
+        let tree = tree(node("root", 0, 0, vec![]));
 
         let json = render_json(&tree).expect("serialize");
         let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -191,12 +196,11 @@ mod tests {
             allocated: 0,
             apparent: 0,
             is_dir: true,
+            modified: None,
+            links: None,
             children: Vec::new(),
         };
-        let tree = ScanTree {
-            root: node("root", 0, 0, vec![empty_dir.clone()]),
-            skipped: Vec::new(),
-        };
+        let tree = tree(node("root", 0, 0, vec![empty_dir.clone()]));
 
         let json = render_json(&tree).expect("serialize");
         let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -214,10 +218,7 @@ mod tests {
     /// formatted string like the human report's "1.0M".
     #[test]
     fn sizes_are_raw_json_numbers_not_formatted_strings() {
-        let tree = ScanTree {
-            root: node("root", 1_048_576, 1_048_575, vec![]),
-            skipped: Vec::new(),
-        };
+        let tree = tree(node("root", 1_048_576, 1_048_575, vec![]));
 
         let value: serde_json::Value =
             serde_json::from_str(&render_json(&tree).expect("serialize")).expect("parse");
@@ -233,6 +234,96 @@ mod tests {
         assert_ne!(value["root"]["allocated"].as_str(), Some("1.0M"));
     }
 
+    /// The v0.2 additions must be on the wire in a shape a consumer can use:
+    /// `modified` as a plain number of seconds (not serde's nested
+    /// `{secs_since_epoch, …}` object), `links` as a number or `null`, and
+    /// `link_groups` as an array of arrays of paths.
+    #[test]
+    fn json_carries_the_new_fields() {
+        let mut file = node("root/a.bin", 4096, 4000, vec![]);
+        file.modified = Some(UNIX_EPOCH + Duration::from_secs(1_750_000_000));
+        file.links = Some(2);
+        let mut root = node("root", 8192, 8000, vec![file]);
+        root.modified = Some(UNIX_EPOCH + Duration::from_secs(1_750_000_001));
+
+        let mut tree = tree(root);
+        tree.link_groups = vec![vec![
+            PathBuf::from("root/a.bin"),
+            PathBuf::from("root/b.bin"),
+        ]];
+
+        let json = render_json(&tree).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+
+        let child = &value["root"]["children"][0];
+        assert_eq!(
+            child["modified"], 1_750_000_000_i64,
+            "modified is whole seconds since the Unix epoch, as a bare number"
+        );
+        assert_eq!(child["links"], 2);
+        assert_eq!(
+            value["link_groups"],
+            serde_json::json!([["root/a.bin", "root/b.bin"]])
+        );
+
+        let parsed: ScanTree = serde_json::from_str(&json).expect("parse back");
+        assert_eq!(parsed, tree, "the additions must round-trip");
+    }
+
+    /// An entry the platform gave no timestamp for, and one on which no link
+    /// count is available (every entry on Windows), must serialize as `null` —
+    /// never as `0`, which a consumer would read as 1970, nor as `1`, which
+    /// would claim the content is unshared.
+    #[test]
+    fn unknown_signals_serialize_as_null() {
+        let tree = tree(node("root", 0, 0, vec![]));
+
+        let value: serde_json::Value =
+            serde_json::from_str(&render_json(&tree).expect("serialize")).expect("parse");
+
+        assert_eq!(value["root"]["modified"], serde_json::Value::Null);
+        assert_eq!(value["root"]["links"], serde_json::Value::Null);
+        assert_eq!(value["link_groups"], serde_json::json!([]));
+    }
+
+    /// serde's own `SystemTime` impl refuses to serialize anything before 1970,
+    /// which would turn one file with a bad clock into a failed `--json` run for
+    /// the whole scan. The custom representation must simply carry the negative
+    /// second count.
+    #[test]
+    fn a_pre_1970_timestamp_serializes_rather_than_failing_the_scan() {
+        let mut root = node("root", 0, 0, vec![]);
+        let ancient = UNIX_EPOCH - Duration::from_secs(86_400);
+        root.modified = Some(ancient);
+        let tree = tree(root);
+
+        let json = render_json(&tree).expect("a pre-epoch mtime must not fail the payload");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(value["root"]["modified"], -86_400_i64);
+
+        let parsed: ScanTree = serde_json::from_str(&json).expect("parse back");
+        assert_eq!(parsed.root.modified, Some(ancient));
+    }
+
+    /// Sub-second precision is deliberately dropped (the age rule works in
+    /// days), so a round trip lands on the containing second rather than the
+    /// original instant. Pinned here so the loss is a documented property
+    /// instead of a surprise for whoever next compares two trees.
+    #[test]
+    fn modified_round_trips_to_whole_seconds() {
+        let mut root = node("root", 0, 0, vec![]);
+        root.modified = Some(UNIX_EPOCH + Duration::new(1_750_000_000, 999_000_000));
+        let tree = tree(root);
+
+        let parsed: ScanTree =
+            serde_json::from_str(&render_json(&tree).expect("serialize")).expect("parse back");
+
+        assert_eq!(
+            parsed.root.modified,
+            Some(UNIX_EPOCH + Duration::from_secs(1_750_000_000))
+        );
+    }
+
     /// A non-UTF-8 path can't become a JSON string; that must surface as an
     /// `Err`, never a panic.
     #[cfg(unix)]
@@ -241,16 +332,15 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let bad = PathBuf::from(std::ffi::OsStr::from_bytes(&[0xff, 0xfe]));
-        let tree = ScanTree {
-            root: ScanNode {
-                path: bad,
-                allocated: 0,
-                apparent: 0,
-                is_dir: true,
-                children: Vec::new(),
-            },
-            skipped: Vec::new(),
-        };
+        let tree = tree(ScanNode {
+            path: bad,
+            allocated: 0,
+            apparent: 0,
+            is_dir: true,
+            modified: None,
+            links: None,
+            children: Vec::new(),
+        });
 
         assert!(
             render_json(&tree).is_err(),

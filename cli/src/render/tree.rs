@@ -229,12 +229,17 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// `modified` and `links` are `None` throughout these fixtures on purpose:
+    /// the tree report shows neither, so a value here would suggest the renderer
+    /// cares about something it does not.
     fn file(path: &str, allocated: u64, apparent: u64) -> ScanNode {
         ScanNode {
             path: PathBuf::from(path),
             allocated,
             apparent,
             is_dir: false,
+            modified: None,
+            links: None,
             children: Vec::new(),
         }
     }
@@ -245,6 +250,8 @@ mod tests {
             allocated,
             apparent,
             is_dir: true,
+            modified: None,
+            links: None,
             children,
         }
     }
@@ -253,6 +260,7 @@ mod tests {
         ScanTree {
             root,
             skipped: Vec::new(),
+            link_groups: Vec::new(),
         }
     }
 
