@@ -4,12 +4,15 @@ Find what's eating your disk. `disk-tools` walks a directory tree in parallel,
 measures **real on-disk (allocated) size**, and prints a size-sorted tree of the
 biggest consumers — or JSON.
 
-**v0.1 — scan + tree report.** This is the anchoring capability of a wider
-disk-utilities suite; cleanup, junk/old/duplicate detectors, config and a TUI are
+**v0.2 — scan, plus a cleanup engine.** `disk-tools clean` finds regenerable
+junk and stale files and offers to remove them **to the OS trash**. It is a dry
+run by default: nothing is deleted without `--apply`. Config and a TUI are
 planned on top of the same core. See the
-[concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and the
-[v0.1 spec](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md) for what
-shipped.
+[concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision, the
+[v0.1 spec](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md) for the
+scanner and the
+[v0.2 spec](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) for
+the cleanup engine.
 
 Cross-platform: macOS, Linux, Windows.
 
@@ -106,6 +109,102 @@ $ disk-tools project --depth 1
   project/locked (permission denied)
 ```
 
+## Cleaning up
+
+`disk-tools clean <PATH>` looks for things that can be regenerated, and tells you
+what it would remove:
+
+```console
+$ disk-tools clean ~/code
+   40.0K  pycache       auto  ~/code/proj/__pycache__
+    1.2M  node-modules  auto  ~/code/proj/node_modules
+
+Reclaimable: 1.2M
+
+Not touched:
+  ~/code/proj/target — uncommitted changes; --allow-dirty to include
+
+Dry run — nothing was removed. Re-run with --apply.
+```
+
+**Nothing is deleted without `--apply`.** The command above touched nothing; it
+is a report. And when you do pass `--apply`, everything goes to the **OS trash**,
+never `rm` — a cleanup tool that is wrong once should cost you a trip to the
+Trash, not your data.
+
+### What it looks for
+
+| Category | Matches | Requires |
+|----------|---------|----------|
+| `rust-target` | `target/` | a `Cargo.toml` beside it |
+| `node-modules` | `node_modules/` | — |
+| `pycache` | `__pycache__/`, loose `*.pyc` | — |
+| `user-caches` | `~/.cache`, `~/Library/Caches`, `%LOCALAPPDATA%\Temp` | — |
+| `old` | anything untouched for `--older-than` | the flag; **off by default** |
+
+A match is never descended into: a `node_modules` with 40,000 files is one
+candidate, not 40,000.
+
+`rust-target` needs the manifest because `target/` is an ordinary directory name.
+Without that check, someone's `target/` of photographs would be build output.
+
+### Four things stand between a match and a deletion
+
+**1. The never-touch denylist.** `/System`, `/Library/Caches` (no tilde),
+`/Windows`, `/Program Files`, `~/Library/Application Support`, `%APPDATA%` — and
+anything inside them. **No flag overrides this**, including `--apply`. Note the
+tilde: `~/Library/Caches` is a candidate, `/Library/Caches` is not.
+
+**2. Two tiers.** The safe-list categories above are `auto` — regenerable, so
+removable without argument. Anything matched by age, and any `venv/` or `.venv/`
+whatever matched it, is `confirm`: recreating a virtualenv is less deterministic
+than a lockfile install. `--safe` offers only the `auto` tier.
+
+**3. The git guard.** Build output belonging to a project with uncommitted
+changes is left alone — you may be mid-work, and it only regenerates identically
+from committed source. `--allow-dirty` includes it anyway. If `git` is missing or
+the repository cannot be read, the answer is "dirty": when the tool cannot know,
+it does not delete.
+
+**4. The dry run itself**, which is the default.
+
+Exclusions are always reported with a reason, and the two reasons are not
+interchangeable — `--allow-dirty` relaxes the guard and nothing else.
+
+### Removing
+
+```console
+$ disk-tools clean ~/code --apply
+Removed 3 of 3. Freed 2.0M.
+```
+
+The plan is printed first, to stderr, so the last thing you see before a deletion
+is the list of what is about to go. A partial failure exits non-zero and names
+every path still on disk.
+
+**`--apply` removes every candidate in the plan, `confirm` tier included** — the
+confirmation is that you read the list and typed the flag, and the count of
+non-regenerable items is said back to you before it acts. Use `--safe` if you
+want only the regenerable ones. (The concept asks for a per-target prompt here;
+that is a v0.3 question.)
+
+### Reclaimable is an upper bound
+
+A candidate holding content hardlinked from outside it does not free its full
+size when removed. Those are flagged `(shared)` and the total is reported as
+"at most":
+
+```
+Reclaimable: at most 4.0G — 1 candidate shares content with something outside
+it, so removing them may free less.
+```
+
+**On Windows the absence of that flag proves nothing.** Getting a link count
+there needs a file handle per file, which this tool will not spend, so sharing
+with anything outside the scanned tree is invisible. Sharing *within* the scan is
+detected on both platforms. Do not compare a Windows figure with a Unix one and
+conclude anything.
+
 ## Flags
 
 | Flag | Effect | Scope |
@@ -119,6 +218,15 @@ $ disk-tools project --depth 1
 | `--json` | Emit JSON instead of the tree report | display |
 | `-v`, `--verbose` | List every skipped entry instead of just the first ten | display |
 | `-h`, `--help` / `-V`, `--version` | Print help / version | — |
+
+`disk-tools clean <PATH>` takes its own flags:
+
+| Flag | Effect |
+|------|--------|
+| `--apply` | **Actually remove**, to the OS trash. Without it nothing is touched |
+| `--safe` | Offer only the `auto` tier — regenerable output, nothing needing confirmation |
+| `--allow-dirty` | Include build output whose project has uncommitted changes. Relaxes **only** the git guard |
+| `--older-than <DURATION>` | Also offer anything untouched for this long: `90d`, `2w`, `6m`, `1y`. A bare number is rejected — `90` could mean seconds as easily as days. `m` is 30 days, `y` is 365 |
 
 **`--depth` and `--min-size` filter what is printed, never what is counted.** A
 directory's size is always its full subtree, exactly like `du`. Hiding a 400 MB
@@ -173,6 +281,11 @@ independent reruns have put it anywhere from 1.7× ahead to slightly behind. It
 accumulates one total and keeps nothing, where `disk-tools` builds the tree that the
 report, and the planned TUI, both need.
 
+Cleanup adds one cost worth knowing: the git guard spawns `git status` once per
+repository, measured at **~23 ms each**, which dominates a dry run over a tree of
+many projects — see [the note](kb/benchmarks/2026.07/2026.07.25-clean-latency.md).
+Every other rule is a pure pass over the already-built tree.
+
 **The parallelism has a low ceiling.** Only recursion into subdirectories runs in
 parallel; the per-entry loop inside a single directory does not, and neither does
 hardlink attribution or aggregation. Measured on 16 cores: 2.1–2.7× end to end, and
@@ -186,7 +299,19 @@ Full protocol, raw numbers and caveats:
 [kb/benchmarks/2026.07/2026.07.25-v0.1-scan-performance.md](kb/benchmarks/2026.07/2026.07.25-v0.1-scan-performance.md).
 Reproduce with `just bench-fixtures <dir>` → `just bench <dir>` → `just bench-memory <path>`.
 
-## Limitations (v0.1)
+## Limitations
+
+Cleanup, first — these are the ones worth reading before `--apply`:
+
+| Limitation | Detail |
+|------------|--------|
+| **On Windows, one failure mode cannot be caught** | The `trash` crate calls `CoCreateInstance(...).unwrap()` on its Windows delete path. If COM cannot be initialised — a service, a session-0 process, some sandboxes — it **panics** rather than returning an error, aborting the run mid-way. No wrapper here can convert a panic, so "the summary names what survived" holds for every failure the backend *reports*, and not for that one. `just smoke-trash` runs on all three platforms in CI so a COM-hostile environment shows up as a red build. |
+| **On macOS, recoverability cannot be verified by a test** | `~/.Trash` needs Full Disk Access and the crate offers no way to list it there, so an automated test can assert only that the original path is gone — which an unrecoverable delete would also satisfy. It rests on the crate's documented behaviour and one manual check. Linux and Windows can be checked properly. |
+| **`(shared)` is not detectable across the scan boundary on Windows** | See [Reclaimable is an upper bound](#reclaimable-is-an-upper-bound). Absence of the flag there is not evidence of unshared content. |
+| **A dry run costs ~23 ms per repository** | The git guard spawns `git status --porcelain` once per repository. Over 50 dirty Rust projects a `clean` is 1.2 s against 15 ms for a plain scan — 80×. `--allow-dirty` skips it entirely and is free. [Measured.](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) |
+| **`--apply` does not prompt per target** | Even for the `confirm` tier. See [Removing](#removing). |
+
+And the scanner's, unchanged from v0.1:
 
 | Limitation | Detail |
 |------------|--------|

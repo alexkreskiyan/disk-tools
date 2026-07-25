@@ -17,11 +17,15 @@ use std::time::{Duration, SystemTime};
 // stops clap treating a subcommand name as a value for the positional.
 #[command(version, about, args_conflicts_with_subcommands = true)]
 pub struct Args {
-    /// Directory (or file) to scan. Always explicit — never defaults to the CWD.
-    ///
-    /// `Option` only because a subcommand replaces it; [`Args::resolve`] rejects
-    /// the case where neither is given, so a bare `disk-tools` still cannot scan
-    /// the working directory by accident.
+    // `Option` only because a subcommand replaces it; `Args::resolve` rejects
+    // the case where neither is given, so a bare `disk-tools` still cannot scan
+    // the working directory by accident.
+    //
+    // A plain comment, not a doc comment: clap turns doc comments into help
+    // text, and a note to whoever maintains this is not something a user should
+    // meet in `--help`. The same reason the strings below are spelled out rather
+    // than marked up — `--help` is a terminal, not a rendered page.
+    /// Directory (or file) to scan. Always explicit — never defaults to the current directory.
     #[arg(value_name = "PATH")]
     pub root: Option<PathBuf>,
 
@@ -29,7 +33,7 @@ pub struct Args {
     #[arg(short = 'n', long = "number")]
     pub number: Option<usize>,
 
-    /// Hide entries below this size, e.g. `1M`, `512K`, `2G` (1024-based).
+    /// Hide entries below this size, e.g. 1M, 512K, 2G (1024-based).
     #[arg(long = "min-size", default_value = "0", value_parser = parse_size)]
     pub min_size: u64,
 
@@ -59,8 +63,7 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Find removable junk. **Dry-run by default** — nothing is deleted without
-    /// `--apply`.
+    /// Find removable junk. Dry-run by default — nothing is deleted without --apply.
     Clean(CleanArgs),
 }
 
@@ -83,8 +86,8 @@ pub struct CleanArgs {
     #[arg(long = "allow-dirty")]
     pub allow_dirty: bool,
 
-    /// Also offer anything untouched for this long, e.g. `90d`, `6m`, `1y`.
-    #[arg(long = "older-than", value_parser = parse_duration)]
+    /// Also offer anything untouched for this long: 90d, 6m, 1y.
+    #[arg(long = "older-than", value_parser = parse_duration, value_name = "DURATION")]
     pub older_than: Option<Duration>,
 }
 
@@ -567,6 +570,45 @@ mod tests {
                 clean_help.contains(flag),
                 "`clean --help` must mention {flag}, got:\n{clean_help}"
             );
+        }
+    }
+
+    /// `--help` is a terminal, not a rendered page.
+    ///
+    /// clap turns doc comments into help text, so a `**bold**` or a `[`link`]`
+    /// written for rustdoc is printed to the user verbatim — and a multi-
+    /// paragraph doc comment becomes `long_help`, which is how a note addressed
+    /// to whoever maintains this file ended up in front of users.
+    #[test]
+    fn help_is_free_of_markup_and_maintainer_notes() {
+        use clap::CommandFactory;
+
+        let mut command = Args::command();
+        let mut pages = vec![
+            command.render_long_help().to_string(),
+            command.render_help().to_string(),
+        ];
+        let mut clean = command
+            .find_subcommand_mut("clean")
+            .expect("the clean subcommand exists")
+            .clone();
+        pages.push(clean.render_long_help().to_string());
+
+        for page in pages {
+            assert!(
+                !page.contains("**"),
+                "emphasis markers reach the terminal as asterisks:\n{page}"
+            );
+            assert!(
+                !page.contains("[`"),
+                "rustdoc links reach the terminal verbatim:\n{page}"
+            );
+            for leak in ["Args::resolve", "Option<", "clap turns"] {
+                assert!(
+                    !page.contains(leak),
+                    "`{leak}` is a note to a maintainer, not help for a user:\n{page}"
+                );
+            }
         }
     }
 
