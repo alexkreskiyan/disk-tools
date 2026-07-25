@@ -29,6 +29,7 @@
 mod clean;
 mod dedup;
 mod detect;
+mod git;
 mod options;
 mod paths;
 mod size;

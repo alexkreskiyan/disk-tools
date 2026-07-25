@@ -1,16 +1,20 @@
 //! Deciding what may be removed, and what removing it would free.
 //!
-//! **Nothing here touches the filesystem.** [`plan`] reads a [`ScanTree`] and
-//! returns a decision, which is what makes every rule below testable against a
-//! hand-built tree: a denylist bug should cost a failing test, not a directory.
-//! Removal lives in [`crate::trash`], the only module that needs the `trash`
-//! crate — so planning is available even to a consumer who cannot apply.
+//! **[`plan`] writes nothing.** It reads a [`ScanTree`] and returns a decision,
+//! which is what makes almost every rule below testable against a hand-built
+//! tree: a denylist bug should cost a failing test, not a directory. Removal
+//! lives in [`crate::trash`], the only module that needs the `trash` crate — so
+//! planning is available even to a consumer who cannot apply.
 //!
-//! Three of v0.2's four safety mechanisms are decided here: the never-touch
-//! denylist, the two tiers, and `--safe`. The fourth, the git guard, joins the
-//! same pipeline in Task 5.
+//! One rule *reads*: the git guard has to look for a `.git` and ask git about
+//! it ([`crate::git`]). Nothing else here touches the filesystem, and nothing
+//! here touches it for writing.
+//!
+//! All four of v0.2's safety mechanisms are decided here — the never-touch
+//! denylist, the two tiers, `--safe`, and that guard.
 
 use crate::detect::{Category, DetectOptions, UserDirs, detect};
+use crate::git;
 use crate::paths::{is_within, normalize_lexically, under_root};
 use crate::tree::{ScanNode, ScanTree};
 use std::collections::HashMap;
@@ -82,6 +86,11 @@ pub struct Candidate {
 pub enum ExcludeReason {
     /// On the never-touch denylist. No flag overrides this.
     Denylisted,
+
+    /// Build output whose project has uncommitted work — you may be mid-change,
+    /// and it only regenerates identically from committed source.
+    /// `--allow-dirty` overrides this one.
+    DirtyRepo,
 }
 
 /// Something a rule matched and the plan then refused.
@@ -120,29 +129,32 @@ pub struct CleanOptions {
     pub safe_only: bool,
 
     /// `--allow-dirty`: relax the git guard. **Never** the denylist.
-    ///
-    /// **Currently inert.** The guard itself arrives in Task 5; until then
-    /// setting this changes nothing, and a caller must not read its presence as
-    /// "the guard exists and can be relaxed". Carried now so the option struct
-    /// does not change shape underneath the CLI mid-version.
     pub allow_dirty: bool,
 }
 
 /// Decide what could be removed, and what that would free.
 ///
-/// Pure: it reads a [`ScanTree`] and returns a decision, touching no filesystem.
-/// That is what makes every rule below testable against a hand-built tree — a
-/// denylist bug should cost a failing test, not a directory.
+/// **Writes nothing.** It reads a [`ScanTree`] and returns a decision, which is
+/// what makes almost every rule below testable against a hand-built tree — a
+/// denylist bug should cost a failing test, not a directory. The one exception
+/// is the git guard, which has to look at the disk to answer at all; it still
+/// only reads.
 ///
 /// The order is the safety model:
 ///
 /// 1. the rules propose ([`crate::detect`]);
 /// 2. the **denylist** removes, unconditionally — no flag overrides it, and what
 ///    it removes is reported rather than dropped;
-/// 3. each survivor gets a tier, virtualenvs demoted whatever their category;
-/// 4. `--safe` keeps only auto-tier;
-/// 5. candidates whose content is reachable from outside them are marked, so
+/// 3. the **git guard** removes build output whose project is mid-change,
+///    likewise reported; `--allow-dirty` relaxes this one and nothing else;
+/// 4. each survivor gets a tier, virtualenvs demoted whatever their category;
+/// 5. `--safe` keeps only auto-tier;
+/// 6. candidates whose content is reachable from outside them are marked, so
 ///    the total can be read as the upper bound it is.
+///
+/// Steps 2 and 3 come before 5 because they are the tool *refusing*, which the
+/// user needs told; step 5 is the user's own narrowing, which they already know
+/// about.
 pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
     let denied = denylist(&options.detect.user_dirs);
     let groups = link_groups_by_path(tree);
@@ -150,12 +162,24 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
 
     let mut candidates = Vec::new();
     let mut excluded = Vec::new();
+    // One `git status` per repository, not per candidate: a tree of sibling
+    // Rust projects would otherwise spawn a process for each, and a workspace
+    // whose members share a repository would ask the same question repeatedly.
+    let mut repos: HashMap<PathBuf, git::RepoState> = HashMap::new();
 
     for detection in detect(tree, &options.detect) {
         if is_denied(&detection.path, &denied) {
             excluded.push(Excluded {
                 path: detection.path,
                 reason: ExcludeReason::Denylisted,
+            });
+            continue;
+        }
+
+        if is_mid_change(&detection.path, detection.category, options, &mut repos) {
+            excluded.push(Excluded {
+                path: detection.path,
+                reason: ExcludeReason::DirtyRepo,
             });
             continue;
         }
@@ -226,6 +250,51 @@ fn is_denied(path: &Path, absolute: &[PathBuf]) -> bool {
 fn matches_denylist(path: &Path, absolute: &[PathBuf]) -> bool {
     DENIED_ROOTS.iter().any(|root| under_root(path, root))
         || absolute.iter().any(|root| is_within(path, root))
+}
+
+/// Is this build output whose project has uncommitted work?
+///
+/// Scoped to build-output categories (§8.2.3 step 1) — `rust-target` is the only
+/// one in v0.2. "You may be mid-change" is a statement about a project, and a
+/// cache does not belong to one; applying the guard there would refuse to clean
+/// `~/.cache` because some unrelated repository above it was dirty.
+///
+/// `--allow-dirty` short-circuits **before** the filesystem is touched, so the
+/// override costs nothing rather than merely ignoring the answer.
+///
+/// `repos` memoises the verdict per repository, since several candidates often
+/// share one.
+fn is_mid_change(
+    path: &Path,
+    category: Category,
+    options: &CleanOptions,
+    repos: &mut HashMap<PathBuf, git::RepoState>,
+) -> bool {
+    if options.allow_dirty || !is_build_output(category) {
+        return false;
+    }
+
+    // No repository above it, so there is no "mid-change" to be in.
+    let Some(repo) = git::enclosing_repo(path) else {
+        return false;
+    };
+
+    let state = *repos
+        .entry(repo.clone())
+        .or_insert_with(|| git::state(&repo));
+
+    state == git::RepoState::Dirty
+}
+
+/// Which categories are output a build regenerates from source.
+fn is_build_output(category: Category) -> bool {
+    match category {
+        Category::RustTarget => true,
+        // `node_modules` is restored by a lockfile install rather than a build,
+        // and the rest are caches or age matches. None of them are produced from
+        // the working tree, so a dirty repository says nothing about them.
+        Category::NodeModules | Category::Pycache | Category::UserCaches | Category::Old => false,
+    }
 }
 
 /// Auto for the safe-list categories, confirm for anything judged by age — and
@@ -314,6 +383,7 @@ fn holds_shared_content(
 mod tests {
     use super::*;
     use crate::detect::Age;
+    use std::process::Command;
     use std::time::{Duration, SystemTime};
 
     // ---- fixtures --------------------------------------------------------
@@ -565,6 +635,203 @@ mod tests {
         assert!(
             is_denied(Path::new("/System/../Users/me/node_modules"), &[]),
             "the raw form is under a denied root, so the denial stands"
+        );
+    }
+
+    // ---- the git guard ---------------------------------------------------
+    //
+    // Driven against **real** repositories: a guard verified against a stubbed
+    // git tells you the stub works. The fixtures skip loudly where git is
+    // absent, following the `chmod 000` precedent — and every CI runner has git,
+    // so these really run rather than quietly passing.
+
+    /// Build a repository under a temp dir, with `Cargo.toml` and `target/` so
+    /// the `rust-target` rule has something to match. Returns `None` where this
+    /// environment has no usable git.
+    fn repo_fixture(committed: bool) -> Option<tempfile::TempDir> {
+        let handle = tempfile::tempdir().expect("tempdir");
+        let root = handle.path();
+
+        let init = Command::new("git").arg("init").arg(root).output();
+        match init {
+            Ok(output) if output.status.success() => {}
+            _ => {
+                eprintln!("skipping: no usable git in this environment");
+                return None;
+            }
+        }
+
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"x\"\n").expect("write");
+        std::fs::create_dir(root.join("target")).expect("mkdir");
+        std::fs::create_dir(root.join("node_modules")).expect("mkdir");
+
+        if committed {
+            let add = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["add", "."])
+                .output()
+                .expect("git add");
+            assert!(add.status.success(), "git add failed: {add:?}");
+            let commit = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "-c",
+                    "user.name=disk-tools test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--message",
+                    "fixture",
+                ])
+                .output()
+                .expect("git commit");
+            assert!(commit.status.success(), "git commit failed: {commit:?}");
+        }
+
+        Some(handle)
+    }
+
+    /// A tree shaped like the fixture on disk, so `plan` sees paths that really
+    /// exist and the guard can consult them.
+    fn repo_tree(root: &Path) -> ScanTree {
+        let as_str = |p: PathBuf| p.to_str().expect("utf8 temp path").to_owned();
+        tree(dir(
+            &as_str(root.to_path_buf()),
+            vec![
+                file(&as_str(root.join("Cargo.toml")), 100),
+                dir(&as_str(root.join("node_modules")), vec![]),
+                dir(&as_str(root.join("target")), vec![]),
+            ],
+        ))
+    }
+
+    #[test]
+    fn dirty_repo_excludes_the_build_directory_with_a_reason() {
+        let Some(handle) = repo_fixture(false) else {
+            return;
+        };
+        let root = handle.path();
+
+        let plan = plan(&repo_tree(root), &opts());
+
+        assert!(
+            !paths(&plan).contains(&root.join("target").as_path()),
+            "build output of a mid-change project must not be a candidate: {:?}",
+            paths(&plan)
+        );
+        assert_eq!(
+            plan.excluded,
+            vec![Excluded {
+                path: root.join("target"),
+                reason: ExcludeReason::DirtyRepo,
+            }],
+            "and the user must be told why"
+        );
+    }
+
+    #[test]
+    fn clean_repo_keeps_the_candidate() {
+        let Some(handle) = repo_fixture(true) else {
+            return;
+        };
+        let root = handle.path();
+
+        let plan = plan(&repo_tree(root), &opts());
+
+        assert!(
+            paths(&plan).contains(&root.join("target").as_path()),
+            "everything is committed, so the build output regenerates: {:?}",
+            paths(&plan)
+        );
+        assert!(plan.excluded.is_empty(), "{:?}", plan.excluded);
+    }
+
+    #[test]
+    fn allow_dirty_disables_the_guard() {
+        let Some(handle) = repo_fixture(false) else {
+            return;
+        };
+        let root = handle.path();
+        let options = CleanOptions {
+            allow_dirty: true,
+            ..opts()
+        };
+
+        let plan = plan(&repo_tree(root), &options);
+
+        assert!(
+            paths(&plan).contains(&root.join("target").as_path()),
+            "the user overrode the guard: {:?}",
+            paths(&plan)
+        );
+        assert!(plan.excluded.is_empty(), "{:?}", plan.excluded);
+    }
+
+    /// §8.2.3 step 1. `node_modules` is restored by a lockfile install, not
+    /// rebuilt from the working tree, so a dirty repository says nothing about
+    /// it — guarding it would refuse cleanups for an unrelated reason.
+    #[test]
+    fn only_build_output_is_guarded() {
+        let Some(handle) = repo_fixture(false) else {
+            return;
+        };
+        let root = handle.path();
+
+        let plan = plan(&repo_tree(root), &opts());
+
+        assert_eq!(
+            paths(&plan),
+            vec![root.join("node_modules").as_path()],
+            "the dependency directory is unaffected by the repository's state"
+        );
+    }
+
+    /// A candidate with no repository above it at all: the guard has nothing to
+    /// consult and must not invent an answer.
+    #[test]
+    fn path_outside_any_repo_is_unaffected() {
+        let handle = tempfile::tempdir().expect("tempdir");
+        let root = handle.path();
+        std::fs::write(root.join("Cargo.toml"), b"[package]").expect("write");
+        std::fs::create_dir(root.join("target")).expect("mkdir");
+        std::fs::create_dir(root.join("node_modules")).expect("mkdir");
+
+        let plan = plan(&repo_tree(root), &opts());
+
+        assert!(
+            paths(&plan).contains(&root.join("target").as_path()),
+            "no repository, no guard: {:?}",
+            paths(&plan)
+        );
+        assert!(plan.excluded.is_empty());
+    }
+
+    /// The ordering test, in the shape that caught the `--safe` reordering in
+    /// Task 4: the denylist must run first, so its reason is the one reported.
+    /// Reversed, a denylisted path in a dirty repository would be blamed on the
+    /// repository — and `--allow-dirty` would then appear to be the way past it.
+    #[test]
+    fn the_denylist_is_reported_ahead_of_the_guard() {
+        let plan = plan(
+            &tree(dir(
+                "/Windows",
+                vec![
+                    file("/Windows/Cargo.toml", 100),
+                    dir("/Windows/target", vec![]),
+                ],
+            )),
+            &opts(),
+        );
+
+        assert_eq!(
+            plan.excluded,
+            vec![Excluded {
+                path: PathBuf::from("/Windows/target"),
+                reason: ExcludeReason::Denylisted,
+            }],
+            "a protected path is denylisted, whatever git would have said"
         );
     }
 
