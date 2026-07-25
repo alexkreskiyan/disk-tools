@@ -53,6 +53,16 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# rustdoc catches what clippy cannot: a public item documenting a link to a
+# private one resolves to nothing in the built docs. Two of those reached code
+# review before this recipe existed, which is why it does.
+#
+# `--all-features` because the serde-gated code carries doc links of its own.
+
+# Build the docs; warnings are errors.
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
 # `--all-targets` so tests and benches are checked too — an API stabilized after
 # the MSRV is just as breaking there. CI runs this under the pinned 1.85.
 
@@ -63,8 +73,8 @@ check:
 # CI runs this recipe on all three platforms, so anything added here is
 # enforced there too.
 
-# Pre-commit gate: formatting, lints, tests.
-verify: fmt-check lint test
+# Pre-commit gate: formatting, lints, docs, tests.
+verify: fmt-check lint doc test
 
 # =============================================================================
 # Benchmarks

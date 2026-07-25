@@ -29,6 +29,7 @@
 #[cfg(feature = "clean")]
 mod clean;
 mod dedup;
+mod detect;
 mod options;
 mod size;
 mod tree;
@@ -38,6 +39,7 @@ mod windows_dir;
 
 #[cfg(feature = "clean")]
 pub use clean::{TrashFailure, move_to_trash};
+pub use detect::{Category, CategorySet, DetectOptions, Detection, UserDirs, detect};
 pub use options::ScanOptions;
 pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
 
