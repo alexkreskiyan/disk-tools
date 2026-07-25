@@ -484,6 +484,25 @@ mod tests {
         assert_eq!(file.modified, Some(expected));
     }
 
+    /// Do two readings of one path's mtime describe the same instant?
+    ///
+    /// Exact on Unix. On Windows a **directory's** timestamp is written back to
+    /// its parent's listing lazily, so a value read from that listing can trail
+    /// a direct `stat` of the same directory by milliseconds — the same field
+    /// seen at two removes, not a discrepancy in what we record. Files are
+    /// unaffected: their entry is flushed when the handle closes, which is why
+    /// [`modified_matches_the_files_mtime`] stays exact.
+    fn same_instant(scanned: SystemTime, stated: SystemTime) -> bool {
+        if !cfg!(windows) {
+            return scanned == stated;
+        }
+        let drift = scanned
+            .duration_since(stated)
+            .or_else(|_| stated.duration_since(scanned))
+            .expect("one of the two orderings holds");
+        drift < std::time::Duration::from_secs(1)
+    }
+
     /// A directory carries its **own** mtime, never its children's — the signal
     /// the age rule is built on (a directory's mtime moves when its entries
     /// change, which is exactly the "still in use" evidence wanted).
@@ -504,8 +523,14 @@ mod tests {
             .iter()
             .find(|e| e.path == sub)
             .expect("the directory was walked");
+        let modified = node
+            .modified
+            .expect("the platform records a directory mtime");
 
-        assert_eq!(node.modified, Some(expected));
+        assert!(
+            same_instant(modified, expected),
+            "the directory's own mtime, got {modified:?} against {expected:?}"
+        );
     }
 
     /// No filesystem this runs on will hand back an entry without a timestamp,
@@ -635,12 +660,8 @@ mod tests {
             .expect("the file was walked");
         let modified = file.modified.expect("the listing carries LastWriteTime");
 
-        let drift = modified
-            .duration_since(expected)
-            .or_else(|_| expected.duration_since(modified))
-            .expect("one of the two orderings holds");
         assert!(
-            drift < std::time::Duration::from_secs(1),
+            same_instant(modified, expected),
             "listing mtime {modified:?} and metadata mtime {expected:?} must agree"
         );
     }

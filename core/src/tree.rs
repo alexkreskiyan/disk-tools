@@ -277,6 +277,7 @@ mod tests {
         use crate::tree::ScanNode;
         use std::fs;
         use std::path::Path;
+        use std::time::SystemTime;
 
         fn opts(root: &Path) -> ScanOptions {
             ScanOptions {
@@ -546,6 +547,25 @@ mod tests {
             assert!(tree.link_groups.is_empty(), "{:?}", tree.link_groups);
         }
 
+        /// Do two readings of one path's mtime describe the same instant?
+        ///
+        /// Exact on Unix. On Windows a **directory's** timestamp is written back
+        /// to its parent's listing lazily, so a value read from that listing can
+        /// trail a direct `stat` of the same directory by milliseconds — the two
+        /// really are the same field seen at two removes. Files are unaffected:
+        /// their entry is flushed when the handle closes, which is why
+        /// `walk::tests::modified_matches_the_files_mtime` can stay exact.
+        fn same_instant(scanned: SystemTime, stated: SystemTime) -> bool {
+            if !cfg!(windows) {
+                return scanned == stated;
+            }
+            let drift = scanned
+                .duration_since(stated)
+                .or_else(|_| stated.duration_since(scanned))
+                .expect("one of the two orderings holds");
+            drift < std::time::Duration::from_secs(1)
+        }
+
         /// Sizes fold upward; mtime does not. A directory judged by its
         /// children's timestamps would make the age rule call a freshly-written
         /// cache "old" whenever its parent had not been touched — the exact
@@ -571,7 +591,13 @@ mod tests {
                 .modified()
                 .expect("mtime");
 
-            assert_eq!(sub_node.modified, Some(expected));
+            let modified = sub_node
+                .modified
+                .expect("the platform records a directory mtime");
+            assert!(
+                same_instant(modified, expected),
+                "the directory node must carry its own mtime, got {modified:?} against {expected:?}"
+            );
             assert_eq!(
                 sub_node.links, None,
                 "a directory carries no link count, whatever its subdirectories say"
