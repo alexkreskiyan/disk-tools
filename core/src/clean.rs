@@ -52,6 +52,43 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// Trash `path`, or report that this environment cannot.
+    ///
+    /// Returns `false` after printing a notice, so a smoke test bails instead of
+    /// failing where no backend exists — the rule the permission fixtures follow,
+    /// since a test that passes because its fixture failed to build is worse than
+    /// no test. Shared by both smoke tests so the branch has one implementation
+    /// and one test rather than duplicated prose in each.
+    fn trashed_or_skipped(path: &Path) -> bool {
+        match move_to_trash(path) {
+            Ok(()) => true,
+            Err(failure) => {
+                eprintln!(
+                    "skipping: this environment has no usable trash backend ({})",
+                    failure.reason
+                );
+                false
+            }
+        }
+    }
+
+    /// Covers the skip branch itself, which the `#[ignore]`d smoke tests never
+    /// reach: every platform CI runs on turns out to *have* a trash backend, so
+    /// the "no backend" arm would otherwise be reasoned about and never executed.
+    ///
+    /// A path that cannot be trashed stands in for a missing backend because the
+    /// branch cannot tell them apart — both arrive as `Err`. That is the point:
+    /// whatever the cause, it must produce a skip rather than a failure.
+    #[test]
+    fn an_unusable_backend_skips_rather_than_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(
+            !trashed_or_skipped(&dir.path().join("cannot-be-trashed.bin")),
+            "a backend failure must report a skip, not panic or fail the test"
+        );
+    }
+
     /// The failure path, exercised without needing a working trash backend: a
     /// path that does not exist cannot be trashed anywhere.
     ///
@@ -81,10 +118,8 @@ mod tests {
     /// running it on every `just test` would litter it. Run deliberately with
     /// `just smoke-trash`.
     ///
-    /// An environment with no trash backend (a container, a volume that has
-    /// none) skips loudly instead of failing — the same rule the permission
-    /// fixtures follow, since a test that passes because its fixture failed to
-    /// build is worse than no test.
+    /// An environment with no trash backend skips loudly instead of failing —
+    /// see [`trashed_or_skipped`].
     #[test]
     #[ignore = "moves a real file to the OS trash; run via `just smoke-trash`"]
     fn trashing_a_file_removes_the_original() {
@@ -92,18 +127,12 @@ mod tests {
         let victim = dir.path().join("smoke-test.bin");
         std::fs::write(&victim, b"disk-tools smoke test").expect("write file");
 
-        match move_to_trash(&victim) {
-            Ok(()) => assert!(
+        if trashed_or_skipped(&victim) {
+            assert!(
                 !victim.exists(),
                 "a trashed file must be gone from its original path: {}",
                 victim.display()
-            ),
-            Err(failure) => {
-                eprintln!(
-                    "skipping: this environment has no usable trash backend ({})",
-                    failure.reason
-                );
-            }
+            );
         }
     }
 
@@ -125,20 +154,15 @@ mod tests {
         }
 
         let start = Instant::now();
-        let outcome = move_to_trash(&tree);
+        let trashed = trashed_or_skipped(&tree);
         let elapsed = start.elapsed();
 
-        match outcome {
-            Ok(()) => {
-                println!("\ntrashed {FILES} files in one call: {elapsed:.1?}");
-                assert!(
-                    !tree.exists(),
-                    "the tree must be gone from its original path"
-                );
-            }
-            Err(failure) => {
-                eprintln!("skipping: no usable trash backend ({})", failure.reason);
-            }
+        if trashed {
+            println!("\ntrashed {FILES} files in one call: {elapsed:.1?}");
+            assert!(
+                !tree.exists(),
+                "the tree must be gone from its original path"
+            );
         }
     }
 }
