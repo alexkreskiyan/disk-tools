@@ -10,9 +10,7 @@
 //! "what would go".
 
 use super::tree::format_size;
-use disk_tools_core::{
-    Candidate, Category, CleanOutcome, CleanPlan, ExcludeReason, Excluded, Tier,
-};
+use disk_tools_core::{Candidate, CleanOutcome, CleanPlan, ExcludeReason, Excluded, Tier};
 use std::fmt::Write;
 
 /// Why the plan is being shown.
@@ -54,14 +52,18 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
     }
 
     if let Some(hidden) = hidden_by_safe.filter(|&n| n > 0) {
-        let noun = if hidden == 1 {
-            "candidate"
+        // The verb and the pronoun have to agree with the noun, not just the
+        // noun with the count — "1 more candidate need confirmation … hiding
+        // them" reads as though more than one were being withheld, which is the
+        // one thing this line exists to say precisely.
+        let (noun, verb, them) = if hidden == 1 {
+            ("candidate", "needs", "it")
         } else {
-            "candidates"
+            ("candidates", "need", "them")
         };
         let _ = writeln!(
             out,
-            "\n{hidden} more {noun} need confirmation; --safe is hiding them."
+            "\n{hidden} more {noun} {verb} confirmation; --safe is hiding {them}."
         );
     }
 
@@ -156,10 +158,11 @@ pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, purged: bool
 
 fn write_candidates(candidates: &[Candidate], out: &mut String) {
     // Widths from the data rather than fixed, so the columns stay tight when
-    // only one category is present.
-    let category_width = candidates
+    // only one rule is present. Rule names are user-supplied in v0.3, so this
+    // is no longer a bounded set of five known strings.
+    let rule_width = candidates
         .iter()
-        .map(|c| category(c.category).len())
+        .map(|c| c.rule.chars().count())
         .max()
         .unwrap_or(0);
     let tier_width = candidates
@@ -172,13 +175,13 @@ fn write_candidates(candidates: &[Candidate], out: &mut String) {
         // Writing to a `String` is infallible.
         let _ = writeln!(
             out,
-            "{size:>8}  {category:<cw$}  {tier:<tw$}  {path}{shared}",
+            "{size:>8}  {rule:<rw$}  {tier:<tw$}  {path}{shared}",
             size = format_size(candidate.allocated),
-            category = category(candidate.category),
+            rule = candidate.rule,
             tier = tier(candidate.tier),
             path = candidate.path.display(),
             shared = if candidate.shared { "  (shared)" } else { "" },
-            cw = category_width,
+            rw = rule_width,
             tw = tier_width,
         );
     }
@@ -236,18 +239,6 @@ fn excuse(reason: &ExcludeReason) -> &'static str {
     }
 }
 
-/// The name the concept and the README use for each category, so the report,
-/// the docs and any future config key all say the same word.
-fn category(category: Category) -> &'static str {
-    match category {
-        Category::RustTarget => "rust-target",
-        Category::NodeModules => "node-modules",
-        Category::Pycache => "pycache",
-        Category::UserCaches => "user-caches",
-        Category::Old => "old",
-    }
-}
-
 fn tier(tier: Tier) -> &'static str {
     match tier {
         Tier::Auto => "auto",
@@ -260,10 +251,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn candidate(path: &str, category: Category, tier: Tier, allocated: u64) -> Candidate {
+    fn candidate(path: &str, rule: &str, tier: Tier, allocated: u64) -> Candidate {
         Candidate {
             path: PathBuf::from(path),
-            category,
+            rule: rule.into(),
             tier,
             allocated,
             shared: false,
@@ -285,19 +276,14 @@ mod tests {
     fn dry_run_lists_candidates_with_a_total() {
         let report = render_clean(
             &plan(vec![
-                candidate(
-                    "/p/node_modules",
-                    Category::NodeModules,
-                    Tier::Auto,
-                    1_048_576,
-                ),
-                candidate("/p/old.bin", Category::Old, Tier::Confirm, 1_048_576),
+                candidate("/p/node_modules", "node-modules", Tier::Auto, 1_048_576),
+                candidate("/p/old.bin", "old", Tier::Confirm, 1_048_576),
             ]),
             None,
             Intent::DryRun,
         );
 
-        // Path, category and tier for each, then the total.
+        // Path, rule and tier for each, then the total.
         assert!(report.contains("/p/node_modules"), "{report}");
         assert!(report.contains("node-modules"), "{report}");
         assert!(report.contains("auto"), "{report}");
@@ -315,7 +301,7 @@ mod tests {
     /// "will not be freed" would be a different, stronger and wrong one.
     #[test]
     fn shared_candidate_is_flagged_and_total_labelled_upper_bound() {
-        let mut shared = candidate("/p/node_modules", Category::NodeModules, Tier::Auto, 2048);
+        let mut shared = candidate("/p/node_modules", "node-modules", Tier::Auto, 2048);
         shared.shared = true;
 
         let report = render_clean(&plan(vec![shared]), None, Intent::DryRun);
@@ -339,7 +325,7 @@ mod tests {
         let report = render_clean(
             &plan(vec![candidate(
                 "/p/node_modules",
-                Category::NodeModules,
+                "node-modules",
                 Tier::Auto,
                 2048,
             )]),
@@ -423,7 +409,7 @@ mod tests {
         let report = render_clean(
             &plan(vec![candidate(
                 "/p/node_modules",
-                Category::NodeModules,
+                "node-modules",
                 Tier::Auto,
                 2048,
             )]),
@@ -441,12 +427,7 @@ mod tests {
     #[test]
     fn nothing_hidden_says_nothing() {
         let report = render_clean(
-            &plan(vec![candidate(
-                "/p/nm",
-                Category::NodeModules,
-                Tier::Auto,
-                1,
-            )]),
+            &plan(vec![candidate("/p/nm", "node-modules", Tier::Auto, 1)]),
             Some(0),
             Intent::DryRun,
         );
@@ -461,27 +442,41 @@ mod tests {
     /// prose a person reads under some pressure.
     #[test]
     fn counts_are_singular_where_they_should_be() {
-        let mut shared = candidate("/p/nm", Category::NodeModules, Tier::Auto, 2048);
+        let mut shared = candidate("/p/nm", "node-modules", Tier::Auto, 2048);
         shared.shared = true;
         let report = render_clean(&plan(vec![shared]), Some(1), Intent::DryRun);
 
         assert!(report.contains("1 candidate shares"), "{report}");
-        assert!(report.contains("1 more candidate need"), "{report}");
+        assert!(
+            report.contains("1 more candidate needs confirmation; --safe is hiding it."),
+            "the verb and the pronoun agree with the noun, not only with the count:\n{report}"
+        );
     }
 
+    /// Only the tier still has a label that could be got wrong. Rule names are
+    /// printed verbatim in v0.3 — they are the user's own text, so there is no
+    /// mapping left that could omit one.
     #[test]
-    fn every_category_and_tier_has_a_label() {
-        for c in [
-            Category::RustTarget,
-            Category::NodeModules,
-            Category::Pycache,
-            Category::UserCaches,
-            Category::Old,
-        ] {
-            assert!(!category(c).is_empty(), "{c:?}");
-        }
+    fn every_tier_has_a_label() {
         assert_eq!(tier(Tier::Auto), "auto");
         assert_eq!(tier(Tier::Confirm), "confirm");
+    }
+
+    /// A user's rule name is not from a fixed set, so the column has to size
+    /// itself from the data rather than from a known-longest label.
+    #[test]
+    fn the_rule_column_fits_the_longest_name_present() {
+        let plan = plan(vec![
+            candidate("/p/a", "nm", Tier::Auto, 1024),
+            candidate("/p/b", "a-very-long-user-rule-name", Tier::Auto, 1024),
+        ]);
+
+        let report = render_clean(&plan, None, Intent::DryRun);
+
+        assert!(
+            report.contains("nm                          auto"),
+            "the short name must be padded to the long one:\n{report}"
+        );
     }
 }
 
@@ -607,7 +602,7 @@ mod intent_tests {
         CleanPlan {
             candidates: vec![Candidate {
                 path: PathBuf::from("/p/node_modules"),
-                category: Category::NodeModules,
+                rule: "node-modules".into(),
                 tier: Tier::Auto,
                 allocated: 2048,
                 shared: false,
@@ -714,7 +709,7 @@ mod min_size_tests {
         let mut plan = CleanPlan {
             candidates: vec![Candidate {
                 path: PathBuf::from("/p/node_modules"),
-                category: Category::NodeModules,
+                rule: "node-modules".into(),
                 tier: Tier::Auto,
                 allocated: 2_000_000,
                 shared: false,

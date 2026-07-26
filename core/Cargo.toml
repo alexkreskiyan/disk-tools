@@ -6,6 +6,11 @@ rust-version.workspace = true
 
 [dependencies]
 rayon = "1.12.0"
+# Detection rules are globs now, and this is the crate ripgrep matches paths
+# with: many patterns compile into **one** automaton, which is what keeps the
+# per-node cost inside the 285 ns budget the hardcoded matcher used to spend.
+# `default-features = false` drops its `log` feature — this crate never logs.
+globset = { version = "0.4.19", default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
 # Deletions go to the OS trash, never `rm` — an unrecoverable mistake is not an
 # acceptable failure mode for a cleanup tool. Pulls only `objc2` on macOS and

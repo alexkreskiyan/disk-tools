@@ -274,7 +274,7 @@ mod tests {
     fn candidate(path: &str, allocated: u64) -> Candidate {
         Candidate {
             path: PathBuf::from(path),
-            category: crate::Category::NodeModules,
+            rule: "node-modules".into(),
             tier: crate::Tier::Auto,
             allocated,
             shared: false,

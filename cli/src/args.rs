@@ -6,7 +6,9 @@
 //! (Task 8).
 
 use clap::{Parser, Subcommand};
-use disk_tools_core::{Age, CleanOptions, DetectOptions, Removal, ScanOptions, UserDirs};
+use disk_tools_core::{
+    CleanOptions, DetectOptions, Removal, Rules, ScanOptions, UserDirs, age_rule, builtin_rules,
+};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -113,7 +115,10 @@ pub enum Mode {
     },
     Clean {
         scan: ScanOptions,
-        clean: CleanOptions,
+        /// Boxed: the compiled rule set carries two glob automata, and without
+        /// the indirection every `Mode::Scan` — which needs none of it — would
+        /// pay for the space anyway.
+        clean: Box<CleanOptions>,
         apply: bool,
         removal: Removal,
     },
@@ -144,28 +149,42 @@ impl Args {
                 number: scan.number,
                 json: scan.json,
             },
-            Command::Clean(clean) => Mode::Clean {
-                scan: ScanOptions {
-                    root: clean.path,
-                    ..ScanOptions::default()
-                },
-                clean: CleanOptions {
-                    detect: DetectOptions {
-                        age: clean.older_than.map(|older_than| Age { older_than, now }),
-                        user_dirs,
-                        ..DetectOptions::default()
+            Command::Clean(clean) => {
+                // The built-in rules, plus the age rule **last** if it was
+                // asked for. Order is precedence, so appending it there is what
+                // keeps a `target/` reported as build output rather than merely
+                // as something old — which is what decides its tier.
+                let mut rules = builtin_rules();
+                if let Some(older_than) = clean.older_than {
+                    rules.push(age_rule(older_than));
+                }
+
+                Mode::Clean {
+                    scan: ScanOptions {
+                        root: clean.path,
+                        ..ScanOptions::default()
                     },
-                    safe_only: clean.safe,
-                    allow_dirty: clean.allow_dirty,
-                    min_size: clean.min_size,
-                },
-                apply: clean.apply,
-                removal: if clean.purge {
-                    Removal::Purge
-                } else {
-                    Removal::Trash
-                },
-            },
+                    clean: Box::new(CleanOptions {
+                        detect: DetectOptions {
+                            // Infallible here: every pattern is a literal in the
+                            // core. A user-supplied rule can fail to compile, and
+                            // that arrives with the config file in v0.3 Task 2.
+                            rules: Rules::new(rules, &user_dirs).expect("built-in globs are valid"),
+                            now,
+                        },
+                        user_dirs,
+                        safe_only: clean.safe,
+                        allow_dirty: clean.allow_dirty,
+                        min_size: clean.min_size,
+                    }),
+                    apply: clean.apply,
+                    removal: if clean.purge {
+                        Removal::Purge
+                    } else {
+                        Removal::Trash
+                    },
+                }
+            }
         }
     }
 }
@@ -487,9 +506,14 @@ mod tests {
 
     // ---- the clean subcommand -------------------------------------------
 
+    /// The age rule's threshold, if `--older-than` put one in the list.
+    fn older_than_of(options: &CleanOptions) -> Option<Duration> {
+        options.detect.rules.get("old")?.older_than
+    }
+
     fn clean_options(args: &[&str]) -> CleanOptions {
         match resolved(args).expect("resolve") {
-            Mode::Clean { clean, .. } => clean,
+            Mode::Clean { clean, .. } => *clean,
             Mode::Scan { .. } => panic!("expected the clean subcommand"),
         }
     }
@@ -518,8 +542,8 @@ mod tests {
         assert!(clean.allow_dirty);
         assert!(apply);
         assert_eq!(
-            clean.detect.age.expect("age armed").older_than,
-            Duration::from_secs(90 * 24 * 60 * 60)
+            older_than_of(&clean),
+            Some(Duration::from_secs(90 * 24 * 60 * 60))
         );
     }
 
@@ -542,8 +566,8 @@ mod tests {
         let Mode::Clean { clean, .. } = mode else {
             panic!("expected the clean subcommand");
         };
-        assert_eq!(clean.detect.user_dirs, dirs);
-        assert_eq!(clean.detect.age.expect("age armed").now, now);
+        assert_eq!(clean.user_dirs, dirs);
+        assert_eq!(clean.detect.now, now);
     }
 
     /// The bare form must be untouched by the subcommand's arrival — this is the
@@ -589,11 +613,7 @@ mod tests {
         const DAY: u64 = 24 * 60 * 60;
 
         let age = |arg: &str| {
-            clean_options(&["clean", "/x", "--older-than", arg])
-                .detect
-                .age
-                .expect("age armed")
-                .older_than
+            older_than_of(&clean_options(&["clean", "/x", "--older-than", arg])).expect("age armed")
         };
 
         assert_eq!(age("1d"), Duration::from_secs(DAY));
@@ -630,12 +650,34 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
-    /// D9: absent flag means the age rule does not run at all.
+    /// D9: absent flag means the age rule is not in the list at all — not that
+    /// it is present with a zero threshold, which would claim everything.
     #[test]
-    fn absent_older_than_is_none() {
+    fn absent_older_than_adds_no_age_rule() {
+        let options = clean_options(&["clean", "/x"]);
+
         assert!(
-            clean_options(&["clean", "/x"]).detect.age.is_none(),
-            "no --older-than must leave the age rule unarmed"
+            options.detect.rules.get("old").is_none(),
+            "no --older-than must leave the age rule out of the list entirely"
+        );
+        assert!(
+            options.detect.rules.get("node-modules").is_some(),
+            "and the built-ins are still there"
+        );
+    }
+
+    /// Order is precedence, so the age rule has to be **last** — ahead of the
+    /// safe-list rules it would claim a `target/` as merely old, and the tier
+    /// would change from auto to confirm with it.
+    #[test]
+    fn the_age_rule_is_appended_after_the_builtins() {
+        let mut rules = builtin_rules();
+        rules.push(age_rule(Duration::from_secs(1)));
+
+        assert_eq!(
+            rules.last().expect("non-empty").name,
+            "old",
+            "the age rule must sit after every built-in"
         );
     }
 

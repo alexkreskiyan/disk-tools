@@ -13,12 +13,15 @@
 //! All four of v0.2's safety mechanisms are decided here — the never-touch
 //! denylist, the two tiers, `--safe`, and that guard.
 
-use crate::detect::{Category, DetectOptions, UserDirs, detect};
+use crate::detect::{DetectOptions, detect};
 use crate::git;
 use crate::paths::{is_within, normalize_lexically, under_root};
+use crate::rules::{Rule, UserDirs};
 use crate::tree::{ScanNode, ScanTree};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+pub use crate::rules::Tier;
 
 /// Directories that are never candidates, whatever matched them, named
 /// relative to the filesystem root.
@@ -43,28 +46,16 @@ const DENIED_ROOTS: &[&[&str]] = &[
     &["Program Files (x86)"],
 ];
 
-/// Directory names that may never be auto-tier, however they were matched.
-///
-/// Recreating a virtualenv is less deterministic than a lockfile install, so it
-/// is the user's call every time (concept §4).
-const CONFIRM_ONLY_NAMES: &[&str] = &["venv", ".venv"];
-
-/// How eligible a candidate is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Tier {
-    /// Regenerable, so removable without per-item confirmation.
-    Auto,
-    /// Needs the user to say yes to this specific path.
-    Confirm,
-}
-
 /// One thing the plan proposes to remove.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Candidate {
     pub path: PathBuf,
-    pub category: Category,
+
+    /// The name of the rule that claimed it. v0.2 carried a `Category` enum
+    /// here; rules are open-ended, so an enum can no longer name them.
+    pub rule: String,
+
     pub tier: Tier,
 
     /// Attributed bytes — what removing this would free, before the question
@@ -137,11 +128,18 @@ pub struct CleanPlan {
 }
 
 /// Everything a cleanup needs to know.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct CleanOptions {
-    /// Which rules run, and against what — categories, the age rule, and where
-    /// this user's directories are.
+    /// Which rules run, and what "now" is for the ones that ask about age.
     pub detect: DetectOptions,
+
+    /// Where this user's directories are.
+    ///
+    /// Kept here rather than inside [`DetectOptions`] because the **denylist**
+    /// is what still needs it — `~/Library/Application Support` and `%APPDATA%`
+    /// are never-touch roots that only a known home can locate. Detection
+    /// resolved its own roots when the rules were compiled and no longer asks.
+    pub user_dirs: UserDirs,
 
     /// `--safe`: admit auto-tier candidates only.
     pub safe_only: bool,
@@ -177,7 +175,7 @@ pub struct CleanOptions {
 ///    it removes is reported rather than dropped;
 /// 3. the **git guard** removes build output whose project is mid-change,
 ///    likewise reported; `--allow-dirty` relaxes this one and nothing else;
-/// 4. each survivor gets a tier, virtualenvs demoted whatever their category;
+/// 4. each survivor takes the tier its rule declares;
 /// 5. `--safe` keeps only auto-tier;
 /// 6. candidates whose content is reachable from outside them are marked, so
 ///    the total can be read as the upper bound it is.
@@ -186,7 +184,7 @@ pub struct CleanOptions {
 /// user needs told; step 5 is the user's own narrowing, which they already know
 /// about.
 pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
-    let denied = denylist(&options.detect.user_dirs);
+    let denied = denylist(&options.user_dirs);
     let groups = link_groups_by_path(tree);
     let nodes = nodes_by_path(tree);
 
@@ -200,6 +198,12 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
     let mut repos: HashMap<PathBuf, git::RepoState> = HashMap::new();
 
     for detection in detect(tree, &options.detect) {
+        // The rule that claimed it decides the three questions below. It is
+        // always present — `detect` only ever names a rule it matched with — but
+        // a missing one must not panic in a delete path, so it reads as the
+        // cautious default: confirm tier, no threshold, no guard.
+        let rule = options.detect.rules.get(&detection.rule);
+
         if is_denied(&detection.path, &denied) {
             excluded.push(Excluded {
                 path: detection.path,
@@ -208,7 +212,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
             continue;
         }
 
-        if is_mid_change(&detection.path, detection.category, options, &mut repos) {
+        if is_mid_change(&detection.path, rule, options, &mut repos) {
             excluded.push(Excluded {
                 path: detection.path,
                 reason: ExcludeReason::DirtyRepo,
@@ -217,13 +221,15 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
         }
 
         // The user's own narrowings, both after the refusals above so that a
-        // denied or guarded path is still reported as such.
-        if detection.allocated < options.min_size {
+        // denied or guarded path is still reported as such. The rule's own
+        // threshold and the global `--min-size` both apply; the larger wins.
+        let floor = options.min_size.max(rule.map_or(0, |rule| rule.min_size));
+        if detection.allocated < floor {
             too_small += 1;
             continue;
         }
 
-        let tier = tier_for(&detection.path, detection.category);
+        let tier = rule.map_or(Tier::Confirm, |rule| rule.tier);
         // Not recorded in `excluded`, deliberately. That list answers "the tool
         // refused something you might have expected"; `--safe` is the user's own
         // narrowing, and putting the two in one list would show a protected
@@ -240,7 +246,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
 
         candidates.push(Candidate {
             path: detection.path,
-            category: detection.category,
+            rule: detection.rule,
             tier,
             allocated: detection.allocated,
             shared,
@@ -296,10 +302,14 @@ fn matches_denylist(path: &Path, absolute: &[PathBuf]) -> bool {
 
 /// Is this build output whose project has uncommitted work?
 ///
-/// Scoped to build-output categories (§8.2.3 step 1) — `rust-target` is the only
-/// one in v0.2. "You may be mid-change" is a statement about a project, and a
-/// cache does not belong to one; applying the guard there would refuse to clean
-/// `~/.cache` because some unrelated repository above it was dirty.
+/// Scoped to the rules that ask for it — `rust-target` is the only built-in one.
+/// "You may be mid-change" is a statement about a project, and a cache does not
+/// belong to one; applying the guard everywhere would refuse to clean `~/.cache`
+/// because some unrelated repository above it was dirty.
+///
+/// v0.2 answered this from the category enum. With open-ended rules there is no
+/// enum to ask, so each rule states it — which also means a user writing a rule
+/// for their own build output can have the same protection.
 ///
 /// `--allow-dirty` short-circuits **before** the filesystem is touched, so the
 /// override costs nothing rather than merely ignoring the answer.
@@ -308,11 +318,11 @@ fn matches_denylist(path: &Path, absolute: &[PathBuf]) -> bool {
 /// share one.
 fn is_mid_change(
     path: &Path,
-    category: Category,
+    rule: Option<&Rule>,
     options: &CleanOptions,
     repos: &mut HashMap<PathBuf, git::RepoState>,
 ) -> bool {
-    if options.allow_dirty || !is_build_output(category) {
+    if options.allow_dirty || !rule.is_some_and(|rule| rule.requires_clean_repo) {
         return false;
     }
 
@@ -326,40 +336,6 @@ fn is_mid_change(
         .or_insert_with(|| git::state(&repo));
 
     state == git::RepoState::Dirty
-}
-
-/// Which categories are output a build regenerates from source.
-fn is_build_output(category: Category) -> bool {
-    match category {
-        Category::RustTarget => true,
-        // `node_modules` is restored by a lockfile install rather than a build,
-        // and the rest are caches or age matches. None of them are produced from
-        // the working tree, so a dirty repository says nothing about them.
-        Category::NodeModules | Category::Pycache | Category::UserCaches | Category::Old => false,
-    }
-}
-
-/// Auto for the safe-list categories, confirm for anything judged by age — and
-/// confirm for a virtualenv whatever its category said.
-///
-/// The demotion changes nothing today: no category matches a `venv/`, so the
-/// only way one reaches a plan is the age rule, which is already confirm. It
-/// exists so that a category added later cannot silently make virtualenvs
-/// removable without asking.
-fn tier_for(path: &Path, category: Category) -> Tier {
-    if path
-        .file_name()
-        .is_some_and(|name| CONFIRM_ONLY_NAMES.iter().any(|deny| name == *deny))
-    {
-        return Tier::Confirm;
-    }
-
-    match category {
-        Category::Old => Tier::Confirm,
-        Category::RustTarget | Category::NodeModules | Category::Pycache | Category::UserCaches => {
-            Tier::Auto
-        }
-    }
 }
 
 /// Every path that shares an inode with another path in this scan, mapped to
@@ -424,7 +400,7 @@ fn holds_shared_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detect::Age;
+    use crate::rules::{Rules, age_rule, builtin_rules};
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
@@ -473,36 +449,40 @@ mod tests {
         }
     }
 
+    /// The built-in rules against a `UserDirs` — the whole of what a `clean` run
+    /// gets before any config is read.
+    fn with(dirs: UserDirs, rules: Vec<Rule>) -> CleanOptions {
+        CleanOptions {
+            detect: DetectOptions {
+                rules: Rules::new(rules, &dirs).expect("compile"),
+                now: now(),
+            },
+            user_dirs: dirs,
+            ..CleanOptions::default()
+        }
+    }
+
     fn opts() -> CleanOptions {
-        CleanOptions::default()
+        with(UserDirs::default(), builtin_rules())
     }
 
     /// Options with a home, which is what makes the user-scoped rules — both the
-    /// `user-caches` category and the denylist's `Application Support` — live.
+    /// `user-caches` rule and the denylist's `Application Support` — live.
     fn with_home(home: &str) -> CleanOptions {
-        CleanOptions {
-            detect: DetectOptions {
-                user_dirs: UserDirs {
-                    home: Some(PathBuf::from(home)),
-                    ..UserDirs::default()
-                },
-                ..DetectOptions::default()
+        with(
+            UserDirs {
+                home: Some(PathBuf::from(home)),
+                ..UserDirs::default()
             },
-            ..CleanOptions::default()
-        }
+            builtin_rules(),
+        )
     }
 
+    /// The built-ins plus the age rule, appended last as `--older-than` does.
     fn aging(older_than: Duration) -> CleanOptions {
-        CleanOptions {
-            detect: DetectOptions {
-                age: Some(Age {
-                    older_than,
-                    now: now(),
-                }),
-                ..DetectOptions::default()
-            },
-            ..CleanOptions::default()
-        }
+        let mut rules = builtin_rules();
+        rules.push(age_rule(older_than));
+        with(UserDirs::default(), rules)
     }
 
     fn aged(mut node: ScanNode, age: Duration) -> ScanNode {
@@ -563,16 +543,13 @@ mod tests {
     /// entry unenforced.
     #[test]
     fn the_roaming_profile_is_denied_when_known() {
-        let options = CleanOptions {
-            detect: DetectOptions {
-                user_dirs: UserDirs {
-                    app_data: Some(PathBuf::from("/users/me/AppData/Roaming")),
-                    ..UserDirs::default()
-                },
-                ..DetectOptions::default()
+        let options = with(
+            UserDirs {
+                app_data: Some(PathBuf::from("/users/me/AppData/Roaming")),
+                ..UserDirs::default()
             },
-            ..CleanOptions::default()
-        };
+            builtin_rules(),
+        );
 
         let plan = plan(
             &tree(dir(
@@ -880,7 +857,7 @@ mod tests {
     // ---- tiers -----------------------------------------------------------
 
     #[test]
-    fn safe_list_categories_are_auto_tier() {
+    fn the_safe_list_rules_are_auto_tier() {
         let plan = plan(
             &tree(dir(
                 "/p",
@@ -914,13 +891,18 @@ mod tests {
 
         assert_eq!(plan.candidates.len(), 1);
         assert_eq!(plan.candidates[0].tier, Tier::Confirm);
-        assert_eq!(plan.candidates[0].category, Category::Old);
+        assert_eq!(plan.candidates[0].rule, "old");
     }
 
-    /// Recreating a virtualenv is less deterministic than a lockfile install, so
-    /// it is the user's call every time — whatever rule found it.
+    /// v0.2 demoted anything named `venv`/`.venv` to confirm tier whatever
+    /// claimed it. v0.3 deletes that list: the rule sets the tier, full stop.
+    ///
+    /// Under the built-in rules nothing changes, and this test is the evidence —
+    /// no safe-list rule matches a `venv/`, so the only way one reaches a plan is
+    /// the age rule, which is confirm anyway. The difference appears only if a
+    /// user writes an `auto` rule that matches one, which is their call to make.
     #[test]
-    fn virtualenvs_are_confirm_tier() {
+    fn virtualenvs_are_still_confirm_tier_under_the_builtin_rules() {
         for name in ["venv", ".venv"] {
             let path = format!("/p/{name}");
             let plan = plan(
@@ -933,20 +915,65 @@ mod tests {
         }
     }
 
-    /// The demotion must beat the category, not merely coincide with it — this
-    /// drives the branch with a category that would otherwise be auto-tier.
+    /// The tier comes from the rule and from nowhere else — no name, no path and
+    /// no category can override it. That is the whole of D2, and it cuts both
+    /// ways: it is also how a user grants themselves removal without asking.
     #[test]
-    fn a_virtualenv_is_demoted_even_when_its_category_is_auto() {
-        assert_eq!(
-            tier_for(Path::new("/p/venv"), Category::NodeModules),
-            Tier::Confirm,
-            "the name wins over a category that would otherwise be auto"
+    fn the_tier_is_whatever_the_rule_declared() {
+        let options = with(
+            UserDirs::default(),
+            vec![Rule {
+                name: "mine".into(),
+                includes: vec!["**/venv/".into()],
+                tier: Tier::Auto,
+                ..Rule::default()
+            }],
         );
+
+        let plan = plan(&tree(dir("/p", vec![dir("/p/venv", vec![])])), &options);
+
+        assert_eq!(paths(&plan), vec![Path::new("/p/venv")]);
         assert_eq!(
-            tier_for(Path::new("/p/node_modules"), Category::NodeModules),
+            plan.candidates[0].tier,
             Tier::Auto,
-            "and an ordinary auto-tier match is unaffected"
+            "the user said auto, so it is auto"
         );
+    }
+
+    /// A rule's own threshold narrows the plan exactly as `--min-size` does, and
+    /// the two compose: whichever is larger wins.
+    #[test]
+    fn a_rules_min_size_narrows_the_plan() {
+        let options = with(
+            UserDirs::default(),
+            vec![Rule {
+                name: "big-only".into(),
+                includes: vec!["**/node_modules/".into()],
+                min_size: 1_048_576,
+                tier: Tier::Auto,
+                ..Rule::default()
+            }],
+        );
+
+        let plan = plan(
+            &tree(dir(
+                "/p",
+                vec![
+                    dir(
+                        "/p/big",
+                        vec![dir(
+                            "/p/big/node_modules",
+                            vec![file("/p/big/node_modules/x.bin", 2_000_000)],
+                        )],
+                    ),
+                    dir("/p/small", vec![dir("/p/small/node_modules", vec![])]),
+                ],
+            )),
+            &options,
+        );
+
+        assert_eq!(paths(&plan), vec![Path::new("/p/big/node_modules")]);
+        assert_eq!(plan.too_small, 1, "and the one dropped is counted");
     }
 
     #[test]

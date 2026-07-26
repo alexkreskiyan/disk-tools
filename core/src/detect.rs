@@ -1,163 +1,56 @@
 //! Deciding what *looks* disposable.
 //!
-//! Rules run over the finished [`ScanTree`], not during the walk: a node's
-//! siblings are exactly what marker-aware detection needs ("is there a
-//! `Cargo.toml` beside this `target/`?"), and the tree already groups them.
-//! The hot parallel walk stays untouched.
+//! The rules themselves live in [`crate::rules`]; this is the one pass that
+//! applies them. It runs over the finished [`ScanTree`], not during the walk: a
+//! node's siblings are exactly what marker-aware detection needs ("is there a
+//! `Cargo.toml` beside this `target/`?"), and the tree already groups them. The
+//! hot parallel walk stays untouched.
 //!
 //! Everything here is a **pure function of its inputs**. No filesystem, no
-//! clock, no environment — the current time and the user's directories are
-//! passed in, the way [`crate::ScanOptions`] already promises. A rule that
-//! consulted the environment could not be tested with a temporary directory
-//! standing in for a home, and for code whose output is later fed to a delete
-//! operation that is not a trade worth making.
+//! clock, no environment — the current time is passed in and the user's
+//! directories were resolved before the rules were compiled, the way
+//! [`crate::ScanOptions`] already promises. A rule that consulted the
+//! environment could not be tested with a temporary directory standing in for a
+//! home, and for code whose output is later fed to a delete operation that is not
+//! a trade worth making.
 //!
 //! Nothing here removes, ranks or excludes anything. It reports what matched;
 //! the denylist, the tiers and the totals belong to the cleanup engine.
 
-use crate::paths::same_path;
+use crate::rules::{Rules, UserDirs};
 use crate::tree::{ScanNode, ScanTree};
+use globset::Candidate;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-/// Why a path was picked out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Category {
-    /// A Cargo build directory, recognised by the manifest beside it.
-    RustTarget,
-    /// An npm-style dependency directory.
-    NodeModules,
-    /// Compiled Python bytecode — a `__pycache__` directory or a loose `.pyc`.
-    Pycache,
-    /// One of *this user's* cache directories. Never their system counterparts.
-    UserCaches,
-    /// Untouched for at least the requested duration.
-    Old,
-}
+/// Everything the rules need, all of it explicit.
+#[derive(Debug, Clone)]
+pub struct DetectOptions {
+    /// The compiled rule list. Its **order is its precedence**.
+    pub rules: Rules,
 
-/// Which safe-list categories are live.
-///
-/// All of them by default: v0.2 ships built-in defaults and needs no config to
-/// clean (D8). Config arrives in v0.3 and will only ever *disable* entries here
-/// — it never invents a new deletion rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CategorySet {
-    pub rust_target: bool,
-    pub node_modules: bool,
-    pub pycache: bool,
-    pub user_caches: bool,
-}
-
-impl Default for CategorySet {
-    fn default() -> Self {
-        CategorySet {
-            rust_target: true,
-            node_modules: true,
-            pycache: true,
-            user_caches: true,
-        }
-    }
-}
-
-impl CategorySet {
-    /// Nothing enabled — the starting point for "only this one category".
-    pub fn none() -> Self {
-        CategorySet {
-            rust_target: false,
-            node_modules: false,
-            pycache: false,
-            user_caches: false,
-        }
-    }
-
-    fn enables(&self, category: Category) -> bool {
-        match category {
-            Category::RustTarget => self.rust_target,
-            Category::NodeModules => self.node_modules,
-            Category::Pycache => self.pycache,
-            Category::UserCaches => self.user_caches,
-            // Gated by the age rule being armed at all, not by this set.
-            Category::Old => true,
-        }
-    }
-}
-
-/// Where this user's own directories are.
-///
-/// Supplied by the frontend, never discovered here — the core consults no
-/// environment. Both fields are `Option` because a frontend may genuinely not
-/// know: a `None` home matches **nothing**, which is the safe direction. It is
-/// never treated as "match any home".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UserDirs {
-    /// `$HOME` / `%USERPROFILE%`.
-    pub home: Option<PathBuf>,
-    /// `%LOCALAPPDATA%` on Windows. `None` elsewhere.
-    pub local_app_data: Option<PathBuf>,
-    /// `%APPDATA%` — the *roaming* profile, on Windows. `None` elsewhere.
+    /// What "now" is, for any rule carrying an `older_than`.
     ///
-    /// Not derivable from [`Self::local_app_data`]: the two are siblings, but a
-    /// roaming profile can be redirected to a network share independently. It is
-    /// here because it is a **denylist** root (§8.3), never a candidate one.
-    pub app_data: Option<PathBuf>,
-}
-
-impl UserDirs {
-    /// The cache directories that belong to this user.
-    ///
-    /// Built from the roots above rather than accepted as a ready-made list:
-    /// *which* directories count as user caches is knowledge about the category,
-    /// so it belongs beside the category. The frontend only has to answer "where
-    /// is home".
-    ///
-    /// The tilde matters and is the whole point — `~/Library/Caches` is a
-    /// candidate, `/Library/Caches` is on the denylist (§8.3). Deriving these
-    /// from a known home is what keeps the two apart.
-    pub(crate) fn cache_roots(&self) -> Vec<PathBuf> {
-        let mut roots = Vec::new();
-        if let Some(home) = &self.home {
-            roots.push(home.join(".cache"));
-            roots.push(home.join("Library").join("Caches"));
-        }
-        if let Some(local) = &self.local_app_data {
-            roots.push(local.join("Temp"));
-        }
-        roots
-    }
-}
-
-/// The age rule's two inputs, kept together because neither means anything
-/// alone.
-///
-/// A threshold with no instant to measure it from silently matches nothing,
-/// which is the worst way for a deletion rule to be wrong — it looks armed and
-/// is not. Pairing them makes that state unrepresentable rather than merely
-/// documented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Age {
-    /// Untouched for at least this long.
-    pub older_than: Duration,
-
-    /// What "now" is. An input rather than a call to [`SystemTime::now`], so a
-    /// boundary test does not depend on the clock.
+    /// Not an `Option` and not a call to [`SystemTime::now`]. v0.2 paired the
+    /// threshold with the clock in one `Age` struct so that a threshold without
+    /// an instant to measure from — armed-looking and matching nothing — was
+    /// unrepresentable. With thresholds now living inside individual rules that
+    /// pairing is gone, and a mandatory clock is what restores the guarantee.
     pub now: SystemTime,
 }
 
-/// Everything the rules need, all of it explicit.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DetectOptions {
-    /// Which safe-list categories to apply.
-    pub categories: CategorySet,
-
-    /// The age rule. **`None` means it does not run at all** (D9) — not "zero",
-    /// not "everything". That is the default, and deliberately so: an always-on
-    /// age rule would bury the safe-list candidates that are the point of the
-    /// feature under confirm-tier noise on the very first run.
-    pub age: Option<Age>,
-
-    /// Where this user's caches live.
-    pub user_dirs: UserDirs,
+impl Default for DetectOptions {
+    /// The built-in rules and no home.
+    ///
+    /// Matches what a `clean` run gets before any config is read: the three
+    /// unrooted safe-list rules apply, and the two cache rules — which need to
+    /// know where the user lives — are dropped.
+    fn default() -> Self {
+        DetectOptions {
+            rules: Rules::builtin(&UserDirs::default()),
+            now: SystemTime::UNIX_EPOCH,
+        }
+    }
 }
 
 /// One thing a rule claimed.
@@ -169,21 +62,24 @@ pub struct DetectOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
     pub path: PathBuf,
-    pub category: Category,
+
+    /// The name of the rule that claimed it — which is how the plan later finds
+    /// its tier, its `min_size` and whether it wants a clean repository.
+    pub rule: String,
+
     pub allocated: u64,
 }
 
-/// Find everything the enabled rules claim.
+/// Find everything the rules claim.
 ///
-/// One depth-first pass. At each node the junk rules are tried first, then the
-/// age rule — §8.2.2 only applies the latter to nodes "not already claimed".
+/// One depth-first pass. At each node the rules are tried in list order and the
+/// first whose every predicate holds takes it.
 ///
 /// **A match is never descended into.** Once `node_modules/` is claimed, its
 /// 40,000 children are not 40,000 further candidates: the subtree is one thing
 /// to delete, and reporting its contents separately would be both useless and
-/// dangerous. The same holds for an age match, so no candidate ever nests inside
-/// another — which is what lets the caller sum their sizes without counting the
-/// same bytes twice.
+/// dangerous. That is what lets the caller sum candidate sizes without counting
+/// the same bytes twice.
 ///
 /// Order follows the tree, whose children are already sorted by path, so two
 /// runs over the same tree return the same list.
@@ -200,10 +96,17 @@ fn visit(
     options: &DetectOptions,
     found: &mut Vec<Detection>,
 ) {
-    if let Some(category) = claim(node, siblings, options) {
+    // A directory under no rule's territory: neither it nor anything beneath it
+    // can match, so the whole subtree goes unvisited. One comparison here
+    // replaces a glob match on every file below.
+    if node.is_dir && options.rules.prunes(&node.path) {
+        return;
+    }
+
+    if let Some(rule) = claim(node, siblings, options) {
         found.push(Detection {
             path: node.path.clone(),
-            category,
+            rule,
             allocated: node.allocated,
         });
         return; // the subtree is this one candidate
@@ -215,63 +118,62 @@ fn visit(
 }
 
 /// Which rule, if any, claims this node.
-fn claim(node: &ScanNode, siblings: &[ScanNode], options: &DetectOptions) -> Option<Category> {
-    junk(node, siblings, options)
-        .filter(|category| options.categories.enables(*category))
-        .or_else(|| old(node, options))
-}
+///
+/// The candidate is built **once** and reused across every pattern — it
+/// precomputes the basename and, on Windows, the lowercased form, which is
+/// precisely the work that must not be repeated per rule.
+///
+/// A rule that matches by glob but fails a later predicate does not abandon the
+/// node: the next-lowest rule is tried. Otherwise disabling one rule's marker
+/// requirement would silently shadow every rule beneath it.
+fn claim(node: &ScanNode, siblings: &[ScanNode], options: &DetectOptions) -> Option<String> {
+    let candidate = Candidate::new(node.path.as_path());
 
-/// The safe-list rules (§8.2.1).
-fn junk(node: &ScanNode, siblings: &[ScanNode], options: &DetectOptions) -> Option<Category> {
-    // A cache root is matched by its whole path, so it is checked before the
-    // name-based rules and needs no marker.
-    if options
-        .user_dirs
-        .cache_roots()
-        .iter()
-        .any(|root| same_path(&node.path, root))
-    {
-        return Some(Category::UserCaches);
-    }
+    for index in options.rules.matching(&candidate, node.is_dir) {
+        let rule = options.rules.rule_at(index);
 
-    let name = node.path.file_name()?;
-
-    if node.is_dir {
-        if name == "target" && has_sibling(siblings, "Cargo.toml") {
-            return Some(Category::RustTarget);
+        if options.rules.excluded(index, &candidate) {
+            continue;
         }
-        if name == "node_modules" {
-            return Some(Category::NodeModules);
+        if !rule
+            .requires_sibling
+            .iter()
+            .all(|name| has_sibling(siblings, name))
+        {
+            continue;
         }
-        if name == "__pycache__" {
-            return Some(Category::Pycache);
+        // Not a `let` chain: those stabilised in 1.88 and this crate's MSRV is
+        // 1.85. A rule with no threshold imposes none.
+        if rule
+            .older_than
+            .is_some_and(|older_than| !is_older(node.modified, older_than, options.now))
+        {
+            continue;
         }
-        return None;
-    }
 
-    // A loose `.pyc` outside any `__pycache__`; one inside is covered by the
-    // directory match, which is never descended into.
-    if node.path.extension().is_some_and(|ext| ext == "pyc") {
-        return Some(Category::Pycache);
+        return Some(rule.name.clone());
     }
 
     None
 }
 
-/// The age rule (§8.2.2).
+/// Has this been untouched for at least `older_than`?
 ///
-/// Opt-in: with no threshold it claims nothing at all. A directory is judged on
-/// its **own** mtime, which is what the model carries — a directory's timestamp
-/// moves when its entries change, and that is precisely the "still in use"
-/// evidence wanted.
-fn old(node: &ScanNode, options: &DetectOptions) -> Option<Category> {
-    let age = options.age?;
-    // Absence of evidence is not evidence of age.
-    let modified = node.modified?;
-    let threshold = age.now.checked_sub(age.older_than)?;
+/// A directory is judged on its **own** mtime, which is what the model carries —
+/// a directory's timestamp moves when its entries change, and that is precisely
+/// the "still in use" evidence wanted.
+fn is_older(modified: Option<SystemTime>, older_than: Duration, now: SystemTime) -> bool {
+    // Absence of evidence is not evidence of age. Every entry on a filesystem
+    // that reports no timestamp would otherwise become a deletion candidate.
+    let Some(modified) = modified else {
+        return false;
+    };
+    let Some(threshold) = now.checked_sub(older_than) else {
+        return false;
+    };
 
     // "Older or exactly equal" — the boundary is inclusive.
-    (modified <= threshold).then_some(Category::Old)
+    modified <= threshold
 }
 
 fn has_sibling(siblings: &[ScanNode], name: &str) -> bool {
@@ -283,6 +185,7 @@ fn has_sibling(siblings: &[ScanNode], name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::{Rule, Tier, age_rule, builtin_rules};
     use std::path::Path;
 
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -331,20 +234,37 @@ mod tests {
         }
     }
 
-    /// Every category on, the age rule off — the default a first run gets.
-    fn opts() -> DetectOptions {
-        DetectOptions::default()
+    fn compiled(rules: Vec<Rule>, dirs: &UserDirs) -> DetectOptions {
+        DetectOptions {
+            rules: Rules::new(rules, dirs).expect("compile"),
+            now: now(),
+        }
     }
 
-    /// The age rule armed against the fixed [`now`].
-    fn aging(older_than: Duration) -> DetectOptions {
+    /// Every built-in rule, the age rule off — the default a first run gets.
+    fn opts() -> DetectOptions {
         DetectOptions {
-            age: Some(Age {
-                older_than,
-                now: now(),
-            }),
+            now: now(),
             ..DetectOptions::default()
         }
+    }
+
+    fn with_dirs(dirs: UserDirs) -> DetectOptions {
+        compiled(builtin_rules(), &dirs)
+    }
+
+    fn home(path: &str) -> UserDirs {
+        UserDirs {
+            home: Some(PathBuf::from(path)),
+            ..UserDirs::default()
+        }
+    }
+
+    /// The built-ins plus the age rule, appended last as `--older-than` does.
+    fn aging(older_than: Duration) -> DetectOptions {
+        let mut rules = builtin_rules();
+        rules.push(age_rule(older_than));
+        compiled(rules, &UserDirs::default())
     }
 
     /// Just the paths, for asserting on a whole result at once.
@@ -352,8 +272,8 @@ mod tests {
         found.iter().map(|m| m.path.as_path()).collect()
     }
 
-    fn categories(found: &[Detection]) -> Vec<Category> {
-        found.iter().map(|m| m.category).collect()
+    fn rules_of(found: &[Detection]) -> Vec<&str> {
+        found.iter().map(|m| m.rule.as_str()).collect()
     }
 
     #[test]
@@ -367,7 +287,7 @@ mod tests {
         );
 
         assert_eq!(paths(&found), vec![Path::new("/p/target")]);
-        assert_eq!(categories(&found), vec![Category::RustTarget]);
+        assert_eq!(rules_of(&found), vec!["rust-target"]);
     }
 
     /// The marker is the whole rule: `target/` is an ordinary directory name,
@@ -383,8 +303,8 @@ mod tests {
         assert!(found.is_empty(), "no manifest, no match: {found:?}");
     }
 
-    /// §8.2.1's stated edge case: the scan root has no containing listing, so
-    /// there are no siblings to find a manifest among. Conservative and correct.
+    /// The scan root has no containing listing, so there are no siblings to find
+    /// a manifest among. Conservative and correct.
     #[test]
     fn target_at_the_scan_root_does_not_match() {
         let found = detect(&tree(dir("/p/target", vec![file("/p/target/a")])), &opts());
@@ -399,7 +319,7 @@ mod tests {
             &opts(),
         );
 
-        assert_eq!(categories(&found), vec![Category::NodeModules]);
+        assert_eq!(rules_of(&found), vec!["node-modules"]);
     }
 
     #[test]
@@ -421,25 +341,14 @@ mod tests {
             vec![Path::new("/p/__pycache__"), Path::new("/p/stale.pyc")],
             "the source file must not be touched"
         );
-        assert_eq!(
-            categories(&found),
-            vec![Category::Pycache, Category::Pycache]
-        );
+        assert_eq!(rules_of(&found), vec!["pycache", "pycache"]);
     }
 
     /// The tilde distinction, which is the entire safety of this category:
     /// `~/Library/Caches` is regenerable user data, `/Library/Caches` is the
-    /// system's and is denied outright (§8.3).
+    /// system's and is denied outright.
     #[test]
     fn user_caches_are_scoped_to_home() {
-        let options = DetectOptions {
-            user_dirs: UserDirs {
-                home: Some(PathBuf::from("/home/me")),
-                ..UserDirs::default()
-            },
-            ..opts()
-        };
-
         let found = detect(
             &tree(dir(
                 "/",
@@ -457,7 +366,7 @@ mod tests {
                     dir("/Library", vec![dir("/Library/Caches", vec![])]),
                 ],
             )),
-            &options,
+            &with_dirs(home("/home/me")),
         );
 
         assert_eq!(
@@ -491,23 +400,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_windows_cache_root_matches_whatever_its_case() {
-        let options = DetectOptions {
-            user_dirs: UserDirs {
-                local_app_data: Some(PathBuf::from(r"C:\Users\Me\AppData\Local")),
-                ..UserDirs::default()
-            },
-            ..opts()
-        };
-
         let found = detect(
             &tree(dir(
                 r"c:\users\me\appdata\local",
                 vec![dir(r"c:\users\me\appdata\local\temp", vec![])],
             )),
-            &options,
+            &with_dirs(UserDirs {
+                local_app_data: Some(PathBuf::from(r"C:\Users\Me\AppData\Local")),
+                ..UserDirs::default()
+            }),
         );
 
-        assert_eq!(categories(&found), vec![Category::UserCaches]);
+        assert_eq!(rules_of(&found), vec!["windows-temp"]);
     }
 
     /// The other half of that decision. Off Windows the comparison stays exact:
@@ -517,17 +421,9 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn case_is_significant_off_windows() {
-        let options = DetectOptions {
-            user_dirs: UserDirs {
-                home: Some(PathBuf::from("/home/me")),
-                ..UserDirs::default()
-            },
-            ..opts()
-        };
-
         let found = detect(
             &tree(dir("/home/me", vec![dir("/home/me/.Cache", vec![])])),
-            &options,
+            &with_dirs(home("/home/me")),
         );
 
         assert!(
@@ -536,26 +432,23 @@ mod tests {
         );
     }
 
+    /// `%LOCALAPPDATA%\Temp` is its own rule rather than part of `user-caches`:
+    /// the two are anchored to different roots, and one rule cannot have two.
     #[cfg(windows)]
     #[test]
     fn windows_temp_is_a_user_cache() {
-        let options = DetectOptions {
-            user_dirs: UserDirs {
-                local_app_data: Some(PathBuf::from(r"C:\Users\me\AppData\Local")),
-                ..UserDirs::default()
-            },
-            ..opts()
-        };
-
         let found = detect(
             &tree(dir(
                 r"C:\Users\me\AppData\Local",
                 vec![dir(r"C:\Users\me\AppData\Local\Temp", vec![])],
             )),
-            &options,
+            &with_dirs(UserDirs {
+                local_app_data: Some(PathBuf::from(r"C:\Users\me\AppData\Local")),
+                ..UserDirs::default()
+            }),
         );
 
-        assert_eq!(categories(&found), vec![Category::UserCaches]);
+        assert_eq!(rules_of(&found), vec!["windows-temp"]);
     }
 
     /// The rule that keeps a candidate list readable — and a deletion
@@ -585,14 +478,14 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_category_matches_nothing() {
-        let options = DetectOptions {
-            categories: CategorySet {
-                node_modules: false,
-                ..CategorySet::default()
-            },
-            ..opts()
-        };
+    fn a_disabled_rule_matches_nothing() {
+        let rules = builtin_rules()
+            .into_iter()
+            .map(|rule| Rule {
+                enabled: rule.name != "node-modules",
+                ..rule
+            })
+            .collect();
 
         let found = detect(
             &tree(dir(
@@ -602,19 +495,20 @@ mod tests {
                     dir("/p/__pycache__", vec![]),
                 ],
             )),
-            &options,
+            &compiled(rules, &UserDirs::default()),
         );
 
         assert_eq!(
             paths(&found),
             vec![Path::new("/p/__pycache__")],
-            "disabling one category must leave the others alone"
+            "disabling one rule must leave the others alone"
         );
     }
 
-    /// D9's default, and the reason its criterion is the *absence* of output: an
-    /// always-on age rule would bury the safe-list candidates that are the point
-    /// of the feature under confirm-tier noise on the very first run.
+    /// The age rule is off unless asked for, and the reason its criterion is the
+    /// *absence* of output: an always-on age rule would bury the safe-list
+    /// candidates that are the point of the feature under confirm-tier noise on
+    /// the very first run.
     #[test]
     fn age_rule_is_off_without_the_flag() {
         let found = detect(
@@ -630,8 +524,6 @@ mod tests {
 
     #[test]
     fn old_file_past_threshold_matches() {
-        let options = aging(90 * DAY);
-
         let found = detect(
             &tree(dir(
                 "/p",
@@ -640,20 +532,18 @@ mod tests {
                     aged(file("/p/fresh.bin"), 89 * DAY),
                 ],
             )),
-            &options,
+            &aging(90 * DAY),
         );
 
         assert_eq!(paths(&found), vec![Path::new("/p/stale.bin")]);
-        assert_eq!(categories(&found), vec![Category::Old]);
+        assert_eq!(rules_of(&found), vec!["old"]);
     }
 
-    /// "Older **or exactly equal**" (§8.2.2 step 2). Exercised with a file one
-    /// second either side as well, so the assertion pins the boundary rather
-    /// than merely the direction.
+    /// "Older **or exactly equal**". Exercised with a file one second either side
+    /// as well, so the assertion pins the boundary rather than merely the
+    /// direction.
     #[test]
     fn threshold_boundary_is_inclusive() {
-        let options = aging(90 * DAY);
-
         let found = detect(
             &tree(dir(
                 "/p",
@@ -666,7 +556,7 @@ mod tests {
                     aged(file("/p/just-older.bin"), 90 * DAY + Duration::from_secs(1)),
                 ],
             )),
-            &options,
+            &aging(90 * DAY),
         );
 
         assert_eq!(
@@ -677,12 +567,10 @@ mod tests {
     }
 
     /// A directory is judged on its own mtime. Here the directory is fresh and
-    /// its contents ancient: nothing matches, because the directory's timestamp
-    /// says something inside it changed recently.
+    /// its contents ancient: the directory does not match, because its timestamp
+    /// says something inside it changed recently — and the pass descends.
     #[test]
     fn directory_age_is_its_own() {
-        let options = aging(90 * DAY);
-
         let found = detect(
             &tree(dir(
                 "/p",
@@ -691,7 +579,7 @@ mod tests {
                     vec![aged(file("/p/recent/ancient.bin"), 900 * DAY)],
                 )],
             )),
-            &options,
+            &aging(90 * DAY),
         );
 
         assert_eq!(
@@ -706,11 +594,10 @@ mod tests {
     /// a deletion candidate the moment `--older-than` was passed.
     #[test]
     fn unknown_timestamp_never_matches() {
-        let options = aging(DAY);
         let mut unknown = file("/p/mystery.bin");
         unknown.modified = None;
 
-        let found = detect(&tree(dir("/p", vec![unknown])), &options);
+        let found = detect(&tree(dir("/p", vec![unknown])), &aging(DAY));
 
         assert!(found.is_empty(), "{found:?}");
     }
@@ -721,8 +608,6 @@ mod tests {
     /// already covers its subtree.
     #[test]
     fn an_old_directory_does_not_also_report_its_old_children() {
-        let options = aging(90 * DAY);
-
         let found = detect(
             &tree(dir(
                 "/p",
@@ -734,7 +619,7 @@ mod tests {
                     900 * DAY,
                 )],
             )),
-            &options,
+            &aging(90 * DAY),
         );
 
         assert_eq!(paths(&found), vec![Path::new("/p/stale")]);
@@ -745,13 +630,11 @@ mod tests {
         );
     }
 
-    /// A junk match wins over the age rule on the same node, so the category a
-    /// candidate reports is the specific one — which is what decides its tier in
-    /// the next task, auto rather than confirm.
+    /// List order is precedence, and this is what it buys: the age rule is
+    /// appended last, so a junk rule that also matches names the candidate — and
+    /// therefore decides its tier, auto rather than confirm.
     #[test]
     fn a_junk_match_beats_the_age_rule() {
-        let options = aging(90 * DAY);
-
         let found = detect(
             &tree(dir(
                 "/p",
@@ -760,33 +643,169 @@ mod tests {
                     aged(dir("/p/target", vec![]), 900 * DAY),
                 ],
             )),
-            &options,
+            &aging(90 * DAY),
         );
 
-        assert_eq!(categories(&found), vec![Category::RustTarget]);
+        assert_eq!(rules_of(&found), vec!["rust-target"]);
     }
 
-    /// Disabling a category must not silently reclassify its directories as
-    /// `Old` — that would turn a category toggle into a tier change.
+    /// Disabling a rule must not silently reclassify its directories as `old` by
+    /// accident — but it must not shield them either. With its own rule off, an
+    /// ancient `node_modules` is merely old, and its tier changes with it.
     #[test]
-    fn a_disabled_category_can_still_be_claimed_by_age() {
-        let options = DetectOptions {
-            categories: CategorySet::none(),
-            ..aging(90 * DAY)
-        };
+    fn a_disabled_rule_can_still_be_claimed_by_age() {
+        let mut rules: Vec<Rule> = builtin_rules()
+            .into_iter()
+            .map(|rule| Rule {
+                enabled: false,
+                ..rule
+            })
+            .collect();
+        rules.push(age_rule(90 * DAY));
 
         let found = detect(
             &tree(dir(
                 "/p",
                 vec![aged(dir("/p/node_modules", vec![]), 900 * DAY)],
             )),
+            &compiled(rules, &UserDirs::default()),
+        );
+
+        assert_eq!(rules_of(&found), vec!["old"]);
+    }
+
+    /// A rule that matches by glob but fails a later predicate must hand the node
+    /// on rather than swallow it. Otherwise `rust-target`'s missing manifest
+    /// would shadow every rule written beneath it.
+    #[test]
+    fn a_failed_predicate_falls_through_to_the_next_rule() {
+        let rules = vec![
+            Rule {
+                name: "needs-marker".into(),
+                includes: vec!["**/target/".into()],
+                requires_sibling: vec!["Cargo.toml".into()],
+                tier: Tier::Auto,
+                ..Rule::default()
+            },
+            Rule {
+                name: "catch-all".into(),
+                includes: vec!["**/target/".into()],
+                ..Rule::default()
+            },
+        ];
+
+        let found = detect(
+            &tree(dir("/p", vec![dir("/p/target", vec![])])),
+            &compiled(rules, &UserDirs::default()),
+        );
+
+        assert_eq!(rules_of(&found), vec!["catch-all"]);
+    }
+
+    /// A rule's own exclusion, likewise: it declines the node, and the next rule
+    /// gets its turn.
+    #[test]
+    fn an_exclusion_hands_the_node_to_the_next_rule() {
+        let rules = vec![
+            Rule {
+                name: "narrow".into(),
+                includes: vec!["**/node_modules/".into()],
+                excludes: vec!["**/vendor/**".into()],
+                tier: Tier::Auto,
+                ..Rule::default()
+            },
+            Rule {
+                name: "wide".into(),
+                includes: vec!["**/node_modules/".into()],
+                ..Rule::default()
+            },
+        ];
+        let options = compiled(rules, &UserDirs::default());
+
+        let inside = detect(
+            &tree(dir(
+                "/p/vendor",
+                vec![dir("/p/vendor/node_modules", vec![])],
+            )),
             &options,
+        );
+        assert_eq!(rules_of(&inside), vec!["wide"]);
+
+        let outside = detect(
+            &tree(dir("/p/app", vec![dir("/p/app/node_modules", vec![])])),
+            &options,
+        );
+        assert_eq!(rules_of(&outside), vec!["narrow"]);
+    }
+
+    /// A rule below its own `min_size` is still claimed here and still not
+    /// descended into. Dropping the match instead would send the pass inside a
+    /// `__pycache__`, turning one skipped candidate into a hundred tiny ones —
+    /// which is why the threshold belongs to `plan` and not to this pass.
+    #[test]
+    fn min_size_does_not_block_the_match() {
+        let rules = vec![Rule {
+            name: "small".into(),
+            includes: vec!["**/__pycache__/".into()],
+            min_size: 1_048_576,
+            tier: Tier::Auto,
+            ..Rule::default()
+        }];
+
+        let found = detect(
+            &tree(dir(
+                "/p",
+                vec![dir("/p/__pycache__", vec![file("/p/__pycache__/a.pyc")])],
+            )),
+            &compiled(rules, &UserDirs::default()),
         );
 
         assert_eq!(
-            categories(&found),
-            vec![Category::Old],
-            "with its own category off, an ancient node_modules is merely old"
+            paths(&found),
+            vec![Path::new("/p/__pycache__")],
+            "claimed whole, and its contents never offered separately"
+        );
+    }
+
+    /// Pruning must never cost a candidate. A rule rooted deep in the tree still
+    /// has to be reached, so every directory on the way to it is walked.
+    #[test]
+    fn a_rooted_rule_is_still_reached_through_unrelated_directories() {
+        let rules = vec![Rule {
+            name: "scoped".into(),
+            root: Some("/home/me/Projects".into()),
+            includes: vec!["**/node_modules/".into()],
+            tier: Tier::Auto,
+            ..Rule::default()
+        }];
+
+        let found = detect(
+            &tree(dir(
+                "/",
+                vec![dir(
+                    "/home",
+                    vec![dir(
+                        "/home/me",
+                        vec![
+                            dir(
+                                "/home/me/Projects",
+                                vec![dir("/home/me/Projects/node_modules", vec![])],
+                            ),
+                            dir(
+                                "/home/me/Downloads",
+                                vec![dir("/home/me/Downloads/node_modules", vec![])],
+                            ),
+                        ],
+                    )],
+                )],
+            )),
+            &compiled(rules, &UserDirs::default()),
+        );
+
+        assert_eq!(
+            paths(&found),
+            vec![Path::new("/home/me/Projects/node_modules")],
+            "reached through /home and /home/me; the sibling tree is out of scope"
         );
     }
 

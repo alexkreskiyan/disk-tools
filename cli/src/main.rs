@@ -39,7 +39,7 @@ fn main() -> ExitCode {
             clean,
             apply,
             removal,
-        } => run_clean(scan, clean, apply, removal, verbose),
+        } => run_clean(scan, *clean, apply, removal, verbose),
     }
 }
 

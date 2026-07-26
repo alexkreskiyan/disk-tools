@@ -6,12 +6,15 @@ tree — and, as of v0.2, offers to clean it up: `disk-tools clean` detects
 regenerable junk and stale files and removes them **to the OS trash**, dry-run by
 default.
 
-**v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete.**
-Config and a TUI are planned on top of the same core. See the
+**v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete;
+v0.3 (config + declarative rules) is specced, with Task 1 of 6 done — detection
+is declarative.** A TUI follows on
+the same core. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
-[v0.1](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md) and
-[v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) specs are
+[v0.1](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md),
+[v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) and
+[v0.3](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md) specs are
 the authoritative task breakdowns. User-facing usage, flags, the safety model and
 the documented limitations live in the [README](README.md).
 
@@ -74,7 +77,8 @@ disc-tools/
 │       ├── tree.rs     # ScanNode / ScanTree / SkippedEntry + aggregation
 │       ├── windows_dir.rs  # cfg(windows): AllocationSize, file id, LastWriteTime
 │       ├── paths.rs    # the path comparisons that decide what is a candidate
-│       ├── detect.rs   # the rules: four safe-list categories plus age
+│       ├── rules.rs    # Rule / Rules — one GlobSet, list order is precedence
+│       ├── detect.rs   # the one pass that applies them
 │       ├── git.rs      # is there uncommitted work here?
 │       ├── clean.rs    # denylist, tiers, totals → CleanPlan. Writes nothing
 │       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
@@ -111,7 +115,8 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `apply(&CleanPlan, Removal, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. `Removal::Trash` batches; `Removal::Purge` deletes outright |
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
-| `DetectOptions` / `Detection` | `core/src/detect.rs` | The rules' input and output. `age: Option<Age>` pairs the threshold with `now` so it cannot be half-armed |
+| `Rule` / `Rules` | `core/src/rules.rs` | Detection as data. **List order is precedence**; a rule that cannot be expressed matches nothing |
+| `DetectOptions` / `Detection` | `core/src/detect.rs` | The pass's input and output. `now` is mandatory, so a rule's `older_than` can never be half-armed |
 | `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason; `filtered_out` / `too_small` count the user's own narrowings |
 | `CleanOutcome` | `core/src/trash.rs` | `removed` / `failed` / `reclaimed` — never a `Result` |
 | `SkippedEntry` / `SkipReason` | `core/src/tree.rs` | Failures returned **as data** — the core never prints |
@@ -130,6 +135,11 @@ Invariants worth keeping in mind:
   size and file identity both come from one `GetFileInformationByHandleEx` call
   per directory; `size.rs` is only the fallback there. Unix takes the per-file
   path and is unchanged.
+- **The safe-list is data, not code.** Five built-in `Rule`s replace v0.2's four
+  hardcoded categories, and a user may edit any of them. **The denylist is the
+  one thing no rule, flag or config can reach.**
+- **A rule that cannot be expressed matches nothing** — disabled, an unresolvable
+  `~`, a non-UTF-8 root. Unknown reads as *no*, never as *any*.
 - **`deny(unsafe_code)` is exempted per function, never per module** — four
   `#[cfg(windows)]` functions, each listed in `core/src/lib.rs`.
 - **Nothing is deleted without `--apply`,** and the default destination is the OS
@@ -174,9 +184,9 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 |--------|---------|-----------------|
 | `kb/architecture/` | System design, key patterns | `2026.07/2026.07.25` |
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
-| `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.25` |
+| `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.26` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
-| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.25` |
+| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.26` |
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07/2026.07.25` |
 | `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
@@ -198,3 +208,4 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 - [v0.1 scan performance and memory](kb/benchmarks/2026.07/2026.07.25-v0.1-scan-performance.md)
 - [What the cleanup engine costs](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) — the git guard at ~23 ms per repository
 - [The trash backend](kb/benchmarks/2026.07/2026.07.25-trash-backend.md) — 10,000 files across three platforms
+- [What detection costs](kb/benchmarks/2026.07/2026.07.26-detect-budget.md) — 285 ns per node before v0.3's rule engine, 201 ns after
