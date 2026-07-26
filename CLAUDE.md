@@ -6,12 +6,17 @@ tree — and, as of v0.2, offers to clean it up: `disk-tools clean` detects
 regenerable junk and stale files and removes them **to the OS trash**, dry-run by
 default.
 
-**v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete.**
-Config and a TUI are planned on top of the same core. See the
+**v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete;
+v0.3 (config + declarative rules) is complete.** Detection is declarative and
+reads a TOML config; flags beat the file; `clean` walks the rule roots when given
+no path; `--apply` refuses while anything not regenerable is in the plan. A TUI
+follows on the same core. A TUI follows on
+the same core. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
-[v0.1](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md) and
-[v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) specs are
+[v0.1](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md),
+[v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) and
+[v0.3](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md) specs are
 the authoritative task breakdowns. User-facing usage, flags, the safety model and
 the documented limitations live in the [README](README.md).
 
@@ -47,6 +52,7 @@ rather than as ad-hoc commands.
 | `just check` | `cargo check --workspace --all-targets` — CI runs it pinned to MSRV 1.85 |
 | `just run <ARGS>` | Run the CLI, e.g. `just run scan ~/Downloads --json` |
 | `just release` | Optimized host build → `target/release/disk-tools` |
+| `just install-cli` | `cargo install --path cli`, then check that the installed copy is the one first on PATH |
 | `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` / `just bench-phases <path>` / `just bench-stat <dir>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
 CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` + `just smoke-trash`
@@ -74,16 +80,18 @@ disc-tools/
 │       ├── tree.rs     # ScanNode / ScanTree / SkippedEntry + aggregation
 │       ├── windows_dir.rs  # cfg(windows): AllocationSize, file id, LastWriteTime
 │       ├── paths.rs    # the path comparisons that decide what is a candidate
-│       ├── detect.rs   # the rules: four safe-list categories plus age
+│       ├── rules.rs    # Rule / Rules — one GlobSet, list order is precedence
+│       ├── detect.rs   # the one pass that applies them
 │       ├── git.rs      # is there uncommitted work here?
 │       ├── clean.rs    # denylist, tiers, totals → CleanPlan. Writes nothing
 │       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
 ├── cli/                # disk-tools (bin) — CLI frontend
-│   ├── Cargo.toml      # clap, terminal_size, serde_json, indicatif, unicode-width
+│   ├── Cargo.toml      # clap, toml, serde, serde_ignored, indicatif, unicode-width
 │   ├── src/
 │   │   ├── main.rs     # verb dispatch (scan | clean); spinner to stderr
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
-│   │   ├── env.rs      # UserDirs from the environment — what the core refuses
+│   │   ├── config.rs   # locate/parse/validate the TOML file; `config init`
+│   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
 │   │   └── render/
 │   │       ├── mod.rs
 │   │       ├── tree.rs     # dust-style tree, parent-relative bars
@@ -108,15 +116,18 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 |------|-------|------|
 | `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs` | Walk → dedup → aggregate, in that order |
 | `plan(&ScanTree, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | Decides what may go and what that frees. **Writes nothing** |
+| `CleanPlan::merge(Vec<CleanPlan>)` | `core/src/clean.rs` | One plan from several roots. Additive **only because** `Rules::scan_roots` drops nested roots |
 | `apply(&CleanPlan, Removal, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. `Removal::Trash` batches; `Removal::Purge` deletes outright |
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
-| `DetectOptions` / `Detection` | `core/src/detect.rs` | The rules' input and output. `age: Option<Age>` pairs the threshold with `now` so it cannot be half-armed |
+| `Rule` / `Rules` | `core/src/rules.rs` | Detection as data. **List order is precedence**; a rule that cannot be expressed matches nothing |
+| `DetectOptions` / `Detection` | `core/src/detect.rs` | The pass's input and output. `now` is mandatory, so a rule's `older_than` can never be half-armed |
 | `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason; `filtered_out` / `too_small` count the user's own narrowings |
 | `CleanOutcome` | `core/src/trash.rs` | `removed` / `failed` / `reclaimed` — never a `Result` |
 | `SkippedEntry` / `SkipReason` | `core/src/tree.rs` | Failures returned **as data** — the core never prints |
 | `RenderOptions` | `cli/src/render/tree.rs` | Display-only knobs |
 | `Intent` | `cli/src/render/clean.rs` | Whether the plan is a dry run or a preview — the closing line differs |
+| `Config` / `Environment` | `cli/src/config.rs`, `cli/src/args.rs` | The file's contents, and everything the frontend resolved before the args became work |
 
 Invariants worth keeping in mind:
 
@@ -130,8 +141,16 @@ Invariants worth keeping in mind:
   size and file identity both come from one `GetFileInformationByHandleEx` call
   per directory; `size.rs` is only the fallback there. Unix takes the per-file
   path and is unchanged.
+- **The safe-list is data, not code.** Five built-in `Rule`s replace v0.2's four
+  hardcoded categories, and a user may edit any of them. **The denylist is the
+  one thing no rule, flag or config can reach.**
+- **A rule that cannot be expressed matches nothing** — disabled, an unresolvable
+  `~`, a non-UTF-8 root. Unknown reads as *no*, never as *any*.
 - **`deny(unsafe_code)` is exempted per function, never per module** — four
   `#[cfg(windows)]` functions, each listed in `core/src/lib.rs`.
+- **`--apply` refuses while a confirm-tier candidate remains,** unless `--safe`
+  or `--yes`. There is no interactive prompt and no config key for `--yes`: a
+  file that answered yes in advance would cancel the confirmation invisibly.
 - **Nothing is deleted without `--apply`,** and the default destination is the OS
   trash. `--purge` deletes outright — an opt-in reversal of that rule, which
   requires `--apply` and which the report never describes as recoverable. The
@@ -148,8 +167,24 @@ Invariants worth keeping in mind:
 
 ## Configuration
 
-The tool reads **no** configuration — `<PATH>` and the flags are its entire input
-(`--config` and a TOML file arrive in v0.3). What configuration exists is build-time:
+`disk-tools` reads a TOML file: `$XDG_CONFIG_HOME/disk-tools/config.toml` when
+that is set (on **every** platform), otherwise `%APPDATA%\disk-tools\config.toml`
+on Windows and `~/.config/disk-tools/config.toml` elsewhere. `--config <PATH>`
+overrides it; `disk-tools config init` writes the commented defaults.
+
+The file supplies the **rules**. An absent `[[rules]]` leaves the built-ins
+alone; an empty list means none. `root` is required, and `"*"` is how a rule says
+it applies wherever the scan goes. The **denylist is not in the file** and cannot
+be put there, and neither are `--purge` or `--allow-dirty`.
+
+Precedence is **flag > file > built-in default**, expressed in exactly one place
+(`Args::resolve`). No overridable flag carries a clap `default_value`: with one,
+`--min-size 0` and an absent `--min-size` would arrive identical, and the first
+has to beat the file while the second defers to it. One limitation: a boolean
+turned **on** in the file cannot be turned back off from the command line, since
+a flag can only be passed or not passed.
+
+What configuration exists beyond that is build-time:
 
 | File | Holds |
 |------|-------|
@@ -172,21 +207,22 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 
 | Folder | Purpose | Latest snapshot |
 |--------|---------|-----------------|
-| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.25` |
+| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.26` |
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
-| `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.25` |
+| `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.26` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
-| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.25` |
+| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.26` |
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07/2026.07.25` |
 | `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
-| `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07` |
+| `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07/2026.07.26` |
 
 Files are always written under a `<YYYY.MM>/` folder — never directly under `kb/<folder>/`. Filenames begin with `<YYYY.MM.DD>-` and never include the folder name.
 
 ## Documentation
 
 **Architecture** (snapshots from `kb/architecture/2026.07/`)
+- [After v0.3: detection as data](kb/architecture/2026.07/2026.07.26-overview.md) — the rule engine, the config path, multi-root `clean`, which invariants moved
 - [Overview](kb/architecture/2026.07/2026.07.25-overview.md) — the three-phase pipeline, data model, invariants, platform splits
 - [Rust crate structure](kb/architecture/2026.07/2026.07.25-rust-crates.md) — workspace, feature flags, unsafe policy
 
@@ -198,3 +234,4 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 - [v0.1 scan performance and memory](kb/benchmarks/2026.07/2026.07.25-v0.1-scan-performance.md)
 - [What the cleanup engine costs](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) — the git guard at ~23 ms per repository
 - [The trash backend](kb/benchmarks/2026.07/2026.07.25-trash-backend.md) — 10,000 files across three platforms
+- [What detection costs](kb/benchmarks/2026.07/2026.07.26-detect-budget.md) — 285 ns per node before v0.3's rule engine, 201 ns after

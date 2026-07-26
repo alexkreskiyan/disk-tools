@@ -5,8 +5,11 @@
 //! `--help` lists them, and consumed by the renderer (Task 7) and JSON output
 //! (Task 8).
 
+use crate::config::Config;
 use clap::{Parser, Subcommand};
-use disk_tools_core::{Age, CleanOptions, DetectOptions, Removal, ScanOptions, UserDirs};
+use disk_tools_core::{
+    CleanOptions, DetectOptions, Removal, RuleError, Rules, ScanOptions, UserDirs, age_rule,
+};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -26,6 +29,14 @@ pub struct Args {
     #[arg(short = 'v', long, global = true)]
     pub verbose: bool,
 
+    /// Read this file instead of the one in your config directory.
+    ///
+    /// Global rather than per-command so that `config init` can be pointed at a
+    /// path too — otherwise the one verb that writes the file would be the one
+    /// verb unable to say where.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -37,6 +48,22 @@ pub enum Command {
 
     /// Find removable junk. Dry-run by default — nothing is deleted without --apply.
     Clean(CleanArgs),
+
+    /// Inspect and create the configuration file.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Write the default configuration, comments and all, so it can be edited.
+    Init {
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -45,23 +72,35 @@ pub struct ScanArgs {
     #[arg(value_name = "PATH")]
     pub root: PathBuf,
 
-    /// Show at most this many entries.
+    // Every field below that a config file can also set is an `Option`, and
+    // none of them carries a clap `default_value`. That is not tidiness: with a
+    // default applied here, `--min-size 0` and an absent `--min-size` arrive
+    // identical, and the first has to beat the file while the second defers to
+    // it. Defaults are applied by the merge in `resolve`, and stated in the doc
+    // comments — a flag whose default is written down nowhere is undocumented.
+    /// Show at most this many entries. Default: all of them.
     #[arg(short = 'n', long = "number")]
     pub number: Option<usize>,
 
-    /// Hide entries below this size, e.g. 1M, 512K, 2G (1024-based).
-    #[arg(long = "min-size", default_value = "0", value_parser = parse_size)]
-    pub min_size: u64,
+    /// Hide entries below this size, e.g. 1M, 512K, 2G (1024-based). Default: 0.
+    #[arg(long = "min-size", value_parser = parse_size)]
+    pub min_size: Option<u64>,
 
     /// Print at most this many levels deep (display only; traversal is always full).
+    ///
+    /// 0 shows the root alone. Default: unlimited.
     #[arg(long)]
     pub depth: Option<usize>,
 
     /// Rank and report apparent size rather than allocated size.
+    ///
+    /// A config file can turn this on; the command line cannot turn it back off.
     #[arg(long)]
     pub apparent: bool,
 
     /// Stop at filesystem boundaries instead of descending into other mounts.
+    ///
+    /// A config file can turn this on; the command line cannot turn it back off.
     #[arg(long = "one-file-system")]
     pub one_file_system: bool,
 
@@ -72,12 +111,20 @@ pub struct ScanArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct CleanArgs {
-    /// Directory to examine.
+    /// Directory to examine. Without one, the roots of your configured rules.
+    ///
+    /// Omitting it is not the same as `.` — nothing here ever falls back to the
+    /// working directory. With no path and no rooted rule there is nothing to
+    /// examine, and the tool says so rather than guessing.
     #[arg(value_name = "PATH")]
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
 
     /// Only offer regenerable safe-list categories; skip anything needing
     /// per-item confirmation.
+    ///
+    /// A config file can turn this on; the command line cannot turn it back off
+    /// — which for this one is the right direction, since the file may only make
+    /// a cleanup more cautious.
     #[arg(long)]
     pub safe: bool,
 
@@ -89,13 +136,24 @@ pub struct CleanArgs {
     #[arg(long, requires = "apply")]
     pub purge: bool,
 
+    /// Remove candidates that are not regenerable too. Requires --apply.
+    ///
+    /// Without it, --apply stops when the plan holds anything that needs
+    /// confirming. There is no config key for this: a file that answered yes in
+    /// advance would cancel the confirmation, and cancel it invisibly.
+    #[arg(long, requires = "apply")]
+    pub yes: bool,
+
     /// Include build output whose project has uncommitted changes.
     #[arg(long = "allow-dirty")]
     pub allow_dirty: bool,
 
-    /// Ignore anything smaller than this, e.g. 1M, 512K (1024-based).
-    #[arg(long = "min-size", default_value = "0", value_parser = parse_size)]
-    pub min_size: u64,
+    /// Ignore anything smaller than this, e.g. 1M, 512K (1024-based). Default: 0.
+    ///
+    /// Unlike the scan flag of the same name this narrows the plan itself, so a
+    /// candidate it hides is one `--apply` will not remove.
+    #[arg(long = "min-size", value_parser = parse_size)]
+    pub min_size: Option<u64>,
 
     /// Also offer anything untouched for this long: 90d, 6m, 1y.
     #[arg(long = "older-than", value_parser = parse_duration, value_name = "DURATION")]
@@ -112,60 +170,174 @@ pub enum Mode {
         json: bool,
     },
     Clean {
-        scan: ScanOptions,
-        clean: CleanOptions,
+        /// What to walk: the path if one was given, otherwise the roots of the
+        /// enabled rules, already merged so none contains another.
+        ///
+        /// **Empty means there is nothing to examine** — every rule unrooted,
+        /// disabled, or dropped. The caller says so; an empty plan would read as
+        /// "nothing to clean", which is a different statement.
+        roots: Vec<PathBuf>,
+
+        /// May the removal take candidates that are not regenerable?
+        ///
+        /// `--yes`, or a config that turned `require-confirmation` off. Resolved
+        /// to one boolean because the decision is made once — leaving both
+        /// inputs to be re-combined at the point of deletion is how they come to
+        /// disagree.
+        confirm_tier_allowed: bool,
+
+        /// Whether those roots came from the rules rather than the command line.
+        ///
+        /// Only then are they worth announcing: a user who named a path knows
+        /// where they pointed, and one who did not is entitled to be told before
+        /// a walk of their whole home directory begins.
+        roots_from_rules: bool,
+        /// Boxed: the compiled rule set carries two glob automata, and without
+        /// the indirection every `Mode::Scan` — which needs none of it — would
+        /// pay for the space anyway.
+        clean: Box<CleanOptions>,
         apply: bool,
         removal: Removal,
     },
+    /// Write the default configuration to `target`.
+    ConfigInit { target: PathBuf, force: bool },
+}
+
+/// What the frontend resolved before the arguments could be turned into work.
+///
+/// The core reads no clock, no environment and no config file, so all three
+/// arrive from here. Bundled rather than passed loose because they are one
+/// thing — the state of the world at the moment the program started — and
+/// because two of them are only meaningful together.
+#[derive(Debug)]
+pub struct Environment {
+    pub now: SystemTime,
+    pub user_dirs: UserDirs,
+    pub config: Config,
+    /// Where the config file is or would be. `None` when nothing in this
+    /// environment implies a path, which is also the one case `config init`
+    /// cannot serve.
+    pub config_path: Option<PathBuf>,
 }
 
 impl Args {
     /// Turn the parsed arguments into what the core needs.
     ///
-    /// Infallible now that every verb is a subcommand: clap requires the path
-    /// each one declares, and a bare `disk-tools` is caught by
-    /// `arg_required_else_help` before this is reached. The old shape had to
-    /// raise its own `MissingRequiredArgument` here, because a positional that a
-    /// subcommand might replace cannot be marked required.
-    ///
-    /// `now` and `user_dirs` are passed in because the core will not look them
-    /// up: it reads no clock and no environment (`ScanOptions`'s contract), so
-    /// supplying them is the frontend's job.
-    pub fn resolve(self, now: SystemTime, user_dirs: UserDirs) -> Mode {
+    /// Fallible again as of v0.3: the rules being compiled are now partly the
+    /// user's, so a malformed glob is possible here in a way it was not while
+    /// every pattern was a literal in the core. Everything clap can check —
+    /// a missing path, `--purge` without `--apply` — is still caught before this.
+    pub fn resolve(self, env: Environment) -> Result<Mode, ResolveError> {
+        let Environment {
+            now,
+            user_dirs,
+            config,
+            config_path,
+        } = env;
+
         match self.command {
-            Command::Scan(scan) => Mode::Scan {
+            // Flag, then file, then built-in default — the one place the
+            // order is expressed, so that no setting can quietly follow a
+            // different one.
+            //
+            // Booleans are the exception and it is a limitation, not a choice:
+            // clap distinguishes only "passed" from "not passed", so `||` is
+            // the whole of the merge and a file that turns one on cannot be
+            // overruled from the command line. Undoing that would take a
+            // `--no-…` counterpart per flag.
+            Command::Scan(scan) => Ok(Mode::Scan {
                 options: ScanOptions {
                     root: scan.root,
-                    min_size: scan.min_size,
-                    depth: scan.depth,
-                    apparent: scan.apparent,
-                    one_file_system: scan.one_file_system,
+                    min_size: scan.min_size.or(config.report.min_size).unwrap_or(0),
+                    depth: scan.depth.or(config.report.depth),
+                    apparent: scan.apparent || config.report.apparent.unwrap_or(false),
+                    one_file_system: scan.one_file_system
+                        || config.scan.one_file_system.unwrap_or(false),
                 },
-                number: scan.number,
+                // `None` all the way down means "every entry", which is what a
+                // scan has always printed without `-n`.
+                number: scan.number.or(config.report.number),
                 json: scan.json,
-            },
-            Command::Clean(clean) => Mode::Clean {
-                scan: ScanOptions {
-                    root: clean.path,
-                    ..ScanOptions::default()
-                },
-                clean: CleanOptions {
-                    detect: DetectOptions {
-                        age: clean.older_than.map(|older_than| Age { older_than, now }),
+            }),
+
+            Command::Config {
+                action: ConfigAction::Init { force },
+            } => config_path
+                .map(|target| Mode::ConfigInit { target, force })
+                .ok_or(ResolveError::NoConfigPath),
+
+            Command::Clean(clean) => {
+                // The configured rules — the built-ins when the file said nothing
+                // — plus the age rule **last** if it was asked for. Order is
+                // precedence, so appending it there is what keeps a `target/`
+                // reported as build output rather than merely as something old,
+                // which is what decides its tier.
+                let mut rules = config.rules;
+                let clean_settings = config.clean;
+                if let Some(older_than) = clean.older_than {
+                    rules.push(age_rule(older_than));
+                }
+
+                let rules = Rules::new(rules, &user_dirs).map_err(ResolveError::Rule)?;
+                // A path narrows the walk to itself; the rules still apply
+                // within it, and one rooted elsewhere simply matches nothing —
+                // `Rules::prunes` sees to that. With no path, the rules say
+                // where to look, which is what `root` is required for.
+                let roots_from_rules = clean.path.is_none();
+                let roots = match clean.path {
+                    Some(path) => vec![path],
+                    None => rules.scan_roots(),
+                };
+
+                Ok(Mode::Clean {
+                    roots,
+                    // **True** when nothing says otherwise. The concept asks for
+                    // confirmation on this tier, and the asymmetry the denylist
+                    // already states applies: refusing too readily costs a user
+                    // one extra flag, refusing too rarely costs them data.
+                    confirm_tier_allowed: clean.yes
+                        || !clean_settings.require_confirmation.unwrap_or(true),
+                    roots_from_rules,
+                    clean: Box::new(CleanOptions {
+                        detect: DetectOptions { rules, now },
                         user_dirs,
-                        ..DetectOptions::default()
+                        safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
+                        // Deliberately not configurable: a file that quietly
+                        // disabled the git guard would hide the disabling.
+                        allow_dirty: clean.allow_dirty,
+                        min_size: clean.min_size.unwrap_or(0),
+                    }),
+                    apply: clean.apply,
+                    removal: if clean.purge {
+                        Removal::Purge
+                    } else {
+                        Removal::Trash
                     },
-                    safe_only: clean.safe,
-                    allow_dirty: clean.allow_dirty,
-                    min_size: clean.min_size,
-                },
-                apply: clean.apply,
-                removal: if clean.purge {
-                    Removal::Purge
-                } else {
-                    Removal::Trash
-                },
-            },
+                })
+            }
+        }
+    }
+}
+
+/// Why the arguments could not be turned into work.
+#[derive(Debug)]
+pub enum ResolveError {
+    /// A rule's glob does not compile. The user's text, so it names both.
+    Rule(RuleError),
+    /// `config init` with nothing to say where the file should go — no home, no
+    /// `%APPDATA%`, no `XDG_CONFIG_HOME`. Guessing would put a file somewhere
+    /// the user would never look for it.
+    NoConfigPath,
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::Rule(err) => write!(f, "{err}"),
+            ResolveError::NoConfigPath => write!(
+                f,
+                "cannot tell where your config directory is; pass --config with a path"
+            ),
         }
     }
 }
@@ -174,7 +346,7 @@ impl Args {
 ///
 /// Used as a clap `value_parser`, so a malformed value surfaces as a clean
 /// usage error rather than a panic.
-fn parse_size(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (digits, unit) = s.split_at(split);
@@ -206,7 +378,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
 /// `m` is 30 days and `y` is 365 — approximations, and stated here because `m`
 /// could otherwise be read as minutes. Nothing shorter than a day is offered:
 /// this rule exists to find things untouched for a long time.
-fn parse_duration(s: &str) -> Result<Duration, String> {
+pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     const DAY: u64 = 24 * 60 * 60;
 
     let s = s.trim();
@@ -254,10 +426,218 @@ mod tests {
         Args::try_parse_from(std::iter::once("disk-tools").chain(args.iter().copied()))
     }
 
-    /// Parse and resolve in one step, with fixed stand-ins for the two things
-    /// the frontend supplies.
+    /// `config init` resolves to a target, or to the one error that says why it
+    /// cannot. Covered end to end already; here so that a change to `resolve`
+    /// fails at the unit that owns the decision.
+    #[test]
+    fn config_init_resolves_to_the_located_path() {
+        let mode = parse(&["config", "init"])
+            .expect("parse")
+            .resolve(env(Config::default()))
+            .expect("resolve");
+
+        assert!(matches!(
+            mode,
+            Mode::ConfigInit { ref target, force: false } if target == Path::new("/cfg/config.toml")
+        ));
+
+        let forced = parse(&["config", "init", "--force"])
+            .expect("parse")
+            .resolve(env(Config::default()))
+            .expect("resolve");
+        assert!(matches!(forced, Mode::ConfigInit { force: true, .. }));
+    }
+
+    /// No home, no `%APPDATA%`, no `XDG_CONFIG_HOME`: there is nowhere to write.
+    /// Guessing would put the file somewhere the user would never look for it.
+    #[test]
+    fn config_init_without_a_known_directory_says_so() {
+        let err = parse(&["config", "init"])
+            .expect("parse")
+            .resolve(Environment {
+                config_path: None,
+                ..env(Config::default())
+            })
+            .expect_err("nowhere to write");
+
+        assert!(matches!(err, ResolveError::NoConfigPath));
+        assert!(err.to_string().contains("--config"));
+    }
+
+    /// Both variants say something a user has to act on, so both are asserted.
+    /// Mutation testing found the whole `Display` impl could be replaced with
+    /// `Ok(())` — an empty message — with every test still passing.
+    #[test]
+    fn resolve_errors_say_what_to_do_about_them() {
+        let rule = ResolveError::Rule(RuleError {
+            rule: "mine".into(),
+            pattern: "**/[".into(),
+            message: "unclosed".into(),
+        })
+        .to_string();
+        assert!(
+            rule.contains("mine") && rule.contains("**/["),
+            "a bad glob must name the rule and the pattern the user wrote: {rule}"
+        );
+
+        let no_path = ResolveError::NoConfigPath.to_string();
+        assert!(
+            no_path.contains("--config"),
+            "and the one remedy has to be named: {no_path}"
+        );
+    }
+
+    /// A fixed stand-in for everything the frontend resolves, so no test here
+    /// depends on this machine's clock, home or config file.
+    fn env(config: Config) -> Environment {
+        Environment {
+            now: SystemTime::UNIX_EPOCH,
+            user_dirs: UserDirs::default(),
+            config,
+            config_path: Some(PathBuf::from("/cfg/config.toml")),
+        }
+    }
+
+    /// Parse and resolve in one step, on the built-in rules.
     fn resolved(args: &[&str]) -> Result<Mode, clap::Error> {
-        Ok(parse(args)?.resolve(SystemTime::UNIX_EPOCH, UserDirs::default()))
+        Ok(parse(args)?
+            .resolve(env(Config::default()))
+            .expect("the built-in rules compile"))
+    }
+
+    // ---- precedence: flag > file > default -------------------------------
+
+    /// Resolve `args` against a config file built from `toml`.
+    fn against(toml: &str, args: &[&str]) -> Mode {
+        let config = crate::config::parse_for_test(toml);
+        parse(args)
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve")
+    }
+
+    fn scan_with(toml: &str, args: &[&str]) -> ScanOptions {
+        match against(toml, args) {
+            Mode::Scan { options, .. } => options,
+            other => panic!("expected a scan, got {other:?}"),
+        }
+    }
+
+    /// One row per overridable setting, because the whole point is that they all
+    /// behave the same way. A setting that quietly followed a different order
+    /// would be the bug this task exists to prevent.
+    #[test]
+    fn every_setting_takes_the_flag_then_the_file_then_the_default() {
+        // (setting, config, flag, expected)
+        let file = "[report]\nmin-size = \"1M\"\nn = 5\ndepth = 3\n";
+
+        assert_eq!(
+            scan_with("", &["scan", "/x"]).min_size,
+            0,
+            "no file, no flag: the built-in default"
+        );
+        assert_eq!(
+            scan_with(file, &["scan", "/x"]).min_size,
+            1_048_576,
+            "the file, when the flag is absent"
+        );
+        assert_eq!(
+            scan_with(file, &["scan", "/x", "--min-size", "2M"]).min_size,
+            2_097_152,
+            "the flag, over the file"
+        );
+
+        assert_eq!(scan_with("", &["scan", "/x"]).depth, None);
+        assert_eq!(scan_with(file, &["scan", "/x"]).depth, Some(3));
+        assert_eq!(
+            scan_with(file, &["scan", "/x", "--depth", "1"]).depth,
+            Some(1)
+        );
+
+        let number = |toml: &str, args: &[&str]| match against(toml, args) {
+            Mode::Scan { number, .. } => number,
+            other => panic!("expected a scan, got {other:?}"),
+        };
+        assert_eq!(number("", &["scan", "/x"]), None);
+        assert_eq!(number(file, &["scan", "/x"]), Some(5));
+        assert_eq!(number(file, &["scan", "/x", "-n", "9"]), Some(9));
+    }
+
+    /// The trap this task exists for.
+    ///
+    /// `--min-size` used to carry `default_value = "0"`, which made an explicit
+    /// zero and an absent flag arrive identical. With a file in play they are
+    /// opposite statements: one overrides it, the other defers to it. Nothing
+    /// short of dropping the clap default can tell them apart.
+    #[test]
+    fn an_explicit_zero_beats_the_file() {
+        let file = "[report]\nmin-size = \"1M\"\n";
+
+        assert_eq!(
+            scan_with(file, &["scan", "/x", "--min-size", "0"]).min_size,
+            0,
+            "the user said zero, so it is zero"
+        );
+        assert_eq!(
+            scan_with(file, &["scan", "/x"]).min_size,
+            1_048_576,
+            "and saying nothing still defers to the file"
+        );
+    }
+
+    /// `--depth 0` shows the root alone, so `depth = 0` in the file must mean
+    /// the same. Giving one value two opposite meanings is how a `config init`
+    /// would have silently collapsed every report to one line.
+    #[test]
+    fn zero_depth_means_the_root_alone_in_both_places() {
+        assert_eq!(
+            scan_with("[report]\ndepth = 0\n", &["scan", "/x"]).depth,
+            Some(0)
+        );
+        assert_eq!(
+            scan_with("", &["scan", "/x", "--depth", "0"]).depth,
+            Some(0)
+        );
+    }
+
+    /// A file may turn a boolean on; the command line cannot turn it back off,
+    /// since clap knows only "passed" and "not passed". Pinned as a limitation
+    /// rather than left to be discovered.
+    #[test]
+    fn a_boolean_set_in_the_file_cannot_be_unset_by_a_flag() {
+        let file = "[scan]\none-file-system = true\n\n[report]\napparent = true\n";
+
+        let from_file = scan_with(file, &["scan", "/x"]);
+        assert!(from_file.apparent);
+        assert!(from_file.one_file_system);
+
+        // There is no flag that turns either back off — which is the limitation.
+        let with_flags = scan_with(file, &["scan", "/x", "--apparent", "--one-file-system"]);
+        assert!(with_flags.apparent);
+        assert!(with_flags.one_file_system);
+    }
+
+    #[test]
+    fn the_file_can_only_make_a_cleanup_more_cautious() {
+        let clean = |toml: &str, args: &[&str]| match against(toml, args) {
+            Mode::Clean { clean, .. } => *clean,
+            other => panic!("expected a clean, got {other:?}"),
+        };
+
+        assert!(!clean("", &["clean", "/x"]).safe_only);
+        assert!(clean("[clean]\nsafe = true\n", &["clean", "/x"]).safe_only);
+        assert!(clean("", &["clean", "/x", "--safe"]).safe_only);
+    }
+
+    /// `--allow-dirty` and `--purge` have no key in the file, and that is the
+    /// point: a config that silently disabled the git guard, or deleted past the
+    /// trash, would hide the fact that it had.
+    #[test]
+    fn the_dangerous_flags_have_no_file_counterpart() {
+        let warnings =
+            crate::config::parse_for_test("[clean]\nallow-dirty = true\npurge = true\n").warnings;
+
+        assert_eq!(warnings, vec!["clean.allow-dirty", "clean.purge"]);
     }
 
     /// `-n` never reaches the core, so it is read off the resolved mode rather
@@ -265,14 +645,22 @@ mod tests {
     fn number_of(args: &[&str]) -> Option<usize> {
         match resolved(args).expect("resolve") {
             Mode::Scan { number, .. } => number,
-            Mode::Clean { .. } => panic!("expected a scan"),
+            other => panic!("expected a scan, got {other:?}"),
         }
     }
 
     fn scan_options(args: &[&str]) -> ScanOptions {
         match resolved(args).expect("resolve") {
             Mode::Scan { options, .. } => options,
-            Mode::Clean { scan, .. } => scan,
+            other => panic!("expected a scan, got {other:?}"),
+        }
+    }
+
+    /// What a `clean` invocation will walk.
+    fn clean_roots(args: &[&str]) -> Vec<PathBuf> {
+        match resolved(args).expect("resolve") {
+            Mode::Clean { roots, .. } => roots,
+            other => panic!("expected a clean, got {other:?}"),
         }
     }
 
@@ -297,15 +685,16 @@ mod tests {
         );
         assert_eq!(err.exit_code(), 2, "still a usage error, not a success");
 
-        // And each verb keeps its own required path.
-        for verb in ["scan", "clean"] {
-            let err = parse(&[verb]).expect_err("{verb} needs a path");
-            assert_eq!(
-                err.kind(),
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "{verb} must demand a path"
-            );
-        }
+        // `scan` still demands one; `clean` no longer does, having the rules to
+        // ask instead. Neither ever falls back to the working directory, which
+        // is the guarantee that has not moved.
+        let err = parse(&["scan"]).expect_err("scan needs a path");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        assert!(
+            parse(&["clean"]).is_ok(),
+            "clean without a path asks the rules where to look"
+        );
     }
 
     #[test]
@@ -487,10 +876,15 @@ mod tests {
 
     // ---- the clean subcommand -------------------------------------------
 
+    /// The age rule's threshold, if `--older-than` put one in the list.
+    fn older_than_of(options: &CleanOptions) -> Option<Duration> {
+        options.detect.rules.get("old")?.older_than
+    }
+
     fn clean_options(args: &[&str]) -> CleanOptions {
         match resolved(args).expect("resolve") {
-            Mode::Clean { clean, .. } => clean,
-            Mode::Scan { .. } => panic!("expected the clean subcommand"),
+            Mode::Clean { clean, .. } => *clean,
+            other => panic!("expected the clean subcommand, got {other:?}"),
         }
     }
 
@@ -508,18 +902,21 @@ mod tests {
         .expect("parse");
 
         let Mode::Clean {
-            scan, clean, apply, ..
+            roots,
+            clean,
+            apply,
+            ..
         } = mode
         else {
             panic!("expected the clean subcommand");
         };
-        assert_eq!(scan.root, PathBuf::from("/x"));
+        assert_eq!(roots, vec![PathBuf::from("/x")]);
         assert!(clean.safe_only);
         assert!(clean.allow_dirty);
         assert!(apply);
         assert_eq!(
-            clean.detect.age.expect("age armed").older_than,
-            Duration::from_secs(90 * 24 * 60 * 60)
+            older_than_of(&clean),
+            Some(Duration::from_secs(90 * 24 * 60 * 60))
         );
     }
 
@@ -537,13 +934,18 @@ mod tests {
 
         let mode = parse(&["clean", "/x", "--older-than", "1d"])
             .expect("parse")
-            .resolve(now, dirs.clone());
+            .resolve(Environment {
+                now,
+                user_dirs: dirs.clone(),
+                ..env(Config::default())
+            })
+            .expect("resolve");
 
         let Mode::Clean { clean, .. } = mode else {
             panic!("expected the clean subcommand");
         };
-        assert_eq!(clean.detect.user_dirs, dirs);
-        assert_eq!(clean.detect.age.expect("age armed").now, now);
+        assert_eq!(clean.user_dirs, dirs);
+        assert_eq!(clean.detect.now, now);
     }
 
     /// The bare form must be untouched by the subcommand's arrival — this is the
@@ -589,11 +991,7 @@ mod tests {
         const DAY: u64 = 24 * 60 * 60;
 
         let age = |arg: &str| {
-            clean_options(&["clean", "/x", "--older-than", arg])
-                .detect
-                .age
-                .expect("age armed")
-                .older_than
+            older_than_of(&clean_options(&["clean", "/x", "--older-than", arg])).expect("age armed")
         };
 
         assert_eq!(age("1d"), Duration::from_secs(DAY));
@@ -630,18 +1028,108 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
-    /// D9: absent flag means the age rule does not run at all.
+    /// D9: absent flag means the age rule is not in the list at all — not that
+    /// it is present with a zero threshold, which would claim everything.
     #[test]
-    fn absent_older_than_is_none() {
+    fn absent_older_than_adds_no_age_rule() {
+        let options = clean_options(&["clean", "/x"]);
+
         assert!(
-            clean_options(&["clean", "/x"]).detect.age.is_none(),
-            "no --older-than must leave the age rule unarmed"
+            options.detect.rules.get("old").is_none(),
+            "no --older-than must leave the age rule out of the list entirely"
+        );
+        assert!(
+            options.detect.rules.get("node-modules").is_some(),
+            "and the built-ins are still there"
         );
     }
 
+    /// Order is precedence, so the age rule has to be **last** — ahead of the
+    /// safe-list rules it would claim a `target/` as merely old, and the tier
+    /// would change from auto to confirm with it.
     #[test]
-    fn clean_without_a_path_is_a_usage_error() {
-        let err = parse(&["clean"]).expect_err("clean needs a path");
+    fn the_age_rule_is_appended_after_the_builtins() {
+        let mut rules = disk_tools_core::builtin_rules();
+        rules.push(age_rule(Duration::from_secs(1)));
+
+        assert_eq!(
+            rules.last().expect("non-empty").name,
+            "old",
+            "the age rule must sit after every built-in"
+        );
+    }
+
+    // ---- what `clean` walks ---------------------------------------------
+
+    /// The promise Task 2 made when it required `root` in the file: without a
+    /// path, the rules say where to look.
+    #[test]
+    fn without_a_path_the_rule_roots_are_walked() {
+        let config = crate::config::parse_for_test(
+            "[[rules]]\nname = \"a\"\nroot = \"/tmp/a\"\nincludes = [\"**/x/\"]\n\n\
+             [[rules]]\nname = \"b\"\nroot = \"/tmp/b\"\nincludes = [\"**/y/\"]\n",
+        );
+        let mode = parse(&["clean"])
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve");
+
+        let Mode::Clean {
+            roots,
+            roots_from_rules,
+            ..
+        } = mode
+        else {
+            panic!("expected a clean");
+        };
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+        assert!(roots_from_rules, "so the caller can announce them");
+    }
+
+    /// A path narrows the walk to itself. The rules still apply within it — one
+    /// rooted elsewhere simply matches nothing, which `Rules::prunes` decides.
+    #[test]
+    fn a_path_is_the_only_thing_walked() {
+        let config = crate::config::parse_for_test(
+            "[[rules]]\nname = \"a\"\nroot = \"/tmp/a\"\nincludes = [\"**/x/\"]\n",
+        );
+        let mode = parse(&["clean", "/elsewhere"])
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve");
+
+        let Mode::Clean {
+            roots,
+            roots_from_rules,
+            ..
+        } = mode
+        else {
+            panic!("expected a clean");
+        };
+        assert_eq!(roots, vec![PathBuf::from("/elsewhere")]);
+        assert!(
+            !roots_from_rules,
+            "a user who named a path knows where they pointed"
+        );
+    }
+
+    /// Every built-in rule but the cache ones is unrooted, so with no home and
+    /// no path there is nothing to walk. That is a statement about the
+    /// configuration, and the caller has to make it — an empty plan would read
+    /// as "nothing to clean".
+    #[test]
+    fn unrooted_rules_alone_leave_nothing_to_walk() {
+        assert!(clean_roots(&["clean"]).is_empty());
+    }
+
+    /// Unlike `clean`, a scan has no rules to ask and never falls back to the
+    /// working directory.
+    #[test]
+    fn scan_still_demands_a_path() {
+        let err = parse(&["scan"]).expect_err("scan needs a path");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 

@@ -59,19 +59,6 @@ pub(crate) fn normalize_lexically(path: &Path) -> PathBuf {
     resolved.iter().collect()
 }
 
-/// Do these two paths name the same thing?
-pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
-    let mut left = a.components();
-    let mut right = b.components();
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return true,
-            (Some(l), Some(r)) if same_component(l, r) => {}
-            _ => return false,
-        }
-    }
-}
-
 /// Is `path` `root` itself, or somewhere beneath it?
 ///
 /// Component-wise, so `/home/mine` is **not** within `/home/min` — the trap a
@@ -149,15 +136,16 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Comparison is component-wise, so `Path`'s own handling of separators and
+    /// `.` applies and a path spelled two ways still compares equal. String
+    /// comparison would see two different things.
     #[test]
-    fn same_path_ignores_separator_and_dot_noise() {
-        assert!(same_path(
-            Path::new("/a/b"),
-            &PathBuf::from("/a").join("./b")
+    fn comparison_ignores_separator_and_dot_noise() {
+        assert!(is_within(
+            &PathBuf::from("/a").join("./b"),
+            Path::new("/a/b")
         ));
-        assert!(!same_path(Path::new("/a/b"), Path::new("/a/c")));
-        assert!(!same_path(Path::new("/a/b"), Path::new("/a/b/c")));
-        assert!(!same_path(Path::new("/a/b/c"), Path::new("/a/b")));
+        assert!(!is_within(Path::new("/a/c"), Path::new("/a/b")));
     }
 
     /// The prefix trap: `/home/mine` shares a string prefix with `/home/min`
@@ -243,10 +231,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_folds_case_and_ignores_the_drive_letter() {
-        assert!(same_path(
-            Path::new(r"C:\Users\Me"),
-            Path::new(r"c:\users\me")
-        ));
         assert!(is_within(
             Path::new(r"C:\Users\Me\Deep"),
             Path::new(r"c:\users\me")
@@ -262,7 +246,6 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn case_is_significant_off_windows() {
-        assert!(!same_path(Path::new("/a/b"), Path::new("/a/B")));
         assert!(!is_within(Path::new("/a/B/c"), Path::new("/a/b")));
         assert!(!under_root(Path::new("/system"), &["System"]));
     }

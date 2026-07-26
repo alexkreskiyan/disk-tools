@@ -5,13 +5,15 @@
 //! summary go to stderr, keeping stdout clean for pipes.
 
 mod args;
+mod config;
 mod env;
 mod render;
 
-use args::{Args, Mode, validate_root};
+use args::{Args, Environment, Mode, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOptions, CleanPlan, Removal, ScanOptions, ScanTree, Tier, apply, plan, scan,
+    CleanOptions, CleanOutcome, CleanPlan, Removal, ScanOptions, ScanTree, SkippedEntry, Tier,
+    apply, plan, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{Intent, render_clean, render_outcome};
@@ -19,6 +21,7 @@ use render::json::render_json;
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
 use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
@@ -26,20 +29,89 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let verbose = args.verbose;
 
-    // The core reads no clock and no environment, so both are resolved here and
-    // handed over. Once, at the top, so every rule sees the same "now".
-    match args.resolve(SystemTime::now(), env::user_dirs()) {
+    // The core reads no clock, no environment and no config file, so all three
+    // are resolved here and handed over. The clock once, at the top, so every
+    // rule in one run sees the same "now".
+    let user_dirs = env::user_dirs();
+    let xdg = env::xdg_config_home();
+    let config_path = config::locate(args.config.as_deref(), &user_dirs, xdg.clone());
+
+    // Before anything is scanned: a config that cannot be understood means the
+    // rules are unknown, and the rules decide what may be deleted.
+    //
+    // Skipped for the `config` verb, which writes the file rather than obeying
+    // it. Reading first would make `--config <new path> config init` fail on the
+    // absence of exactly the file it was asked to create.
+    let config = if matches!(args.command, args::Command::Config { .. }) {
+        config::Config::default()
+    } else {
+        match config::load(args.config.as_deref(), &user_dirs, xdg) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("disk-tools: config: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    };
+    for warning in &config.warnings {
+        eprintln!("disk-tools: config: unknown key `{warning}` (ignored)");
+    }
+
+    let mode = match args.resolve(Environment {
+        now: SystemTime::now(),
+        user_dirs,
+        config,
+        config_path,
+    }) {
+        Ok(mode) => mode,
+        Err(err) => {
+            eprintln!("disk-tools: config: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match mode {
         Mode::Scan {
             options,
             number,
             json,
         } => run_scan(options, number, json, verbose),
         Mode::Clean {
-            scan,
+            roots,
+            confirm_tier_allowed,
+            roots_from_rules,
             clean,
             apply,
             removal,
-        } => run_clean(scan, clean, apply, removal, verbose),
+        } => run_clean(
+            &roots,
+            roots_from_rules,
+            *clean,
+            Removing {
+                apply,
+                removal,
+                confirm_tier_allowed,
+            },
+            verbose,
+        ),
+        Mode::ConfigInit { target, force } => run_config_init(&target, force),
+    }
+}
+
+/// Write the default configuration where this platform keeps one.
+///
+/// The path goes to **stdout**: it is the result of the command, and the obvious
+/// next thing a user does with it is open it.
+fn run_config_init(target: &std::path::Path, force: bool) -> ExitCode {
+    match config::init(target, force) {
+        Ok(()) => {
+            println!("{}", target.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("disk-tools: config: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -70,27 +142,98 @@ fn run_scan(options: ScanOptions, number: Option<usize>, json: bool, verbose: bo
         render_tree(&tree, &render_options)
     };
 
-    emit(&report, &tree, verbose)
+    emit(&report, &tree.skipped, verbose)
+}
+
+/// What `--apply` was asked to do, and how far it is allowed to go.
+///
+/// Three booleans that only mean anything together: applying at all, whether the
+/// trash is bypassed, and whether the non-regenerable candidates may go. Passed
+/// as one value so no caller can supply two of the three.
+struct Removing {
+    apply: bool,
+    removal: Removal,
+    confirm_tier_allowed: bool,
+}
+
+impl Removing {
+    /// May the outcome describe what it removed as still retrievable?
+    ///
+    /// Only the trash makes that true. Named rather than written inline as
+    /// `!= Removal::Purge` because it guards the one sentence a user reads to
+    /// find out whether their data still exists — and because inline it was
+    /// untestable: that sentence prints only after a partial failure, which
+    /// cannot be provoked against the macOS trash.
+    fn recoverable(&self) -> bool {
+        self.removal == Removal::Trash
+    }
 }
 
 fn run_clean(
-    options: ScanOptions,
+    roots: &[PathBuf],
+    roots_from_rules: bool,
     clean: CleanOptions,
-    apply: bool,
-    removal: Removal,
+    removing: Removing,
     verbose: bool,
 ) -> ExitCode {
-    // The git guard runs a `git status` per repository, so a tree of many
-    // projects spends real time after the walk finishes.
-    let Some(tree) = scan_or_report(&options, "Scanning…") else {
-        return ExitCode::from(2);
-    };
-
-    if apply {
-        return remove(&plan(&tree, &clean), removal, &tree, verbose);
+    if roots.is_empty() {
+        // Not an error and not an empty plan. "Nothing to clean" would be a
+        // claim about the disk; this is a statement about the configuration, and
+        // the two remedies are different things to go and do.
+        eprintln!(
+            "disk-tools: no rule names a directory to clean.\n\
+             Pass a path, or give a rule a `root` other than \"*\"."
+        );
+        return ExitCode::SUCCESS;
     }
 
-    let planned = plan(&tree, &clean);
+    if roots_from_rules {
+        // Announced only when the rules chose them. The default config roots
+        // `user-caches` at the home directory, so a bare `disk-tools clean`
+        // walks all of it — slow rather than dangerous, the default still being
+        // a dry run, but no one should have to guess why it is taking a minute.
+        let listed: Vec<String> = roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect();
+        eprintln!("disk-tools: examining {}", listed.join(", "));
+    } else {
+        // A path the user **named** and that is not there is a typo, and an
+        // empty report would hide it. A root that came from a rule is only a
+        // description, which may have gone stale — that one is a skip, since a
+        // single missing directory is no reason to leave the others uncleaned.
+        for root in roots {
+            if let Err(problem) = validate_root(root) {
+                eprintln!("disk-tools: {problem}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // The git guard runs a `git status` per repository, so a tree of many
+    // projects spends real time after the walk finishes.
+    let mut plans = Vec::with_capacity(roots.len());
+    let mut skipped = Vec::new();
+    for root in roots {
+        let options = ScanOptions {
+            root: root.clone(),
+            ..ScanOptions::default()
+        };
+        // No `validate_root` here. A path the user *named* is checked before
+        // this function is reached; a root that came from a rule is a
+        // description that may have gone stale, and one missing directory is no
+        // reason to leave the others uncleaned. `scan` reports it as a skip.
+        let tree = scan_with_spinner(&options, "Scanning…");
+        plans.push(plan(&tree, &clean));
+        skipped.extend(tree.skipped);
+    }
+
+    let planned = CleanPlan::merge(plans);
+
+    if removing.apply {
+        return remove(&planned, &removing, &skipped, verbose);
+    }
+
     // The count of what `--safe` hid comes back with the plan. It used to come
     // from planning a second time without the flag, which cost a full extra pass
     // of the git guard — measured at ~23 ms per repository, so `--safe` was the
@@ -100,7 +243,7 @@ fn run_clean(
 
     emit(
         &render_clean(&planned, hidden, Intent::DryRun),
-        &tree,
+        &skipped,
         verbose,
     )
 }
@@ -110,27 +253,68 @@ fn run_clean(
 /// The plan is printed **before** it is carried out, so the last thing a user
 /// sees before the removal is the list of what is about to go — the same report
 /// a dry run would have given them.
-fn remove(planned: &CleanPlan, removal: Removal, tree: &ScanTree, verbose: bool) -> ExitCode {
+fn remove(
+    planned: &CleanPlan,
+    removing: &Removing,
+    skipped: &[SkippedEntry],
+    verbose: bool,
+) -> ExitCode {
     if planned.candidates.is_empty() {
-        return emit(&render_clean(planned, None, Intent::DryRun), tree, verbose);
+        return emit(
+            &render_clean(planned, None, Intent::DryRun),
+            skipped,
+            verbose,
+        );
     }
 
-    // To stderr: this is context for the operation, not the report. It also
-    // keeps stdout to the outcome alone for anything reading it.
-    eprint!("{}", render_clean(planned, None, Intent::AboutToApply));
     let confirm = planned
         .candidates
         .iter()
         .filter(|c| c.tier == Tier::Confirm)
         .count();
+
+    // Decided **before** anything is printed. The plan below goes out with an
+    // intent, and `AboutToApply`'s closing line promises a removal — printing
+    // that and then declining would make the last thing a user reads before the
+    // outcome the one sentence in the report that is false. That is the defect
+    // `Intent` was introduced for.
+    //
+    // `--safe` needs no case of its own: it keeps confirm-tier candidates out of
+    // the plan, so the count is zero and there is nothing to refuse.
+    if confirm > 0 && !removing.confirm_tier_allowed {
+        let code = emit(
+            &render_clean(planned, None, Intent::DryRun),
+            skipped,
+            verbose,
+        );
+        let (noun, verb) = if confirm == 1 {
+            ("candidate", "is")
+        } else {
+            ("candidates", "are")
+        };
+        eprintln!(
+            "\n{confirm} {noun} {verb} not regenerable, and nothing was removed.\n\
+             Add --safe to take only the regenerable ones, or --yes to take all of them."
+        );
+        // The flags were well formed; the invitation was incomplete. That is a
+        // usage answer, not an operation that failed.
+        return if code == ExitCode::SUCCESS {
+            ExitCode::from(2)
+        } else {
+            code
+        };
+    }
+
+    // To stderr: this is context for the operation, not the report. It also
+    // keeps stdout to the outcome alone for anything reading it.
+    eprint!("{}", render_clean(planned, None, Intent::AboutToApply));
     if confirm > 0 {
-        // The concept asks for per-target confirmation on this tier; v0.2's
-        // confirmation is having read the list above and typed `--apply`. Saying
-        // the number out loud is what keeps that from being a blind yes.
+        // Reached only with `--yes`, or with `require-confirmation` turned off.
+        // Saying the number out loud is what keeps either from being a blind yes.
         eprintln!("{confirm} of these are not regenerable — removing anyway, as asked.");
     }
 
-    if removal == Removal::Purge {
+    if removing.removal == Removal::Purge {
         // The last word before something becomes unrecoverable. `--purge` is a
         // deliberate reversal of this tool's central promise, so it is said
         // plainly rather than assumed understood.
@@ -145,20 +329,16 @@ fn remove(planned: &CleanPlan, removal: Removal, tree: &ScanTree, verbose: bool)
     let spinner = ProgressBar::new_spinner();
     spinner.set_message(format!("Removing {} items…", planned.candidates.len()));
     spinner.enable_steady_tick(Duration::from_millis(100));
-    let outcome = apply(planned, removal, |_| {});
+    let outcome = apply(planned, removing.removal, |_| {});
     spinner.finish_and_clear();
 
-    // Whether the freed figure needs the same hedge the dry run's total carried:
-    // a removed candidate that shares content with something outside it did not
-    // free everything its size claimed.
-    let shared_removed = planned
-        .candidates
-        .iter()
-        .any(|c| c.shared && outcome.removed.contains(&c.path));
-
     let code = emit(
-        &render_outcome(&outcome, shared_removed, removal == Removal::Purge),
-        tree,
+        &render_outcome(
+            &outcome,
+            shared_was_removed(planned, &outcome),
+            removing.recoverable(),
+        ),
+        skipped,
         verbose,
     );
     if !outcome.is_complete() {
@@ -169,12 +349,21 @@ fn remove(planned: &CleanPlan, removal: Removal, tree: &ScanTree, verbose: bool)
 }
 
 /// Scan, with a spinner, or report why the root is unusable.
+///
+/// The check belongs to a path the **user named**: one that does not exist is a
+/// typo, and an empty report would hide it. A root that came from a rule gets
+/// [`scan_with_spinner`] instead, and a missing one there is a skip.
 fn scan_or_report(options: &ScanOptions, message: &'static str) -> Option<ScanTree> {
     if let Err(problem) = validate_root(&options.root) {
         eprintln!("disk-tools: {problem}");
         return None;
     }
 
+    Some(scan_with_spinner(options, message))
+}
+
+/// Scan, with a spinner, whatever the root turns out to be.
+fn scan_with_spinner(options: &ScanOptions, message: &'static str) -> ScanTree {
     // indicatif draws to stderr and hides itself when stderr isn't a tty, so a
     // piped run shows no spinner and stdout stays clean.
     let spinner = ProgressBar::new_spinner();
@@ -183,11 +372,15 @@ fn scan_or_report(options: &ScanOptions, message: &'static str) -> Option<ScanTr
     let tree = scan(options);
     spinner.finish_and_clear();
 
-    Some(tree)
+    tree
 }
 
 /// Report to stdout, skips to stderr.
-fn emit(report: &str, tree: &ScanTree, verbose: bool) -> ExitCode {
+///
+/// Takes the skips rather than the tree they came from: `clean` with no path
+/// walks a root per rule and has several trees, one report, and one combined
+/// list of what it could not read.
+fn emit(report: &str, skipped: &[SkippedEntry], verbose: bool) -> ExitCode {
     if let Err(err) = write_report(report) {
         // `disk-tools <path> | head` closes the pipe after a few lines. For a
         // Unix filter that is a normal end of output, not a failure — stop
@@ -203,10 +396,25 @@ fn emit(report: &str, tree: &ScanTree, verbose: bool) -> ExitCode {
     // stdout stays valid JSON). Errors are dropped: stderr closing (`2>&1 | head`)
     // must not turn a successful scan into a failure, and there is nowhere left
     // to report it anyway.
-    if let Some(summary) = render_skipped(&tree.skipped, verbose) {
+    if let Some(summary) = render_skipped(skipped, verbose) {
         let _ = write!(io::stderr(), "{summary}");
     }
     ExitCode::SUCCESS
+}
+
+/// Does the freed figure need the same hedge the dry run's total carried?
+///
+/// A candidate that shares content with something outside it did not free
+/// everything its size claimed — but only if it actually went. Both halves
+/// matter and neither is testable through the binary: the sentence they control
+/// appears only after a **partial** failure, and a partial trash failure cannot
+/// be provoked on macOS (v0.2 measured that). Pulled out here so the decision can
+/// be driven directly, the way `already_gone` was for the same reason.
+fn shared_was_removed(planned: &CleanPlan, outcome: &CleanOutcome) -> bool {
+    planned
+        .candidates
+        .iter()
+        .any(|candidate| candidate.shared && outcome.removed.contains(&candidate.path))
 }
 
 /// Write the finished report to stdout in one buffered pass.
@@ -227,4 +435,122 @@ fn terminal_width() -> usize {
     terminal_size::terminal_size()
         .map(|(width, _)| width.0 as usize)
         .unwrap_or(80)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use disk_tools_core::{Candidate, TrashFailure};
+
+    fn candidate(path: &str, shared: bool) -> Candidate {
+        Candidate {
+            path: PathBuf::from(path),
+            rule: "node-modules".into(),
+            tier: Tier::Auto,
+            allocated: 4096,
+            shared,
+        }
+    }
+
+    fn plan_of(candidates: Vec<Candidate>) -> CleanPlan {
+        CleanPlan {
+            reclaimable: candidates.iter().map(|c| c.allocated).sum(),
+            candidates,
+            ..CleanPlan::default()
+        }
+    }
+
+    fn outcome(removed: &[&str], failed: &[&str]) -> CleanOutcome {
+        CleanOutcome {
+            removed: removed.iter().map(PathBuf::from).collect(),
+            failed: failed
+                .iter()
+                .map(|path| TrashFailure {
+                    path: PathBuf::from(path),
+                    reason: "denied".into(),
+                })
+                .collect(),
+            reclaimed: 0,
+        }
+    }
+
+    /// Both halves of the predicate, driven apart.
+    ///
+    /// Mutation testing found neither was covered: the sentence they control
+    /// appears only after a partial failure, and a partial *trash* failure cannot
+    /// be provoked on macOS. Replacing the `&&` with `||` left every test passing.
+    #[test]
+    fn the_hedge_needs_a_shared_candidate_that_actually_went() {
+        let shared = plan_of(vec![candidate("/p/a", true)]);
+        let plain = plan_of(vec![candidate("/p/a", false)]);
+
+        assert!(
+            shared_was_removed(&shared, &outcome(&["/p/a"], &[])),
+            "shared and removed: the freed figure is an upper bound"
+        );
+        assert!(
+            !shared_was_removed(&shared, &outcome(&[], &["/p/a"])),
+            "shared but it stayed — nothing it shares was freed either way"
+        );
+        assert!(
+            !shared_was_removed(&plain, &outcome(&["/p/a"], &[])),
+            "removed but unshared: the figure is exact, and hedging it would be \
+             the report doubting a number it knows"
+        );
+    }
+
+    /// One shared candidate among many is enough — the total covers them all.
+    #[test]
+    fn one_shared_removal_among_several_is_enough() {
+        let plan = plan_of(vec![
+            candidate("/p/a", false),
+            candidate("/p/b", true),
+            candidate("/p/c", false),
+        ]);
+
+        assert!(shared_was_removed(
+            &plan,
+            &outcome(&["/p/a", "/p/b", "/p/c"], &[])
+        ));
+        assert!(
+            !shared_was_removed(&plan, &outcome(&["/p/a", "/p/c"], &["/p/b"])),
+            "the only shared one failed, so what did go was measured exactly"
+        );
+    }
+
+    #[test]
+    fn nothing_removed_needs_no_hedge() {
+        let plan = plan_of(vec![candidate("/p/a", true)]);
+
+        assert!(!shared_was_removed(&plan, &outcome(&[], &[])));
+        assert!(!shared_was_removed(
+            &CleanPlan::default(),
+            &outcome(&[], &[])
+        ));
+    }
+}
+
+#[cfg(test)]
+mod removing_tests {
+    use super::*;
+
+    /// The one sentence a user reads to find out whether their data still
+    /// exists. Inline as `removal == Removal::Purge` it was untestable — the
+    /// line prints only after a partial failure, which cannot be provoked
+    /// against the macOS trash — and mutation testing showed nothing caught it
+    /// being inverted.
+    #[test]
+    fn only_the_trash_is_recoverable() {
+        let removing = |removal| Removing {
+            apply: true,
+            removal,
+            confirm_tier_allowed: false,
+        };
+
+        assert!(removing(Removal::Trash).recoverable());
+        assert!(
+            !removing(Removal::Purge).recoverable(),
+            "there is nothing in the trash to put back"
+        );
+    }
 }

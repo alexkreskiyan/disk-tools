@@ -10,9 +10,7 @@
 //! "what would go".
 
 use super::tree::format_size;
-use disk_tools_core::{
-    Candidate, Category, CleanOutcome, CleanPlan, ExcludeReason, Excluded, Tier,
-};
+use disk_tools_core::{Candidate, CleanOutcome, CleanPlan, ExcludeReason, Excluded, Tier};
 use std::fmt::Write;
 
 /// Why the plan is being shown.
@@ -54,28 +52,47 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
     }
 
     if let Some(hidden) = hidden_by_safe.filter(|&n| n > 0) {
-        let noun = if hidden == 1 {
-            "candidate"
+        // The verb and the pronoun have to agree with the noun, not just the
+        // noun with the count — "1 more candidate need confirmation … hiding
+        // them" reads as though more than one were being withheld, which is the
+        // one thing this line exists to say precisely.
+        let (noun, verb, them) = if hidden == 1 {
+            ("candidate", "needs", "it")
         } else {
-            "candidates"
+            ("candidates", "need", "them")
         };
         let _ = writeln!(
             out,
-            "\n{hidden} more {noun} need confirmation; --safe is hiding them."
+            "\n{hidden} more {noun} {verb} confirmation; --safe is hiding {them}."
         );
     }
 
+    // Three separate lines, and deliberately so: each names the thing a user
+    // would have to change to see what is missing. Offering `--safe` as the
+    // answer to "where did the rest go" when the answer is `--min-size` sends
+    // them at the wrong flag — and naming `--min-size` when the threshold came
+    // from a rule sends them to change something they never set.
     if plan.too_small > 0 {
-        // A separate line from the `--safe` one above, and deliberately so: the
-        // remedy differs. Offering `--safe` as the answer to "where did the rest
-        // go" when the answer is `--min-size` would send the user at the wrong
-        // flag, the same way an undifferentiated exclusion list would.
-        let noun = if plan.too_small == 1 {
-            "candidate is"
-        } else {
-            "candidates are"
-        };
-        let _ = writeln!(out, "\n{} more {noun} below --min-size.", plan.too_small);
+        let _ = writeln!(
+            out,
+            "\n{} more {} below --min-size.",
+            plan.too_small,
+            are(plan.too_small)
+        );
+    }
+
+    if plan.below_rule_minimum > 0 {
+        let _ = writeln!(
+            out,
+            "\n{} more {} below their rule's own min-size; edit the rule to see {}.",
+            plan.below_rule_minimum,
+            are(plan.below_rule_minimum),
+            if plan.below_rule_minimum == 1 {
+                "it"
+            } else {
+                "them"
+            }
+        );
     }
 
     if !plan.candidates.is_empty() && intent == Intent::DryRun {
@@ -91,7 +108,7 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
 /// delete is acceptable; leaving the user to guess which half happened is not.
 /// So a failure names its path and what the OS said, and the closing line states
 /// plainly that something is still there.
-pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, purged: bool) -> String {
+pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, recoverable: bool) -> String {
     let mut out = String::new();
     let attempted = outcome.removed.len() + outcome.failed.len();
 
@@ -138,7 +155,11 @@ pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, purged: bool
     // sitting directly under the failure list, reads as promising exactly the
     // items that are *not* in the trash. This is the sentence a user reads to
     // find out whether their work survived.
-    if !outcome.removed.is_empty() && !purged {
+    //
+    // Phrased as `recoverable` rather than `!purged`: a double negative guarding
+    // the one sentence that tells a user whether their data still exists is a
+    // negation too many.
+    if !outcome.removed.is_empty() && recoverable {
         let removed = outcome.removed.len();
         let (noun, verb) = if removed == 1 {
             ("candidate", "is")
@@ -154,12 +175,23 @@ pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, purged: bool
     out
 }
 
+/// "candidate is" / "candidates are" — the verb has to agree with the noun, not
+/// only the noun with the count.
+fn are(count: usize) -> &'static str {
+    if count == 1 {
+        "candidate is"
+    } else {
+        "candidates are"
+    }
+}
+
 fn write_candidates(candidates: &[Candidate], out: &mut String) {
     // Widths from the data rather than fixed, so the columns stay tight when
-    // only one category is present.
-    let category_width = candidates
+    // only one rule is present. Rule names are user-supplied in v0.3, so this
+    // is no longer a bounded set of five known strings.
+    let rule_width = candidates
         .iter()
-        .map(|c| category(c.category).len())
+        .map(|c| c.rule.chars().count())
         .max()
         .unwrap_or(0);
     let tier_width = candidates
@@ -172,13 +204,13 @@ fn write_candidates(candidates: &[Candidate], out: &mut String) {
         // Writing to a `String` is infallible.
         let _ = writeln!(
             out,
-            "{size:>8}  {category:<cw$}  {tier:<tw$}  {path}{shared}",
+            "{size:>8}  {rule:<rw$}  {tier:<tw$}  {path}{shared}",
             size = format_size(candidate.allocated),
-            category = category(candidate.category),
+            rule = candidate.rule,
             tier = tier(candidate.tier),
             path = candidate.path.display(),
             shared = if candidate.shared { "  (shared)" } else { "" },
-            cw = category_width,
+            rw = rule_width,
             tw = tier_width,
         );
     }
@@ -236,18 +268,6 @@ fn excuse(reason: &ExcludeReason) -> &'static str {
     }
 }
 
-/// The name the concept and the README use for each category, so the report,
-/// the docs and any future config key all say the same word.
-fn category(category: Category) -> &'static str {
-    match category {
-        Category::RustTarget => "rust-target",
-        Category::NodeModules => "node-modules",
-        Category::Pycache => "pycache",
-        Category::UserCaches => "user-caches",
-        Category::Old => "old",
-    }
-}
-
 fn tier(tier: Tier) -> &'static str {
     match tier {
         Tier::Auto => "auto",
@@ -260,10 +280,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn candidate(path: &str, category: Category, tier: Tier, allocated: u64) -> Candidate {
+    fn candidate(path: &str, rule: &str, tier: Tier, allocated: u64) -> Candidate {
         Candidate {
             path: PathBuf::from(path),
-            category,
+            rule: rule.into(),
             tier,
             allocated,
             shared: false,
@@ -278,6 +298,7 @@ mod tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 0,
+            below_rule_minimum: 0,
         }
     }
 
@@ -285,19 +306,14 @@ mod tests {
     fn dry_run_lists_candidates_with_a_total() {
         let report = render_clean(
             &plan(vec![
-                candidate(
-                    "/p/node_modules",
-                    Category::NodeModules,
-                    Tier::Auto,
-                    1_048_576,
-                ),
-                candidate("/p/old.bin", Category::Old, Tier::Confirm, 1_048_576),
+                candidate("/p/node_modules", "node-modules", Tier::Auto, 1_048_576),
+                candidate("/p/old.bin", "old", Tier::Confirm, 1_048_576),
             ]),
             None,
             Intent::DryRun,
         );
 
-        // Path, category and tier for each, then the total.
+        // Path, rule and tier for each, then the total.
         assert!(report.contains("/p/node_modules"), "{report}");
         assert!(report.contains("node-modules"), "{report}");
         assert!(report.contains("auto"), "{report}");
@@ -315,7 +331,7 @@ mod tests {
     /// "will not be freed" would be a different, stronger and wrong one.
     #[test]
     fn shared_candidate_is_flagged_and_total_labelled_upper_bound() {
-        let mut shared = candidate("/p/node_modules", Category::NodeModules, Tier::Auto, 2048);
+        let mut shared = candidate("/p/node_modules", "node-modules", Tier::Auto, 2048);
         shared.shared = true;
 
         let report = render_clean(&plan(vec![shared]), None, Intent::DryRun);
@@ -339,7 +355,7 @@ mod tests {
         let report = render_clean(
             &plan(vec![candidate(
                 "/p/node_modules",
-                Category::NodeModules,
+                "node-modules",
                 Tier::Auto,
                 2048,
             )]),
@@ -423,7 +439,7 @@ mod tests {
         let report = render_clean(
             &plan(vec![candidate(
                 "/p/node_modules",
-                Category::NodeModules,
+                "node-modules",
                 Tier::Auto,
                 2048,
             )]),
@@ -441,12 +457,7 @@ mod tests {
     #[test]
     fn nothing_hidden_says_nothing() {
         let report = render_clean(
-            &plan(vec![candidate(
-                "/p/nm",
-                Category::NodeModules,
-                Tier::Auto,
-                1,
-            )]),
+            &plan(vec![candidate("/p/nm", "node-modules", Tier::Auto, 1)]),
             Some(0),
             Intent::DryRun,
         );
@@ -461,27 +472,41 @@ mod tests {
     /// prose a person reads under some pressure.
     #[test]
     fn counts_are_singular_where_they_should_be() {
-        let mut shared = candidate("/p/nm", Category::NodeModules, Tier::Auto, 2048);
+        let mut shared = candidate("/p/nm", "node-modules", Tier::Auto, 2048);
         shared.shared = true;
         let report = render_clean(&plan(vec![shared]), Some(1), Intent::DryRun);
 
         assert!(report.contains("1 candidate shares"), "{report}");
-        assert!(report.contains("1 more candidate need"), "{report}");
+        assert!(
+            report.contains("1 more candidate needs confirmation; --safe is hiding it."),
+            "the verb and the pronoun agree with the noun, not only with the count:\n{report}"
+        );
     }
 
+    /// Only the tier still has a label that could be got wrong. Rule names are
+    /// printed verbatim in v0.3 — they are the user's own text, so there is no
+    /// mapping left that could omit one.
     #[test]
-    fn every_category_and_tier_has_a_label() {
-        for c in [
-            Category::RustTarget,
-            Category::NodeModules,
-            Category::Pycache,
-            Category::UserCaches,
-            Category::Old,
-        ] {
-            assert!(!category(c).is_empty(), "{c:?}");
-        }
+    fn every_tier_has_a_label() {
         assert_eq!(tier(Tier::Auto), "auto");
         assert_eq!(tier(Tier::Confirm), "confirm");
+    }
+
+    /// A user's rule name is not from a fixed set, so the column has to size
+    /// itself from the data rather than from a known-longest label.
+    #[test]
+    fn the_rule_column_fits_the_longest_name_present() {
+        let plan = plan(vec![
+            candidate("/p/a", "nm", Tier::Auto, 1024),
+            candidate("/p/b", "a-very-long-user-rule-name", Tier::Auto, 1024),
+        ]);
+
+        let report = render_clean(&plan, None, Intent::DryRun);
+
+        assert!(
+            report.contains("nm                          auto"),
+            "the short name must be padded to the long one:\n{report}"
+        );
     }
 }
 
@@ -506,7 +531,7 @@ mod outcome_tests {
             reclaimed: 2048,
         };
 
-        let report = render_outcome(&outcome, false, false);
+        let report = render_outcome(&outcome, false, true);
 
         assert!(report.contains("Removed 1 of 1"), "{report}");
         assert!(report.contains("Freed 2.0K"), "{report}");
@@ -527,7 +552,7 @@ mod outcome_tests {
             reclaimed: 0,
         };
 
-        let report = render_outcome(&outcome, false, false);
+        let report = render_outcome(&outcome, false, true);
 
         assert!(report.contains("Removed nothing."), "{report}");
         assert!(report.contains("2 candidates still on disk"), "{report}");
@@ -548,7 +573,7 @@ mod outcome_tests {
             reclaimed: 1024,
         };
 
-        let report = render_outcome(&outcome, false, false);
+        let report = render_outcome(&outcome, false, true);
 
         assert!(report.contains("1 candidate still on disk"), "{report}");
         assert!(
@@ -573,12 +598,12 @@ mod outcome_tests {
         };
 
         assert!(
-            render_outcome(&outcome, true, false).contains("Freed at most 4.0K"),
+            render_outcome(&outcome, true, true).contains("Freed at most 4.0K"),
             "{}",
-            render_outcome(&outcome, true, false)
+            render_outcome(&outcome, true, true)
         );
         assert!(
-            render_outcome(&outcome, false, false).contains("Freed 4.0K"),
+            render_outcome(&outcome, false, true).contains("Freed 4.0K"),
             "and without sharing the figure is exact"
         );
     }
@@ -592,7 +617,7 @@ mod outcome_tests {
         };
 
         assert!(
-            render_outcome(&outcome, false, false).contains("1 candidate still on disk"),
+            render_outcome(&outcome, false, true).contains("1 candidate still on disk"),
             "not `1 candidates`"
         );
     }
@@ -607,7 +632,7 @@ mod intent_tests {
         CleanPlan {
             candidates: vec![Candidate {
                 path: PathBuf::from("/p/node_modules"),
-                category: Category::NodeModules,
+                rule: "node-modules".into(),
                 tier: Tier::Auto,
                 allocated: 2048,
                 shared: false,
@@ -616,6 +641,7 @@ mod intent_tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 0,
+            below_rule_minimum: 0,
         }
     }
 
@@ -679,7 +705,7 @@ mod purge_tests {
     /// trash to put back.
     #[test]
     fn a_purged_run_never_claims_anything_can_be_put_back() {
-        let report = render_outcome(&partial(), false, true);
+        let report = render_outcome(&partial(), false, false);
 
         assert!(report.contains("1 candidate still on disk"), "{report}");
         assert!(
@@ -692,7 +718,7 @@ mod purge_tests {
     /// both.
     #[test]
     fn a_trashed_run_still_says_what_can_be_put_back() {
-        let report = render_outcome(&partial(), false, false);
+        let report = render_outcome(&partial(), false, true);
 
         assert!(
             report.contains("in the trash and can be put back"),
@@ -714,7 +740,7 @@ mod min_size_tests {
         let mut plan = CleanPlan {
             candidates: vec![Candidate {
                 path: PathBuf::from("/p/node_modules"),
-                category: Category::NodeModules,
+                rule: "node-modules".into(),
                 tier: Tier::Auto,
                 allocated: 2_000_000,
                 shared: false,
@@ -723,6 +749,7 @@ mod min_size_tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 150,
+            below_rule_minimum: 0,
         };
 
         let report = render_clean(&plan, None, Intent::DryRun);
@@ -736,14 +763,73 @@ mod min_size_tests {
             "the remedy is the size flag, not the tier one: {report}"
         );
 
-        // And with both narrowings in effect, both are stated.
+        // And with all three narrowings in effect, all three are stated.
         plan.filtered_out = 3;
-        let both = render_clean(&plan, Some(3), Intent::DryRun);
+        plan.below_rule_minimum = 7;
+        let all = render_clean(&plan, Some(3), Intent::DryRun);
+        assert!(all.contains("3 more candidates need confirmation"), "{all}");
         assert!(
-            both.contains("3 more candidates need confirmation"),
-            "{both}"
+            all.contains("150 more candidates are below --min-size"),
+            "{all}"
         );
-        assert!(both.contains("150 more candidates are below"), "{both}");
+        assert!(
+            all.contains("7 more candidates are below their rule's own min-size"),
+            "{all}"
+        );
+    }
+
+    /// The two size thresholds are not the same statement, and they do not have
+    /// the same remedy: one is a flag on this command line, the other is a line
+    /// in a file the user has to go and find. Naming `--min-size` for a rule's
+    /// threshold sends them to change something they never set.
+    #[test]
+    fn a_rules_own_threshold_is_reported_apart_from_the_flag() {
+        let plan = CleanPlan {
+            candidates: Vec::new(),
+            reclaimable: 0,
+            excluded: Vec::new(),
+            filtered_out: 0,
+            too_small: 0,
+            below_rule_minimum: 2,
+        };
+
+        let report = render_clean(&plan, None, Intent::DryRun);
+
+        assert!(
+            report.contains("2 more candidates are below their rule's own min-size"),
+            "{report}"
+        );
+        assert!(
+            report.contains("edit the rule"),
+            "and it must say where to go: {report}"
+        );
+        assert!(
+            !report.contains("--min-size"),
+            "naming a flag the user never passed is the bug this splits: {report}"
+        );
+    }
+
+    #[test]
+    fn one_below_a_rules_threshold_reads_singular() {
+        let plan = CleanPlan {
+            candidates: Vec::new(),
+            reclaimable: 0,
+            excluded: Vec::new(),
+            filtered_out: 0,
+            too_small: 0,
+            below_rule_minimum: 1,
+        };
+
+        let report = render_clean(&plan, None, Intent::DryRun);
+
+        assert!(
+            report.contains("1 more candidate is below their rule's own min-size"),
+            "{report}"
+        );
+        assert!(
+            report.contains("edit the rule to see it."),
+            "the pronoun agrees too: {report}"
+        );
     }
 
     #[test]
@@ -754,6 +840,7 @@ mod min_size_tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 0,
+            below_rule_minimum: 0,
         };
 
         assert!(!render_clean(&plan, None, Intent::DryRun).contains("--min-size"));
@@ -767,6 +854,7 @@ mod min_size_tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 1,
+            below_rule_minimum: 0,
         };
 
         assert!(

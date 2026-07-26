@@ -4,15 +4,19 @@ Find what's eating your disk. `disk-tools` walks a directory tree in parallel,
 measures **real on-disk (allocated) size**, and prints a size-sorted tree of the
 biggest consumers — or JSON.
 
-**v0.2 — scan, plus a cleanup engine.** `disk-tools clean` finds regenerable
-junk and stale files and offers to remove them **to the OS trash**. It is a dry
-run by default: nothing is deleted without `--apply`. Config and a TUI are
-planned on top of the same core. See the
-[concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision, the
-[v0.1 spec](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md) for the
-scanner and the
-[v0.2 spec](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) for
-the cleanup engine.
+**v0.3 — scan, a cleanup engine, and a config file.** `disk-tools clean` finds
+regenerable junk and stale files and offers to remove them **to the OS trash**.
+It is a dry run by default: nothing is deleted without `--apply`.
+
+What counts as junk is no longer fixed. Detection is a list of rules you can
+read and edit — `disk-tools config init` writes the defaults out with their
+comments — and a rule can be narrowed to a directory, given a size floor, or
+written from scratch. A TUI comes next, on the same core. See the
+[concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
+the specs for the
+[scanner](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md),
+the [cleanup engine](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md)
+and [configuration](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md).
 
 Cross-platform: macOS, Linux, Windows.
 
@@ -23,7 +27,9 @@ From a checkout:
 ```bash
 git clone https://github.com/alexkreskiyan/disk-tools.git
 cd disk-tools
-cargo install --path cli        # installs `disk-tools` into ~/.cargo/bin
+just install-cli                # installs into ~/.cargo/bin, and checks
+                                # that the copy you just built is the one
+                                # first on your PATH
 ```
 
 Or build without installing:
@@ -119,7 +125,7 @@ $ disk-tools scan project --depth 1
 
 ## Cleaning up
 
-`disk-tools clean <PATH>` looks for things that can be regenerated, and tells you
+`disk-tools clean [PATH]` looks for things that can be regenerated, and tells you
 what it would remove:
 
 ```console
@@ -142,13 +148,22 @@ your data. (`--purge` deletes outright instead; see [below](#purge).)
 
 ### What it looks for
 
-| Category | Matches | Requires |
-|----------|---------|----------|
+Five rules ship built in. They are ordinary rules, not a privileged set — `disk-tools
+config init` writes them into your config file, where you can narrow, disable or
+replace any of them. See [Configuration](#configuration).
+
+| Rule | Matches | Requires |
+|------|---------|----------|
 | `rust-target` | `target/` | a `Cargo.toml` beside it |
 | `node-modules` | `node_modules/` | — |
 | `pycache` | `__pycache__/`, loose `*.pyc` | — |
-| `user-caches` | `~/.cache`, `~/Library/Caches`, `%LOCALAPPDATA%\Temp` | — |
+| `user-caches` | `~/.cache`, `~/Library/Caches` | a known home directory |
+| `windows-temp` | `%LOCALAPPDATA%\Temp` | Windows |
 | `old` | anything untouched for `--older-than` | the flag; **off by default** |
+
+**List order is precedence.** The first rule that matches a path claims it, which
+is why an ancient `target/` is reported as `rust-target` rather than as `old` —
+and therefore keeps that rule's tier.
 
 A match is never descended into: a `node_modules` with 40,000 files is one
 candidate, not 40,000.
@@ -163,10 +178,16 @@ Without that check, someone's `target/` of photographs would be build output.
 anything inside them. **No flag overrides this**, including `--apply`. Note the
 tilde: `~/Library/Caches` is a candidate, `/Library/Caches` is not.
 
-**2. Two tiers.** The safe-list categories above are `auto` — regenerable, so
-removable without argument. Anything matched by age, and any `venv/` or `.venv/`
-whatever matched it, is `confirm`: recreating a virtualenv is less deterministic
-than a lockfile install. `--safe` offers only the `auto` tier.
+**2. Two tiers.** The built-in rules above are `auto` — regenerable, so removable
+without argument. Anything matched by age is `confirm`. `--safe` offers only the
+`auto` tier, and `--apply` refuses while anything `confirm` is still in the plan.
+
+> **A rule you write sets its own tier, and `auto` is a claim the tool cannot
+> check.** For the five built-ins, `auto` is this project's word that the content
+> comes back from a build or a lockfile install. For a rule in your config file it
+> is *your* word, and `--apply` will take it without asking. Nothing verifies that
+> what you marked regenerable is. If you are unsure, leave `tier` out — an
+> unstated tier is `confirm`.
 
 **3. The git guard.** Build output belonging to a project with uncommitted
 changes is left alone — you may be mid-work, and it only regenerates identically
@@ -190,11 +211,32 @@ The plan is printed first, to stderr, so the last thing you see before a deletio
 is the list of what is about to go. A partial failure exits non-zero and names
 every path still on disk.
 
-**`--apply` removes every candidate in the plan, `confirm` tier included** — the
-confirmation is that you read the list and typed the flag, and the count of
-non-regenerable items is said back to you before it acts. Use `--safe` if you
-want only the regenerable ones. (The concept asks for a per-target prompt here;
-that is a v0.3 question.)
+**`--apply` stops while anything not regenerable is in the plan:**
+
+```console
+$ disk-tools clean ~/code --older-than 90d --apply
+   40.0K  pycache       auto     ~/code/proj/__pycache__
+    1.1M  node-modules  auto     ~/code/proj/node_modules
+    4.0K  old           confirm  ~/code/proj/notes.txt
+
+Reclaimable: 1.2M
+
+Dry run — nothing was removed. Re-run with --apply.
+
+1 candidate is not regenerable, and nothing was removed.
+Add --safe to take only the regenerable ones, or --yes to take all of them.
+```
+
+It exits 2 and removes nothing at all — not even the two regenerable ones, since
+a partial removal you did not ask for is its own surprise. `--safe` takes the
+`auto` tier and leaves the rest; `--yes` takes everything, saying the count aloud
+first.
+
+There is no prompt. A real one needs stdin, TTY detection and a story for piped
+input, which belongs with the interactive browser; a refusal gives the same
+guarantee — nothing not regenerable goes without you saying so — for the price of
+one flag. Set `require-confirmation = false` in your config to get v0.2's
+behaviour back, where reading the list and typing `--apply` was the confirmation.
 
 ### Cutting the noise
 
@@ -210,6 +252,11 @@ Reclaimable: 2.0M
 
 150 more candidates are below --min-size.
 ```
+
+A rule can carry its own `min-size`, and the report says which threshold applied
+— "below `--min-size`" or "below their rule's own min-size". The remedies differ:
+one is a flag on this command line, the other a line in a file you have to go and
+find.
 
 **This narrows the plan, not just the display.** `scan --min-size` hides rows
 while the totals stay whole; here the report *is* the list of what `--apply` will
@@ -258,6 +305,92 @@ with anything outside the scanned tree is invisible. Sharing *within* the scan i
 detected on both platforms. Do not compare a Windows figure with a Unix one and
 conclude anything.
 
+## Configuration
+
+`disk-tools` reads one file. Write the defaults out and edit them:
+
+```console
+$ disk-tools config init
+/Users/you/.config/disk-tools/config.toml
+```
+
+It refuses to overwrite an existing file without `--force`, and the path it
+prints is the one it read: `$XDG_CONFIG_HOME/disk-tools/config.toml` when that is
+set — on **every** platform, since exporting it is you saying where your
+configuration lives — otherwise `%APPDATA%\disk-tools\config.toml` on Windows and
+`~/.config/disk-tools/config.toml` elsewhere. `--config <PATH>` overrides all of
+it.
+
+**No config file is an ordinary state**: the built-in rules apply and nothing is
+reported. A `--config` path that is *not there* is an error, because that is a
+typo and defaults quietly substituted for it would leave you cleaning under rules
+you never wrote.
+
+### A rule
+
+```toml
+[[rules]]
+name                = "github-node-modules"
+root                = "~/Projects/github"   # "*" means wherever the scan goes
+includes            = ["**/node_modules/"]  # trailing / is directory-only
+excludes            = ["**/vendor/**"]
+requires-sibling    = "Cargo.toml"          # a file that must be beside a match
+requires-clean-repo = true                  # skip if the repo has uncommitted work
+older-than          = "90d"
+min-size            = "10M"
+tier                = "confirm"             # unstated means confirm
+enabled             = true
+```
+
+`root` is required, and answers "what do I clean when no path is named". Use
+`"*"` for a rule that applies wherever the scan goes — which is what three of the
+five built-ins say.
+
+A trailing `/` in `includes` means **directory only**, as in gitignore. That is
+why `**/*.pyc` matches files and `**/node_modules/` does not match a file of that
+name.
+
+`~`, `%LOCALAPPDATA%` and `%APPDATA%` are expanded from your environment. **A
+token that cannot be resolved disables its rule** rather than widening it — an
+unknown home is never treated as "any home".
+
+`min-size` on a rule narrows the plan just as `--min-size` does, and the report
+says which of the two applied. They are different things to go and change.
+
+### Running with no path
+
+```console
+$ disk-tools clean
+disk-tools: examining /Users/you
+```
+
+With no `<PATH>`, `clean` walks the roots of your enabled rules, merged so none
+contains another. The default config roots `user-caches` at your home directory,
+so a bare `clean` walks all of it — slow, but a dry run. Narrow that rule, or
+name a path.
+
+If nothing names a directory it says so rather than reporting an empty plan:
+
+```console
+$ disk-tools clean
+disk-tools: no rule names a directory to clean.
+Pass a path, or give a rule a `root` other than "*".
+```
+
+### What the file cannot do
+
+| Not configurable | Why |
+|------------------|-----|
+| **The denylist** | A denylist a config can edit is not a denylist. `/System`, `/Windows`, `/Library/Caches` and the rest stay in the binary, and no rule, flag or file reaches them |
+| `--purge` | Deleting past the trash stays an explicit choice on one run. A default in a file would make it invisible |
+| `--allow-dirty` | Same: a file that silently disabled the git guard would hide that it had |
+| `--yes` | A file answering yes in advance cancels the confirmation, and cancels it invisibly |
+
+One limitation worth knowing: a true/false setting turned **on** in the file
+cannot be turned back off from the command line, because a flag can only be
+passed or not passed. For `[clean] safe` that direction is the right one — the
+file may only make a cleanup more cautious.
+
 ## Flags
 
 `disk-tools scan <PATH>`:
@@ -272,13 +405,17 @@ conclude anything.
 | `--one-file-system` | Stop at filesystem boundaries instead of descending into other mounts (**Unix only** — see limitations) | scan |
 | `--json` | Emit JSON instead of the tree report | display |
 | `-v`, `--verbose` | List every skipped entry instead of just the first ten. **Global** — works with any verb | display |
+| `--config <PATH>` | Read this file instead of the one in your config directory. **Global** | — |
 | `-h`, `--help` / `-V`, `--version` | Print help / version | — |
 
-`disk-tools clean <PATH>` takes its own:
+`disk-tools clean [PATH]` takes its own. **The path is optional** — without it,
+the roots of your configured rules are walked; see
+[Configuration](#running-with-no-path).
 
 | Flag | Effect |
 |------|--------|
 | `--apply` | **Actually remove**, to the OS trash. Without it nothing is touched |
+| `--yes` | Also remove what is not regenerable. Without it `--apply` refuses while any `confirm`-tier candidate remains. Requires `--apply` |
 | `--safe` | Offer only the `auto` tier — regenerable output, nothing needing confirmation |
 | `--min-size <SIZE>` | Ignore anything smaller. **Narrows the plan, not just the printout** — unlike `scan`'s flag of the same name, what is shown is what `--apply` removes |
 | `--purge` | Delete **permanently** instead of trashing. Nothing can be put back; requires `--apply` |
@@ -367,7 +504,8 @@ Cleanup, first — these are the ones worth reading before `--apply`:
 | **`(shared)` is not detectable across the scan boundary on Windows** | See [Reclaimable is an upper bound](#reclaimable-is-an-upper-bound). Absence of the flag there is not evidence of unshared content. |
 | **Removing to the trash costs ~230 ms per batch on macOS** | Every trash operation is an `osascript` round-trip to Finder. Removals are batched into one call, so the cost is per *run* rather than per candidate — 60 small directories take 1.4 s, against 0.02 s for `--purge`. |
 | **A dry run costs ~23 ms per repository** | The git guard spawns `git status --porcelain` once per repository. Over 50 dirty Rust projects a `clean` is 1.2 s against 15 ms for a plain scan — 80×. `--allow-dirty` skips it entirely and is free. [Measured.](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) |
-| **`--apply` does not prompt per target** | Even for the `confirm` tier. See [Removing](#removing). |
+| **`--apply` refuses rather than prompting** | For the `confirm` tier it stops and asks you to add `--safe` or `--yes`, rather than asking about each path. A real prompt needs stdin, TTY detection and a story for piped input, which belongs with the interactive browser. See [Removing](#removing). |
+| **`auto` on a rule you wrote is unverified** | The tool takes your word that the content regenerates, and removes it without asking. For the five built-in rules `auto` is this project's claim; for yours it is yours. See [Two tiers](#four-things-stand-between-a-match-and-a-deletion). |
 
 And the scanner's, unchanged from v0.1:
 

@@ -8,11 +8,37 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// An empty directory to stand in for the runner's own home and config.
+///
+/// Both matter, and both were found the hard way.
+///
+/// `XDG_CONFIG_HOME`: without it every test reads the config of whoever runs
+/// them, and a `depth` or `n` in that file silently changes what the binary
+/// prints. Three tests failed that way the moment the config reached behaviour.
+///
+/// `HOME`: `clean` with no path walks the roots of the rules, and the built-in
+/// `user-caches` is rooted at the home directory. Without this the suite scanned
+/// the developer's entire home — 93 seconds, and every unreadable directory in
+/// it reported as a skip.
+fn isolated() -> tempfile::TempDir {
+    tempfile::tempdir().expect("tempdir")
+}
+
+fn spawn(args: &[&str], home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_disk-tools"));
+    command
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("LOCALAPPDATA")
+        .env_remove("APPDATA")
+        .args(args);
+    command
+}
+
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_disk-tools"))
-        .args(args)
-        .output()
-        .expect("spawn disk-tools")
+    let home = isolated();
+    spawn(args, home.path()).output().expect("spawn disk-tools")
 }
 
 /// Run the binary, read one small chunk of stdout, then close the pipe —
@@ -22,8 +48,8 @@ fn run(args: &[&str]) -> std::process::Output {
 /// (64 KiB is typical); otherwise the child writes everything before the reader
 /// goes away and the closed-pipe path is never taken.
 fn run_with_stdout_closed_early(args: &[&str]) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_disk-tools"))
-        .args(args)
+    let home = isolated();
+    let mut child = spawn(args, home.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -560,14 +586,51 @@ fn bare_path_still_scans_exactly_as_before() {
 }
 
 #[test]
-fn clean_without_a_path_exits_two() {
+fn clean_without_a_path_announces_what_it_walks() {
+    // The built-in `user-caches` is rooted at the home directory, so a bare
+    // `clean` walks all of it. On a real machine that is minutes; nobody should
+    // have to guess why.
     let output = run(&["clean"]);
 
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "a missing path is a usage error, got {:?}",
+    assert!(output.status.success(), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("examining"),
+        "a walk the user did not name must say where it is going:\n{stderr}"
+    );
+}
+
+/// Every rule unrooted — `root = "*"` — so nothing names a directory to walk.
+/// Not an error, and not an empty plan either: "nothing to clean" is a claim
+/// about the disk, and this is a statement about the configuration.
+#[test]
+fn a_config_that_names_no_directory_says_so() {
+    let home = isolated();
+    let config = write(
+        home.path(),
+        "config.toml",
+        "[[rules]]\nname = \"anywhere\"\nroot = \"*\"\nincludes = [\"**/x/\"]\n",
+    );
+
+    let output = run(&["--config", config.to_str().expect("utf8"), "clean"]);
+
+    assert!(
+        output.status.success(),
+        "a configuration that covers nothing is not an error, got {:?}",
         output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no rule names a directory"),
+        "silence would read as 'nothing to clean':\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Pass a path") && stderr.contains("root"),
+        "and the message must name both remedies:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("examining"),
+        "nothing was walked:\n{stderr}"
     );
 }
 
@@ -799,4 +862,568 @@ fn purge_without_apply_is_a_usage_error() {
         output.status
     );
     assert_eq!(before, snapshot(dir.path()), "and nothing was removed");
+}
+
+// ---- the configuration file ---------------------------------------------
+//
+// Driven through `--config` so that no test here depends on — or writes to —
+// the real config directory of whoever is running them.
+
+/// A `clean` fixture with one `node_modules` in it.
+fn node_modules_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("node_modules")).expect("mkdir");
+    std::fs::write(dir.path().join("node_modules/lib.bin"), vec![b'x'; 4096]).expect("write");
+    dir
+}
+
+fn write(dir: &Path, name: &str, text: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, text).expect("write config");
+    path
+}
+
+/// The point of the whole feature: a rule the user wrote is the rule that runs.
+#[test]
+fn a_configured_rule_replaces_the_builtins() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+    let config = write(
+        home.path(),
+        "config.toml",
+        "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"**/node_modules/\"]\ntier = \"auto\"\n",
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("mine"),
+        "the report names the rule that claimed it:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("node-modules"),
+        "and the built-in rule it replaced is gone:\n{stdout}"
+    );
+}
+
+/// A config file is the input to a delete operation. If it cannot be
+/// understood, the rules are unknown — so nothing is scanned and nothing runs.
+#[test]
+fn a_malformed_config_stops_the_program_before_scanning() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+    let config = write(home.path(), "config.toml", "[scan]\none-file-system = \n");
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(
+        output.stdout.is_empty(),
+        "nothing may be reported: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("line 2"),
+        "must locate the mistake:\n{stderr}"
+    );
+}
+
+/// A named file that is not there is a typo, not a request for defaults.
+#[test]
+fn an_explicit_config_that_is_absent_is_an_error() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let output = run(&[
+        "--config",
+        home.path().join("nope.toml").to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nope.toml"),
+        "the message must name the file it looked for"
+    );
+}
+
+/// A typo or a newer version's key. Naming it is enough; refusing to run would
+/// make the tool brittle and protect nothing.
+#[test]
+fn an_unknown_key_warns_but_the_run_continues() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+    let config = write(
+        home.path(),
+        "config.toml",
+        "[scan]\none-file-sistem = true\n",
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("one-file-sistem"),
+        "the typo must be findable:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("node-modules"),
+        "and the built-in rules still ran"
+    );
+}
+
+/// A rule that cannot be understood is refused by name — an error about "a
+/// rule" in a file with twelve of them is not one a user can act on.
+#[test]
+fn a_rule_missing_its_root_is_refused_by_name() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+    let config = write(
+        home.path(),
+        "config.toml",
+        "[[rules]]\nname = \"mine\"\nincludes = [\"**/x/\"]\n",
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("rule `mine`"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn config_init_writes_a_usable_file_and_prints_its_path() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = home.path().join("nested").join("config.toml");
+
+    let output = run(&["--config", target.to_str().expect("utf8"), "config", "init"]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        target.to_str().expect("utf8"),
+        "the path is the result, so it goes to stdout"
+    );
+
+    // And the file it wrote is one the tool can read back.
+    let fixture = node_modules_dir();
+    let reread = run(&[
+        "--config",
+        target.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+    assert!(reread.status.success(), "{:?}", reread.status);
+    assert!(String::from_utf8_lossy(&reread.stdout).contains("node-modules"));
+}
+
+/// A config is something a user edits, and "show me the defaults" must not be
+/// able to throw those edits away.
+#[test]
+fn config_init_refuses_to_overwrite_without_force() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = write(home.path(), "config.toml", "# mine\n");
+
+    let output = run(&["--config", target.to_str().expect("utf8"), "config", "init"]);
+
+    assert!(!output.status.success(), "{:?}", output.status);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--force"));
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read"),
+        "# mine\n",
+        "the edits are still there"
+    );
+
+    let forced = run(&[
+        "--config",
+        target.to_str().expect("utf8"),
+        "config",
+        "init",
+        "--force",
+    ]);
+    assert!(forced.status.success(), "{:?}", forced.status);
+    assert!(
+        std::fs::read_to_string(&target)
+            .expect("read")
+            .contains("[[rules]]")
+    );
+}
+
+/// A `node_modules` of a known size under `dir`.
+fn seed_node_modules(dir: &Path, bytes: usize) {
+    let nested = dir.join("node_modules");
+    std::fs::create_dir_all(&nested).expect("mkdir");
+    std::fs::write(nested.join("lib.bin"), vec![b'x'; bytes]).expect("write");
+}
+
+/// A config rooting one rule at each of `roots`.
+fn rules_rooted_at(at: &Path, roots: &[&Path]) -> std::path::PathBuf {
+    let mut text = String::new();
+    for (index, root) in roots.iter().enumerate() {
+        text.push_str(&format!(
+            "[[rules]]\nname = \"r{index}\"\nroot = {:?}\nincludes = [\"**/node_modules/\"]\ntier = \"auto\"\n\n",
+            root.to_str().expect("utf8")
+        ));
+    }
+    write(at, "config.toml", &text)
+}
+
+/// The promise Task 2 made when it required `root` in the file.
+#[test]
+fn two_rule_roots_are_both_walked() {
+    let home = isolated();
+    let a = home.path().join("a");
+    let b = home.path().join("b");
+    seed_node_modules(&a, 4096);
+    seed_node_modules(&b, 4096);
+    let config = rules_rooted_at(home.path(), &[&a, &b]);
+
+    let output = run(&["--config", config.to_str().expect("utf8"), "clean"]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(a.join("node_modules").to_str().expect("utf8")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(b.join("node_modules").to_str().expect("utf8")),
+        "{stdout}"
+    );
+}
+
+/// A root inside another must not be walked twice.
+///
+/// Asserted on the **total**, not on the number of lines: a duplicated candidate
+/// is what doubles `reclaimable`, and that figure is what a user reads to decide
+/// whether the cleanup is worth doing.
+#[test]
+fn a_nested_root_does_not_double_the_total() {
+    let home = isolated();
+    let outer = home.path().join("outer");
+    let inner = outer.join("inner");
+    seed_node_modules(&inner, 100_000);
+
+    let both = rules_rooted_at(home.path(), &[&outer, &inner]);
+    let just_outer = {
+        let dir = isolated();
+        let path = rules_rooted_at(dir.path(), &[&outer]);
+        std::fs::read_to_string(&path).expect("read")
+    };
+    let only = write(home.path(), "only.toml", &just_outer);
+
+    let with_both = run(&["--config", both.to_str().expect("utf8"), "clean"]);
+    let with_one = run(&["--config", only.to_str().expect("utf8"), "clean"]);
+
+    assert!(with_both.status.success() && with_one.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&with_both.stdout),
+        String::from_utf8_lossy(&with_one.stdout),
+        "the nested root adds nothing, so the report and the total are unchanged"
+    );
+}
+
+/// A rule's root is a description, and descriptions go stale. One directory that
+/// has moved is no reason to leave the others uncleaned.
+#[test]
+fn a_rule_root_that_is_gone_is_skipped_not_fatal() {
+    let home = isolated();
+    let real = home.path().join("real");
+    seed_node_modules(&real, 4096);
+    let vanished = home.path().join("vanished");
+    let config = rules_rooted_at(home.path(), &[&vanished, &real]);
+
+    let output = run(&["--config", config.to_str().expect("utf8"), "clean"]);
+
+    assert!(
+        output.status.success(),
+        "a stale root must not stop the run, got {:?}",
+        output.status
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(real.join("node_modules").to_str().expect("utf8")),
+        "the root that is still there was cleaned"
+    );
+}
+
+/// The other half of that decision: a path the **user** named and that is not
+/// there is a typo, and an empty report would hide it.
+#[test]
+fn a_named_path_that_is_gone_is_still_an_error() {
+    let home = isolated();
+
+    let output = run(&["clean", home.path().join("nope").to_str().expect("utf8")]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("nope"));
+}
+
+// ---- confirmation --------------------------------------------------------
+//
+// The concept asks that a non-regenerable candidate never go without explicit
+// consent. v0.3 gives that as a refusal rather than a prompt, which is why every
+// test below is an ordinary one: refusing deletes nothing, so the headline
+// property is checkable in a normal run rather than behind `just smoke-trash`.
+//
+// The three that do get past the refusal pass `--purge`, and not for speed. The
+// refusal is decided before the removal method matters, so either flag exercises
+// the same branch — but `--apply` alone would put a temp fixture into the real
+// Trash of whoever ran the suite, which is exactly what this project keeps
+// behind `#[ignore]`. `--purge` confines the deletion to the temp directory.
+// (It is also 70x faster: measured at 121 s for these three against the trash.)
+
+/// A `node_modules` (auto tier) beside something only the age rule can claim,
+/// which is confirm tier.
+fn mixed_tiers_dir() -> tempfile::TempDir {
+    let dir = cleanable_dir();
+    let stale = dir.path().join("notes.txt");
+    std::fs::write(&stale, b"old").expect("write");
+    // 2001-01-01, comfortably past any threshold a test will use.
+    let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(978_307_200);
+    filetime_set(&stale, long_ago);
+    dir
+}
+
+fn filetime_set(path: &Path, when: std::time::SystemTime) {
+    let secs = when
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    // No dev-dependency for this: `touch -t` is on every platform CI runs, and
+    // the alternative is a crate pulled in for one line of a test.
+    let stamp = std::process::Command::new("touch")
+        .arg("-d")
+        .arg(format!("@{secs}"))
+        .arg(path)
+        .status();
+    if !matches!(stamp, Ok(status) if status.success()) {
+        // BSD `touch` spells it differently.
+        let _ = std::process::Command::new("touch")
+            .args(["-t", "200101010000"])
+            .arg(path)
+            .status();
+    }
+}
+
+/// The headline property: `--apply` alone does not take what cannot be
+/// regenerated.
+#[test]
+fn apply_refuses_while_a_confirm_tier_candidate_remains() {
+    let dir = mixed_tiers_dir();
+    let before = snapshot(dir.path());
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--apply",
+    ]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an incomplete invitation is a usage answer, got {:?}",
+        output.status
+    );
+    assert_eq!(
+        before,
+        snapshot(dir.path()),
+        "and absolutely nothing was removed"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not regenerable") && stderr.contains("nothing was removed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--safe") && stderr.contains("--yes"),
+        "both remedies must be named:\n{stderr}"
+    );
+}
+
+/// The refusal prints the plan as a **dry run**. Printing "about to apply" and
+/// then declining would make the last thing a user reads before the outcome the
+/// one sentence in the report that is false — the defect `Intent` exists for.
+#[test]
+fn the_refusal_does_not_promise_a_removal() {
+    let dir = mixed_tiers_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--apply",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Dry run — nothing was removed"),
+        "the plan must close as a dry run:\n{stdout}"
+    );
+}
+
+/// A plan of only regenerable candidates needs no confirmation, so `--apply`
+/// proceeds. This is also why every pre-existing `--apply` test still passes.
+#[test]
+fn apply_proceeds_when_nothing_needs_confirming() {
+    let dir = cleanable_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--apply",
+        "--purge",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Add --safe"),
+        "an auto-tier plan must not be refused:\n{stderr}"
+    );
+}
+
+/// `--safe` keeps confirm-tier candidates out of the plan, so the count is zero
+/// and there is nothing to refuse. Pinned rather than left a coincidence.
+#[test]
+fn safe_removes_the_regenerable_ones_without_a_refusal() {
+    let dir = mixed_tiers_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--safe",
+        "--apply",
+        "--purge",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Add --safe"),
+        "--safe already answered the question:\n{stderr}"
+    );
+}
+
+/// Turning the setting off restores v0.2's behaviour: the confirmation is having
+/// read the list and typed `--apply`.
+#[test]
+fn the_setting_can_be_turned_off() {
+    let dir = mixed_tiers_dir();
+    let home = isolated();
+    let config = write(
+        home.path(),
+        "config.toml",
+        "[clean]\nrequire-confirmation = false\n",
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--apply",
+        "--purge",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Add --safe"),
+        "the file said not to ask:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("removing anyway, as asked"),
+        "but the count is still said out loud:\n{stderr}"
+    );
+}
+
+/// "I confirm" without "remove" is a statement about nothing.
+#[test]
+fn yes_without_apply_is_a_usage_error() {
+    let dir = cleanable_dir();
+    let before = snapshot(dir.path());
+
+    let output = run(&["clean", dir.path().to_str().expect("utf8"), "--yes"]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert_eq!(before, snapshot(dir.path()));
+}
+
+/// The count is said aloud only when there is something to say.
+///
+/// `confirm > 0` mutated to `>=` survived every test: with `--yes` on a plan of
+/// only regenerable candidates the tool would have announced "0 of these are not
+/// regenerable — removing anyway", which is both false and alarming.
+#[test]
+fn nothing_is_announced_when_nothing_needs_confirming() {
+    let dir = cleanable_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--apply",
+        "--purge",
+        "--yes",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not regenerable"),
+        "an all-auto plan has nothing to say about confirmation:\n{stderr}"
+    );
+}
+
+/// The refusal counts in words as well as digits. One candidate is "1 candidate
+/// is", not "1 candidates are".
+#[test]
+fn one_refused_candidate_reads_singular() {
+    let dir = mixed_tiers_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--apply",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 candidate is not regenerable"),
+        "the verb agrees with the noun, not only the noun with the count:\n{stderr}"
+    );
 }

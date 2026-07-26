@@ -32,6 +32,7 @@ mod detect;
 mod git;
 mod options;
 mod paths;
+mod rules;
 mod size;
 #[cfg(feature = "trash")]
 mod trash;
@@ -40,9 +41,10 @@ mod walk;
 #[cfg(windows)]
 mod windows_dir;
 
-pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, Tier, plan};
-pub use detect::{Age, Category, CategorySet, DetectOptions, Detection, UserDirs, detect};
+pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, plan};
+pub use detect::{DetectOptions, Detection, detect};
 pub use options::ScanOptions;
+pub use rules::{Rule, RuleError, Rules, Tier, UserDirs, age_rule, builtin_rules};
 #[cfg(feature = "trash")]
 pub use trash::{CleanOutcome, Removal, TrashFailure, apply, move_to_trash};
 pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
@@ -72,7 +74,7 @@ pub fn scan(options: &ScanOptions) -> ScanTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::time::{Duration, Instant, SystemTime};
 
     /// Diagnostic, not an assertion: prints where `scan` spends its time.
     ///
@@ -104,17 +106,53 @@ mod tests {
         let dedup = start.elapsed();
 
         let start = Instant::now();
-        let tree = tree::aggregate(walked.entries, options.root.as_path());
+        let root_node = tree::aggregate(walked.entries, options.root.as_path());
         let aggregate = start.elapsed();
 
-        let total = walk + dedup + aggregate;
+        let skipped = walked.skipped.len();
+        let groups = link_groups.len();
+        let allocated = root_node.allocated;
+        let tree = ScanTree {
+            root: root_node,
+            skipped: walked.skipped,
+            link_groups,
+        };
+
+        // The detection pass, which the three phases above never included. It is
+        // timed with the defaults a first `clean` run gets — every built-in rule
+        // on, the age rule off — and with a real home, so the rooted cache rules
+        // are exercised rather than dropped.
+        let dirs = UserDirs {
+            home: std::env::var_os("HOME").map(Into::into),
+            ..UserDirs::default()
+        };
+        let detect_options = DetectOptions {
+            rules: Rules::builtin(&dirs),
+            now: SystemTime::now(),
+        };
+        let start = Instant::now();
+        let found = detect::detect(&tree, &detect_options);
+        let detect = start.elapsed();
+
+        // The upper bound, and the number a rule engine must be measured
+        // against. Above, a claimed `node_modules` is never descended into, so
+        // the pass skips whole subtrees and its time is not per-node over the
+        // whole tree. Here one rule matches everything the walk can reach and
+        // claims none of it — an impossible `older_than` — so the DFS visits
+        // every node and pays a full glob match on each.
+        let none = DetectOptions {
+            rules: Rules::new(vec![age_rule(Duration::from_secs(1))], &dirs).expect("compile"),
+            now: SystemTime::UNIX_EPOCH,
+        };
+        let start = Instant::now();
+        let full = detect::detect(&tree, &none);
+        let detect_full = start.elapsed();
+        assert!(full.is_empty(), "the upper-bound pass must claim nothing");
+
+        let total = walk + dedup + aggregate + detect;
         let share = |d: std::time::Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64();
 
-        println!(
-            "\n{root} — {entries} entries, {} skipped, {} hardlink groups",
-            walked.skipped.len(),
-            link_groups.len()
-        );
+        println!("\n{root} — {entries} entries, {skipped} skipped, {groups} hardlink groups");
         println!("  walk       {:>9.1?}  {:>5.1}%", walk, share(walk));
         println!("  dedup      {:>9.1?}  {:>5.1}%", dedup, share(dedup));
         println!(
@@ -122,11 +160,20 @@ mod tests {
             aggregate,
             share(aggregate)
         );
+        println!(
+            "  detect     {:>9.1?}  {:>5.1}%   {} candidates",
+            detect,
+            share(detect),
+            found.len()
+        );
+        println!(
+            "  detect*    {:>9.1?}          every node visited, nothing claimed",
+            detect_full
+        );
         println!("  total      {total:>9.1?}");
         println!(
-            "  threads    {}\n  root total {} bytes",
+            "  threads    {}\n  root total {allocated} bytes",
             rayon::current_num_threads(),
-            tree.allocated
         );
     }
 

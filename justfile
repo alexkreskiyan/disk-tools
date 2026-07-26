@@ -31,7 +31,29 @@ release:
     cargo build --release
     echo
     echo "binary:  $PWD/target/release/disk-tools"
-    echo "install: cargo install --path cli"
+    echo "install: just install-cli"
+
+# The `which` check is not ceremony. A `disk-tools` left in /usr/local/bin by an
+# earlier install shadows ~/.cargo/bin, and `cargo install` says nothing about
+# it — so the next run silently exercises the old binary, and its unfamiliar
+# errors get blamed on the new code.
+
+# Install the CLI into ~/.cargo/bin.
+install-cli:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo install --path cli
+    echo
+    installed="$(command -v disk-tools || true)"
+    expected="${CARGO_HOME:-$HOME/.cargo}/bin/disk-tools"
+    if [ "$installed" = "$expected" ]; then
+        echo "on PATH: $installed — $(disk-tools --version)"
+    elif [ -z "$installed" ]; then
+        echo "WARNING: nothing named disk-tools is on PATH; add $expected to it."
+    else
+        echo "WARNING: $installed comes first on PATH, not the copy just installed"
+        echo "         at $expected. Remove the former or reorder PATH."
+    fi
 
 # =============================================================================
 # Quality
