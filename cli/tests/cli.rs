@@ -8,8 +8,20 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// An empty directory to point `XDG_CONFIG_HOME` at.
+///
+/// Without it every test here reads the config of whoever is running them, and
+/// a `depth` or `n` in that file silently changes what the binary prints. That
+/// is not hypothetical: it is how these tests first failed once the config was
+/// wired to behaviour.
+fn isolated() -> tempfile::TempDir {
+    tempfile::tempdir().expect("tempdir")
+}
+
 fn run(args: &[&str]) -> std::process::Output {
+    let empty = isolated();
     Command::new(env!("CARGO_BIN_EXE_disk-tools"))
+        .env("XDG_CONFIG_HOME", empty.path())
         .args(args)
         .output()
         .expect("spawn disk-tools")
@@ -22,7 +34,9 @@ fn run(args: &[&str]) -> std::process::Output {
 /// (64 KiB is typical); otherwise the child writes everything before the reader
 /// goes away and the closed-pipe path is never taken.
 fn run_with_stdout_closed_early(args: &[&str]) -> std::process::Output {
+    let empty = isolated();
     let mut child = Command::new(env!("CARGO_BIN_EXE_disk-tools"))
+        .env("XDG_CONFIG_HOME", empty.path())
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

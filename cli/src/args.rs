@@ -72,23 +72,35 @@ pub struct ScanArgs {
     #[arg(value_name = "PATH")]
     pub root: PathBuf,
 
-    /// Show at most this many entries.
+    // Every field below that a config file can also set is an `Option`, and
+    // none of them carries a clap `default_value`. That is not tidiness: with a
+    // default applied here, `--min-size 0` and an absent `--min-size` arrive
+    // identical, and the first has to beat the file while the second defers to
+    // it. Defaults are applied by the merge in `resolve`, and stated in the doc
+    // comments — a flag whose default is written down nowhere is undocumented.
+    /// Show at most this many entries. Default: all of them.
     #[arg(short = 'n', long = "number")]
     pub number: Option<usize>,
 
-    /// Hide entries below this size, e.g. 1M, 512K, 2G (1024-based).
-    #[arg(long = "min-size", default_value = "0", value_parser = parse_size)]
-    pub min_size: u64,
+    /// Hide entries below this size, e.g. 1M, 512K, 2G (1024-based). Default: 0.
+    #[arg(long = "min-size", value_parser = parse_size)]
+    pub min_size: Option<u64>,
 
     /// Print at most this many levels deep (display only; traversal is always full).
+    ///
+    /// 0 shows the root alone. Default: unlimited.
     #[arg(long)]
     pub depth: Option<usize>,
 
     /// Rank and report apparent size rather than allocated size.
+    ///
+    /// A config file can turn this on; the command line cannot turn it back off.
     #[arg(long)]
     pub apparent: bool,
 
     /// Stop at filesystem boundaries instead of descending into other mounts.
+    ///
+    /// A config file can turn this on; the command line cannot turn it back off.
     #[arg(long = "one-file-system")]
     pub one_file_system: bool,
 
@@ -105,6 +117,10 @@ pub struct CleanArgs {
 
     /// Only offer regenerable safe-list categories; skip anything needing
     /// per-item confirmation.
+    ///
+    /// A config file can turn this on; the command line cannot turn it back off
+    /// — which for this one is the right direction, since the file may only make
+    /// a cleanup more cautious.
     #[arg(long)]
     pub safe: bool,
 
@@ -120,9 +136,12 @@ pub struct CleanArgs {
     #[arg(long = "allow-dirty")]
     pub allow_dirty: bool,
 
-    /// Ignore anything smaller than this, e.g. 1M, 512K (1024-based).
-    #[arg(long = "min-size", default_value = "0", value_parser = parse_size)]
-    pub min_size: u64,
+    /// Ignore anything smaller than this, e.g. 1M, 512K (1024-based). Default: 0.
+    ///
+    /// Unlike the scan flag of the same name this narrows the plan itself, so a
+    /// candidate it hides is one `--apply` will not remove.
+    #[arg(long = "min-size", value_parser = parse_size)]
+    pub min_size: Option<u64>,
 
     /// Also offer anything untouched for this long: 90d, 6m, 1y.
     #[arg(long = "older-than", value_parser = parse_duration, value_name = "DURATION")]
@@ -184,15 +203,27 @@ impl Args {
         } = env;
 
         match self.command {
+            // Flag, then file, then built-in default — the one place the
+            // order is expressed, so that no setting can quietly follow a
+            // different one.
+            //
+            // Booleans are the exception and it is a limitation, not a choice:
+            // clap distinguishes only "passed" from "not passed", so `||` is
+            // the whole of the merge and a file that turns one on cannot be
+            // overruled from the command line. Undoing that would take a
+            // `--no-…` counterpart per flag.
             Command::Scan(scan) => Ok(Mode::Scan {
                 options: ScanOptions {
                     root: scan.root,
-                    min_size: scan.min_size,
-                    depth: scan.depth,
-                    apparent: scan.apparent,
-                    one_file_system: scan.one_file_system,
+                    min_size: scan.min_size.or(config.report.min_size).unwrap_or(0),
+                    depth: scan.depth.or(config.report.depth),
+                    apparent: scan.apparent || config.report.apparent.unwrap_or(false),
+                    one_file_system: scan.one_file_system
+                        || config.scan.one_file_system.unwrap_or(false),
                 },
-                number: scan.number,
+                // `None` all the way down means "every entry", which is what a
+                // scan has always printed without `-n`.
+                number: scan.number.or(config.report.number),
                 json: scan.json,
             }),
 
@@ -209,6 +240,7 @@ impl Args {
                 // reported as build output rather than merely as something old,
                 // which is what decides its tier.
                 let mut rules = config.rules;
+                let clean_settings = config.clean;
                 if let Some(older_than) = clean.older_than {
                     rules.push(age_rule(older_than));
                 }
@@ -224,9 +256,11 @@ impl Args {
                             now,
                         },
                         user_dirs,
-                        safe_only: clean.safe,
+                        safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
+                        // Deliberately not configurable: a file that quietly
+                        // disabled the git guard would hide the disabling.
                         allow_dirty: clean.allow_dirty,
-                        min_size: clean.min_size,
+                        min_size: clean.min_size.unwrap_or(0),
                     }),
                     apply: clean.apply,
                     removal: if clean.purge {
@@ -363,6 +397,141 @@ mod tests {
         Ok(parse(args)?
             .resolve(env(Config::default()))
             .expect("the built-in rules compile"))
+    }
+
+    // ---- precedence: flag > file > default -------------------------------
+
+    /// Resolve `args` against a config file built from `toml`.
+    fn against(toml: &str, args: &[&str]) -> Mode {
+        let config = crate::config::parse_for_test(toml);
+        parse(args)
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve")
+    }
+
+    fn scan_with(toml: &str, args: &[&str]) -> ScanOptions {
+        match against(toml, args) {
+            Mode::Scan { options, .. } => options,
+            other => panic!("expected a scan, got {other:?}"),
+        }
+    }
+
+    /// One row per overridable setting, because the whole point is that they all
+    /// behave the same way. A setting that quietly followed a different order
+    /// would be the bug this task exists to prevent.
+    #[test]
+    fn every_setting_takes_the_flag_then_the_file_then_the_default() {
+        // (setting, config, flag, expected)
+        let file = "[report]\nmin-size = \"1M\"\nn = 5\ndepth = 3\n";
+
+        assert_eq!(
+            scan_with("", &["scan", "/x"]).min_size,
+            0,
+            "no file, no flag: the built-in default"
+        );
+        assert_eq!(
+            scan_with(file, &["scan", "/x"]).min_size,
+            1_048_576,
+            "the file, when the flag is absent"
+        );
+        assert_eq!(
+            scan_with(file, &["scan", "/x", "--min-size", "2M"]).min_size,
+            2_097_152,
+            "the flag, over the file"
+        );
+
+        assert_eq!(scan_with("", &["scan", "/x"]).depth, None);
+        assert_eq!(scan_with(file, &["scan", "/x"]).depth, Some(3));
+        assert_eq!(
+            scan_with(file, &["scan", "/x", "--depth", "1"]).depth,
+            Some(1)
+        );
+
+        let number = |toml: &str, args: &[&str]| match against(toml, args) {
+            Mode::Scan { number, .. } => number,
+            other => panic!("expected a scan, got {other:?}"),
+        };
+        assert_eq!(number("", &["scan", "/x"]), None);
+        assert_eq!(number(file, &["scan", "/x"]), Some(5));
+        assert_eq!(number(file, &["scan", "/x", "-n", "9"]), Some(9));
+    }
+
+    /// The trap this task exists for.
+    ///
+    /// `--min-size` used to carry `default_value = "0"`, which made an explicit
+    /// zero and an absent flag arrive identical. With a file in play they are
+    /// opposite statements: one overrides it, the other defers to it. Nothing
+    /// short of dropping the clap default can tell them apart.
+    #[test]
+    fn an_explicit_zero_beats_the_file() {
+        let file = "[report]\nmin-size = \"1M\"\n";
+
+        assert_eq!(
+            scan_with(file, &["scan", "/x", "--min-size", "0"]).min_size,
+            0,
+            "the user said zero, so it is zero"
+        );
+        assert_eq!(
+            scan_with(file, &["scan", "/x"]).min_size,
+            1_048_576,
+            "and saying nothing still defers to the file"
+        );
+    }
+
+    /// `--depth 0` shows the root alone, so `depth = 0` in the file must mean
+    /// the same. Giving one value two opposite meanings is how a `config init`
+    /// would have silently collapsed every report to one line.
+    #[test]
+    fn zero_depth_means_the_root_alone_in_both_places() {
+        assert_eq!(
+            scan_with("[report]\ndepth = 0\n", &["scan", "/x"]).depth,
+            Some(0)
+        );
+        assert_eq!(
+            scan_with("", &["scan", "/x", "--depth", "0"]).depth,
+            Some(0)
+        );
+    }
+
+    /// A file may turn a boolean on; the command line cannot turn it back off,
+    /// since clap knows only "passed" and "not passed". Pinned as a limitation
+    /// rather than left to be discovered.
+    #[test]
+    fn a_boolean_set_in_the_file_cannot_be_unset_by_a_flag() {
+        let file = "[scan]\none-file-system = true\n\n[report]\napparent = true\n";
+
+        let from_file = scan_with(file, &["scan", "/x"]);
+        assert!(from_file.apparent);
+        assert!(from_file.one_file_system);
+
+        // There is no flag that turns either back off — which is the limitation.
+        let with_flags = scan_with(file, &["scan", "/x", "--apparent", "--one-file-system"]);
+        assert!(with_flags.apparent);
+        assert!(with_flags.one_file_system);
+    }
+
+    #[test]
+    fn the_file_can_only_make_a_cleanup_more_cautious() {
+        let clean = |toml: &str, args: &[&str]| match against(toml, args) {
+            Mode::Clean { clean, .. } => *clean,
+            other => panic!("expected a clean, got {other:?}"),
+        };
+
+        assert!(!clean("", &["clean", "/x"]).safe_only);
+        assert!(clean("[clean]\nsafe = true\n", &["clean", "/x"]).safe_only);
+        assert!(clean("", &["clean", "/x", "--safe"]).safe_only);
+    }
+
+    /// `--allow-dirty` and `--purge` have no key in the file, and that is the
+    /// point: a config that silently disabled the git guard, or deleted past the
+    /// trash, would hide the fact that it had.
+    #[test]
+    fn the_dangerous_flags_have_no_file_counterpart() {
+        let warnings =
+            crate::config::parse_for_test("[clean]\nallow-dirty = true\npurge = true\n").warnings;
+
+        assert_eq!(warnings, vec!["clean.allow-dirty", "clean.purge"]);
     }
 
     /// `-n` never reaches the core, so it is read off the resolved mode rather

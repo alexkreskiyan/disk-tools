@@ -39,16 +39,29 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_CONFIG: &str = r#"# disk-tools configuration.
 #
 # Precedence: command-line flag > this file > built-in default.
+#
+# One exception, and it is a limitation rather than a rule: a true/false setting
+# turned on here cannot be turned back off from the command line, because a flag
+# can only be passed or not passed. `--purge` and `--allow-dirty` are absent
+# from this file for the same reason inverted — a file that silently deleted
+# past the trash, or disabled the git guard, would hide the fact.
+#
 # The never-touch denylist is NOT here and cannot be configured.
 
 [scan]                          # walk behaviour, for `scan <PATH>` only
 one-file-system = false
 
-[report]                        # `scan` only; display only, never changes a total.
-n         = 20                  # `clean` always lists every candidate — the
-depth     = 0                   # 0 = unlimited      dry-run list is what you
-min-size  = "0"                 #                    approve with --apply.
-apparent  = false
+# `scan` only, and display only — none of it ever changes a total. `clean`
+# always lists every candidate, because that list is what you approve by typing
+# --apply, and a truncated one would be approval of what was never shown.
+#
+# Commented-out keys are the built-in defaults; uncomment to change them.
+#   n     = 20    # show at most this many entries. Default: all of them.
+#   depth = 2     # print at most this many levels. 0 is the root alone,
+#                 # exactly as --depth 0 means. Default: unlimited.
+[report]
+min-size = "0"
+apparent = false
 
 [clean]
 require-confirmation = true     # --apply refuses while confirm-tier remains
@@ -107,20 +120,10 @@ pub struct Config {
     /// rules — an absent `[[rules]]` is not a request to have none.
     pub rules: Vec<Rule>,
 
-    // Parsed and validated here; wired to behaviour in v0.3 Task 3, whose whole
-    // content is the merge order — a flag beats the file, and an explicit
-    // `--min-size 0` beats it too.
-    //
-    // `expect` rather than `allow`, so that Task 3 wiring them turns the
-    // attribute itself into a warning and it cannot be left behind. Scoped to
-    // `not(test)` because the tests below already read all three, which would
-    // make the expectation unfulfilled — and therefore an error — in the test
-    // build.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in v0.3 Task 3"))]
+    // Merged against the flags in `Args::resolve`, which is the only place the
+    // order flag > file > default is expressed.
     pub scan: ScanSettings,
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in v0.3 Task 3"))]
     pub report: ReportSettings,
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up in v0.3 Task 3"))]
     pub clean: CleanSettings,
 
     /// Unknown keys, by their dotted path. The caller prints them; this module
@@ -283,6 +286,17 @@ pub fn init(target: &Path, force: bool) -> Result<(), ConfigError> {
     }
     std::fs::write(target, DEFAULT_CONFIG)
         .map_err(|err| ConfigError::Write(target.to_path_buf(), err))
+}
+
+/// Parse a config from a literal, for the precedence tests in `args`.
+///
+/// Those tests are about the **merge**, not about parsing, so they need a
+/// `Config` and nothing else. Going through the real `parse` rather than
+/// building the struct by hand is what keeps them honest: a test that assembled
+/// its own `Config` would still pass if the file's keys stopped reaching it.
+#[cfg(test)]
+pub fn parse_for_test(text: &str) -> Config {
+    parse(Path::new("/test/config.toml"), text).expect("the literal must parse")
 }
 
 /// The whole of parsing, with no filesystem in it — which is what lets every
@@ -616,8 +630,17 @@ mod tests {
         let config = at(DEFAULT_CONFIG).expect("parse");
 
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
-        assert_eq!(config.report.number, Some(20));
         assert_eq!(config.report.min_size, Some(0));
+        assert_eq!(
+            config.report.number, None,
+            "`n` ships commented out: the written file must not change what a \
+             scan prints, and without `-n` a scan has always printed everything"
+        );
+        assert_eq!(
+            config.report.depth, None,
+            "`depth` ships commented out too — 0 means the root alone for the \
+             flag, so the file must not give the same value the opposite meaning"
+        );
         assert_eq!(config.clean.require_confirmation, Some(true));
         assert_eq!(config.scan.one_file_system, Some(false));
     }

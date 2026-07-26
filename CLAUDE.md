@@ -7,8 +7,8 @@ regenerable junk and stale files and removes them **to the OS trash**, dry-run b
 default.
 
 **v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete;
-v0.3 (config + declarative rules) is specced, with Tasks 1-2 of 6 done —
-detection is declarative and reads a TOML config.** A TUI follows on
+v0.3 (config + declarative rules) is specced, with Tasks 1-3 of 6 done —
+detection is declarative, reads a TOML config, and flags beat the file.** A TUI follows on
 the same core. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
@@ -169,8 +169,14 @@ overrides it; `disk-tools config init` writes the commented defaults.
 The file supplies the **rules**. An absent `[[rules]]` leaves the built-ins
 alone; an empty list means none. `root` is required, and `"*"` is how a rule says
 it applies wherever the scan goes. The **denylist is not in the file** and cannot
-be put there. Precedence of the other sections over their flags lands in v0.3
-Task 3.
+be put there, and neither are `--purge` or `--allow-dirty`.
+
+Precedence is **flag > file > built-in default**, expressed in exactly one place
+(`Args::resolve`). No overridable flag carries a clap `default_value`: with one,
+`--min-size 0` and an absent `--min-size` would arrive identical, and the first
+has to beat the file while the second defers to it. One limitation: a boolean
+turned **on** in the file cannot be turned back off from the command line, since
+a flag can only be passed or not passed.
 
 What configuration exists beyond that is build-time:
 
