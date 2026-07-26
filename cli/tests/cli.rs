@@ -1427,3 +1427,71 @@ fn one_refused_candidate_reads_singular() {
         "the verb agrees with the noun, not only the noun with the count:\n{stderr}"
     );
 }
+
+// ---- the browser ---------------------------------------------------------
+//
+// Every test here runs with stdout piped, which is itself the point: `ui`
+// refuses rather than writing escape sequences somewhere no one can read them.
+// Anything needing a real terminal cannot be tested on CI and is checked by hand.
+
+#[test]
+fn ui_refuses_a_pipe_rather_than_filling_it_with_escapes() {
+    let dir = isolated();
+
+    let output = run(&["ui", dir.path().to_str().expect("utf8")]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(
+        output.stdout.is_empty(),
+        "not one byte may reach the pipe: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("needs a terminal"), "{stderr}");
+    assert!(
+        !stderr.contains('\x1b'),
+        "and the refusal itself emits no escapes: {stderr:?}"
+    );
+}
+
+/// A path the user named and that is not there is a typo, and it must be said
+/// before the screen opens — afterwards, leaving the screen erases it.
+#[test]
+fn ui_reports_a_missing_path_ahead_of_the_terminal_check() {
+    let dir = isolated();
+
+    let output = run(&["ui", dir.path().join("nope").to_str().expect("utf8")]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nope"), "{stderr}");
+    assert!(
+        !stderr.contains("needs a terminal"),
+        "the path is the more useful thing to hear about: {stderr}"
+    );
+}
+
+/// Unlike `scan`, `ui` opens the working directory when given none — the ban on
+/// defaulting to it exists against accidentally *walking* something huge, and a
+/// browser lists one directory.
+#[test]
+fn ui_without_a_path_is_not_a_usage_error() {
+    let output = run(&["ui"]);
+
+    // Still refused here, because these tests pipe stdout — but refused for the
+    // terminal, not for a missing argument.
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("needs a terminal"),
+        "a missing path must not be what stops it: {stderr}"
+    );
+}
+
+#[test]
+fn help_lists_the_ui_verb() {
+    let output = run(&["--help"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ui"), "{stdout}");
+}

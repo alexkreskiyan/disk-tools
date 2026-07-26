@@ -104,7 +104,7 @@ coverage-branch:
     cargo +nightly llvm-cov --workspace --all-features --branch --summary-only
 
 # `--all-targets` so tests and benches are checked too — an API stabilized after
-# the MSRV is just as breaking there. CI runs this under the pinned 1.85.
+# the MSRV is just as breaking there. CI runs this under the pinned 1.88.
 
 # Type-check everything, including tests.
 check:

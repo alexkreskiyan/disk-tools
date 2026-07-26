@@ -42,7 +42,7 @@ just release                    # → target/release/disk-tools
 There are no published binaries yet — see the concept's *Distribution — deferred*
 for what packaging will involve.
 
-Requires Rust **1.85** or newer (edition 2024, pinned as `rust-version` in the
+Requires Rust **1.88** or newer (edition 2024, pinned as `rust-version` in the
 workspace manifest).
 
 ## Usage

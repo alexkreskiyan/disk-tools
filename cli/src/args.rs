@@ -49,11 +49,26 @@ pub enum Command {
     /// Find removable junk. Dry-run by default — nothing is deleted without --apply.
     Clean(CleanArgs),
 
+    /// Browse a directory, with each entry coloured by what the rules say.
+    Ui(UiArgs),
+
     /// Inspect and create the configuration file.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
+}
+
+#[derive(clap::Args, Debug)]
+pub struct UiArgs {
+    /// Directory to open. Defaults to the working directory.
+    ///
+    /// The only place in this tool where the working directory is implied. The
+    /// rule against it exists so that nothing huge is *scanned* by accident;
+    /// opening a browser costs one directory listing, so the reason does not
+    /// carry. `scan` still demands a path and `clean` asks the rules.
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -201,6 +216,9 @@ pub enum Mode {
     },
     /// Write the default configuration to `target`.
     ConfigInit { target: PathBuf, force: bool },
+
+    /// Open the browser at this directory.
+    Ui { root: PathBuf },
 }
 
 /// What the frontend resolved before the arguments could be turned into work.
@@ -258,6 +276,13 @@ impl Args {
                 // scan has always printed without `-n`.
                 number: scan.number.or(config.report.number),
                 json: scan.json,
+            }),
+
+            Command::Ui(ui) => Ok(Mode::Ui {
+                // `.` rather than an absolute path: what the user typed is what
+                // the title bar should say, and `validate_root` is about to
+                // check it either way.
+                root: ui.path.unwrap_or_else(|| PathBuf::from(".")),
             }),
 
             Command::Config {

@@ -18,7 +18,8 @@ its Roadmap for what lands when; the
 [v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) and
 [v0.3](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md) specs are
 the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
-(the TUI) is specced and not started. User-facing usage, flags, the safety model and
+(the TUI) has Task 1 of 7 done — `disk-tools ui` opens and, more to the point,
+closes. User-facing usage, flags, the safety model and
 the documented limitations live in the [README](README.md).
 
 ## Important: Documentation Requirements
@@ -50,14 +51,14 @@ rather than as ad-hoc commands.
 | `just check-minimal` | Core without default features: proves a scan-only consumer still compiles without the trash backend |
 | `just smoke-trash` | The `#[ignore]`d tests that move real files to the OS trash, in both crates |
 | `just coverage-branch` | Nightly-only branch coverage; advisory, mirrored by a non-blocking CI job |
-| `just check` | `cargo check --workspace --all-targets` — CI runs it pinned to MSRV 1.85 |
+| `just check` | `cargo check --workspace --all-targets` — CI runs it pinned to MSRV 1.88 |
 | `just run <ARGS>` | Run the CLI, e.g. `just run scan ~/Downloads --json` |
 | `just release` | Optimized host build → `target/release/disk-tools` |
 | `just install-cli` | `cargo install --path cli`, then check that the installed copy is the one first on PATH |
 | `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` / `just bench-phases <path>` / `just bench-stat <dir>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
 CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` + `just smoke-trash`
-on Linux, macOS and Windows, plus a Linux job pinned to MSRV 1.85 running
+on Linux, macOS and Windows, plus a Linux job pinned to MSRV 1.88 running
 `just check` and a non-blocking nightly branch-coverage job. It calls the justfile
 recipes rather than duplicating cargo commands, so a new local check added there
 is automatically enforced in CI.
@@ -66,7 +67,7 @@ is automatically enforced in CI.
 
 ```
 disc-tools/
-├── Cargo.toml          # workspace: members core, cli; edition 2024, MSRV 1.85
+├── Cargo.toml          # workspace: members core, cli; edition 2024, MSRV 1.88
 ├── justfile            # single entry point for local tooling
 ├── .github/workflows/
 │   └── ci.yml          # verify matrix on ×3 OS + an MSRV-pinned check job
@@ -92,6 +93,7 @@ disc-tools/
 │   │   ├── main.rs     # verb dispatch (scan | clean); spinner to stderr
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
 │   │   ├── config.rs   # locate/parse/validate the TOML file; `config init`
+│   │   ├── ui/         # the TUI — term.rs restores the terminal on every path
 │   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
 │   │   └── render/
 │   │       ├── mod.rs
@@ -189,7 +191,7 @@ What configuration exists beyond that is build-time:
 
 | File | Holds |
 |------|-------|
-| `Cargo.toml` (workspace) | `version`, `edition = "2024"`, `rust-version = "1.85"`, inherited by both crates |
+| `Cargo.toml` (workspace) | `version`, `edition = "2024"`, `rust-version = "1.88"`, inherited by both crates |
 | `core/Cargo.toml` | The optional `serde` feature; `windows-sys` under `[target.'cfg(windows)'.dependencies]` |
 | `cli/Cargo.toml` | Enables the core's `serde` feature for `--json` |
 | `.gitattributes` | `* text=auto eol=lf` — a CRLF checkout would fail `cargo fmt --check` on Windows |

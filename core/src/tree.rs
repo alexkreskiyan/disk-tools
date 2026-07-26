@@ -144,14 +144,14 @@ pub(crate) fn aggregate(entries: Vec<WalkEntry>, root: &Path) -> ScanNode {
             root_index = Some(i);
             continue; // the root has no parent to attach to
         }
-        if let Some(parent) = entry.path.parent() {
-            if let Some(&p) = by_path.get(parent) {
-                children[p].push(i);
-            }
-            // else: a child whose parent isn't recorded. The walk descends only
-            // into directories it managed to record, so this is unreachable in
-            // normal operation — kept as a defensive fallback that drops the
-            // orphan rather than panicking, should that invariant ever change.
+        // A child whose parent is not recorded falls through silently. The walk
+        // descends only into directories it managed to record, so that is
+        // unreachable in normal operation — dropping the orphan rather than
+        // panicking is the defensive choice, should the invariant ever change.
+        if let Some(parent) = entry.path.parent()
+            && let Some(&p) = by_path.get(parent)
+        {
+            children[p].push(i);
         }
     }
 
