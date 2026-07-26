@@ -7,10 +7,10 @@ regenerable junk and stale files and removes them **to the OS trash**, dry-run b
 default.
 
 **v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete;
-v0.3 (config + declarative rules) is specced, with Tasks 1-5 of 6 done —
-detection is declarative, reads a TOML config, flags beat the file, `clean`
-walks the rule roots when given no path, and `--apply` refuses while anything
-not regenerable is in the plan.** A TUI follows on
+v0.3 (config + declarative rules) is complete.** Detection is declarative and
+reads a TOML config; flags beat the file; `clean` walks the rule roots when given
+no path; `--apply` refuses while anything not regenerable is in the plan. A TUI
+follows on the same core. A TUI follows on
 the same core. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
@@ -207,7 +207,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 
 | Folder | Purpose | Latest snapshot |
 |--------|---------|-----------------|
-| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.25` |
+| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.26` |
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
 | `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.26` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
@@ -215,13 +215,14 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07/2026.07.25` |
 | `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
-| `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07` |
+| `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07/2026.07.26` |
 
 Files are always written under a `<YYYY.MM>/` folder — never directly under `kb/<folder>/`. Filenames begin with `<YYYY.MM.DD>-` and never include the folder name.
 
 ## Documentation
 
 **Architecture** (snapshots from `kb/architecture/2026.07/`)
+- [After v0.3: detection as data](kb/architecture/2026.07/2026.07.26-overview.md) — the rule engine, the config path, multi-root `clean`, which invariants moved
 - [Overview](kb/architecture/2026.07/2026.07.25-overview.md) — the three-phase pipeline, data model, invariants, platform splits
 - [Rust crate structure](kb/architecture/2026.07/2026.07.25-rust-crates.md) — workspace, feature flags, unsafe policy
 
