@@ -5,9 +5,10 @@
 //! `--help` lists them, and consumed by the renderer (Task 7) and JSON output
 //! (Task 8).
 
+use crate::config::Config;
 use clap::{Parser, Subcommand};
 use disk_tools_core::{
-    CleanOptions, DetectOptions, Removal, Rules, ScanOptions, UserDirs, age_rule, builtin_rules,
+    CleanOptions, DetectOptions, Removal, RuleError, Rules, ScanOptions, UserDirs, age_rule,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -28,6 +29,14 @@ pub struct Args {
     #[arg(short = 'v', long, global = true)]
     pub verbose: bool,
 
+    /// Read this file instead of the one in your config directory.
+    ///
+    /// Global rather than per-command so that `config init` can be pointed at a
+    /// path too — otherwise the one verb that writes the file would be the one
+    /// verb unable to say where.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -39,6 +48,22 @@ pub enum Command {
 
     /// Find removable junk. Dry-run by default — nothing is deleted without --apply.
     Clean(CleanArgs),
+
+    /// Inspect and create the configuration file.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Write the default configuration, comments and all, so it can be edited.
+    Init {
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -122,23 +147,44 @@ pub enum Mode {
         apply: bool,
         removal: Removal,
     },
+    /// Write the default configuration to `target`.
+    ConfigInit { target: PathBuf, force: bool },
+}
+
+/// What the frontend resolved before the arguments could be turned into work.
+///
+/// The core reads no clock, no environment and no config file, so all three
+/// arrive from here. Bundled rather than passed loose because they are one
+/// thing — the state of the world at the moment the program started — and
+/// because two of them are only meaningful together.
+#[derive(Debug)]
+pub struct Environment {
+    pub now: SystemTime,
+    pub user_dirs: UserDirs,
+    pub config: Config,
+    /// Where the config file is or would be. `None` when nothing in this
+    /// environment implies a path, which is also the one case `config init`
+    /// cannot serve.
+    pub config_path: Option<PathBuf>,
 }
 
 impl Args {
     /// Turn the parsed arguments into what the core needs.
     ///
-    /// Infallible now that every verb is a subcommand: clap requires the path
-    /// each one declares, and a bare `disk-tools` is caught by
-    /// `arg_required_else_help` before this is reached. The old shape had to
-    /// raise its own `MissingRequiredArgument` here, because a positional that a
-    /// subcommand might replace cannot be marked required.
-    ///
-    /// `now` and `user_dirs` are passed in because the core will not look them
-    /// up: it reads no clock and no environment (`ScanOptions`'s contract), so
-    /// supplying them is the frontend's job.
-    pub fn resolve(self, now: SystemTime, user_dirs: UserDirs) -> Mode {
+    /// Fallible again as of v0.3: the rules being compiled are now partly the
+    /// user's, so a malformed glob is possible here in a way it was not while
+    /// every pattern was a literal in the core. Everything clap can check —
+    /// a missing path, `--purge` without `--apply` — is still caught before this.
+    pub fn resolve(self, env: Environment) -> Result<Mode, ResolveError> {
+        let Environment {
+            now,
+            user_dirs,
+            config,
+            config_path,
+        } = env;
+
         match self.command {
-            Command::Scan(scan) => Mode::Scan {
+            Command::Scan(scan) => Ok(Mode::Scan {
                 options: ScanOptions {
                     root: scan.root,
                     min_size: scan.min_size,
@@ -148,28 +194,33 @@ impl Args {
                 },
                 number: scan.number,
                 json: scan.json,
-            },
+            }),
+
+            Command::Config {
+                action: ConfigAction::Init { force },
+            } => config_path
+                .map(|target| Mode::ConfigInit { target, force })
+                .ok_or(ResolveError::NoConfigPath),
+
             Command::Clean(clean) => {
-                // The built-in rules, plus the age rule **last** if it was
-                // asked for. Order is precedence, so appending it there is what
-                // keeps a `target/` reported as build output rather than merely
-                // as something old — which is what decides its tier.
-                let mut rules = builtin_rules();
+                // The configured rules — the built-ins when the file said nothing
+                // — plus the age rule **last** if it was asked for. Order is
+                // precedence, so appending it there is what keeps a `target/`
+                // reported as build output rather than merely as something old,
+                // which is what decides its tier.
+                let mut rules = config.rules;
                 if let Some(older_than) = clean.older_than {
                     rules.push(age_rule(older_than));
                 }
 
-                Mode::Clean {
+                Ok(Mode::Clean {
                     scan: ScanOptions {
                         root: clean.path,
                         ..ScanOptions::default()
                     },
                     clean: Box::new(CleanOptions {
                         detect: DetectOptions {
-                            // Infallible here: every pattern is a literal in the
-                            // core. A user-supplied rule can fail to compile, and
-                            // that arrives with the config file in v0.3 Task 2.
-                            rules: Rules::new(rules, &user_dirs).expect("built-in globs are valid"),
+                            rules: Rules::new(rules, &user_dirs).map_err(ResolveError::Rule)?,
                             now,
                         },
                         user_dirs,
@@ -183,8 +234,31 @@ impl Args {
                     } else {
                         Removal::Trash
                     },
-                }
+                })
             }
+        }
+    }
+}
+
+/// Why the arguments could not be turned into work.
+#[derive(Debug)]
+pub enum ResolveError {
+    /// A rule's glob does not compile. The user's text, so it names both.
+    Rule(RuleError),
+    /// `config init` with nothing to say where the file should go — no home, no
+    /// `%APPDATA%`, no `XDG_CONFIG_HOME`. Guessing would put a file somewhere
+    /// the user would never look for it.
+    NoConfigPath,
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::Rule(err) => write!(f, "{err}"),
+            ResolveError::NoConfigPath => write!(
+                f,
+                "cannot tell where your config directory is; pass --config with a path"
+            ),
         }
     }
 }
@@ -193,7 +267,7 @@ impl Args {
 ///
 /// Used as a clap `value_parser`, so a malformed value surfaces as a clean
 /// usage error rather than a panic.
-fn parse_size(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (digits, unit) = s.split_at(split);
@@ -225,7 +299,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
 /// `m` is 30 days and `y` is 365 — approximations, and stated here because `m`
 /// could otherwise be read as minutes. Nothing shorter than a day is offered:
 /// this rule exists to find things untouched for a long time.
-fn parse_duration(s: &str) -> Result<Duration, String> {
+pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     const DAY: u64 = 24 * 60 * 60;
 
     let s = s.trim();
@@ -273,10 +347,22 @@ mod tests {
         Args::try_parse_from(std::iter::once("disk-tools").chain(args.iter().copied()))
     }
 
-    /// Parse and resolve in one step, with fixed stand-ins for the two things
-    /// the frontend supplies.
+    /// A fixed stand-in for everything the frontend resolves, so no test here
+    /// depends on this machine's clock, home or config file.
+    fn env(config: Config) -> Environment {
+        Environment {
+            now: SystemTime::UNIX_EPOCH,
+            user_dirs: UserDirs::default(),
+            config,
+            config_path: Some(PathBuf::from("/cfg/config.toml")),
+        }
+    }
+
+    /// Parse and resolve in one step, on the built-in rules.
     fn resolved(args: &[&str]) -> Result<Mode, clap::Error> {
-        Ok(parse(args)?.resolve(SystemTime::UNIX_EPOCH, UserDirs::default()))
+        Ok(parse(args)?
+            .resolve(env(Config::default()))
+            .expect("the built-in rules compile"))
     }
 
     /// `-n` never reaches the core, so it is read off the resolved mode rather
@@ -284,7 +370,7 @@ mod tests {
     fn number_of(args: &[&str]) -> Option<usize> {
         match resolved(args).expect("resolve") {
             Mode::Scan { number, .. } => number,
-            Mode::Clean { .. } => panic!("expected a scan"),
+            other => panic!("expected a scan, got {other:?}"),
         }
     }
 
@@ -292,6 +378,7 @@ mod tests {
         match resolved(args).expect("resolve") {
             Mode::Scan { options, .. } => options,
             Mode::Clean { scan, .. } => scan,
+            other => panic!("expected a scan or a clean, got {other:?}"),
         }
     }
 
@@ -514,7 +601,7 @@ mod tests {
     fn clean_options(args: &[&str]) -> CleanOptions {
         match resolved(args).expect("resolve") {
             Mode::Clean { clean, .. } => *clean,
-            Mode::Scan { .. } => panic!("expected the clean subcommand"),
+            other => panic!("expected the clean subcommand, got {other:?}"),
         }
     }
 
@@ -561,7 +648,12 @@ mod tests {
 
         let mode = parse(&["clean", "/x", "--older-than", "1d"])
             .expect("parse")
-            .resolve(now, dirs.clone());
+            .resolve(Environment {
+                now,
+                user_dirs: dirs.clone(),
+                ..env(Config::default())
+            })
+            .expect("resolve");
 
         let Mode::Clean { clean, .. } = mode else {
             panic!("expected the clean subcommand");
@@ -671,7 +763,7 @@ mod tests {
     /// would change from auto to confirm with it.
     #[test]
     fn the_age_rule_is_appended_after_the_builtins() {
-        let mut rules = builtin_rules();
+        let mut rules = disk_tools_core::builtin_rules();
         rules.push(age_rule(Duration::from_secs(1)));
 
         assert_eq!(

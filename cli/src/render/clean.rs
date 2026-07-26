@@ -77,7 +77,15 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
         } else {
             "candidates are"
         };
-        let _ = writeln!(out, "\n{} more {noun} below --min-size.", plan.too_small);
+        // Both thresholds are named, because since v0.3 either could be the one
+        // that applied: `--min-size` on the command line, or a `min-size` on the
+        // rule that matched. Naming only the flag would send a user to change
+        // something they never set.
+        let _ = writeln!(
+            out,
+            "\n{} more {noun} below --min-size or their rule's own min-size.",
+            plan.too_small
+        );
     }
 
     if !plan.candidates.is_empty() && intent == Intent::DryRun {

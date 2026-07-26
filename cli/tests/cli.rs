@@ -800,3 +800,216 @@ fn purge_without_apply_is_a_usage_error() {
     );
     assert_eq!(before, snapshot(dir.path()), "and nothing was removed");
 }
+
+// ---- the configuration file ---------------------------------------------
+//
+// Driven through `--config` so that no test here depends on — or writes to —
+// the real config directory of whoever is running them.
+
+/// A `clean` fixture with one `node_modules` in it.
+fn node_modules_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("node_modules")).expect("mkdir");
+    std::fs::write(dir.path().join("node_modules/lib.bin"), vec![b'x'; 4096]).expect("write");
+    dir
+}
+
+fn write(dir: &Path, name: &str, text: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, text).expect("write config");
+    path
+}
+
+/// The point of the whole feature: a rule the user wrote is the rule that runs.
+#[test]
+fn a_configured_rule_replaces_the_builtins() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+    let config = write(
+        home.path(),
+        "config.toml",
+        "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"**/node_modules/\"]\ntier = \"auto\"\n",
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("mine"),
+        "the report names the rule that claimed it:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("node-modules"),
+        "and the built-in rule it replaced is gone:\n{stdout}"
+    );
+}
+
+/// A config file is the input to a delete operation. If it cannot be
+/// understood, the rules are unknown — so nothing is scanned and nothing runs.
+#[test]
+fn a_malformed_config_stops_the_program_before_scanning() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+    let config = write(home.path(), "config.toml", "[scan]\none-file-system = \n");
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(
+        output.stdout.is_empty(),
+        "nothing may be reported: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("line 2"),
+        "must locate the mistake:\n{stderr}"
+    );
+}
+
+/// A named file that is not there is a typo, not a request for defaults.
+#[test]
+fn an_explicit_config_that_is_absent_is_an_error() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let output = run(&[
+        "--config",
+        home.path().join("nope.toml").to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nope.toml"),
+        "the message must name the file it looked for"
+    );
+}
+
+/// A typo or a newer version's key. Naming it is enough; refusing to run would
+/// make the tool brittle and protect nothing.
+#[test]
+fn an_unknown_key_warns_but_the_run_continues() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+    let config = write(
+        home.path(),
+        "config.toml",
+        "[scan]\none-file-sistem = true\n",
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("one-file-sistem"),
+        "the typo must be findable:\n{stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("node-modules"),
+        "and the built-in rules still ran"
+    );
+}
+
+/// A rule that cannot be understood is refused by name — an error about "a
+/// rule" in a file with twelve of them is not one a user can act on.
+#[test]
+fn a_rule_missing_its_root_is_refused_by_name() {
+    let fixture = node_modules_dir();
+    let home = tempfile::tempdir().expect("tempdir");
+    let config = write(
+        home.path(),
+        "config.toml",
+        "[[rules]]\nname = \"mine\"\nincludes = [\"**/x/\"]\n",
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("rule `mine`"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn config_init_writes_a_usable_file_and_prints_its_path() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = home.path().join("nested").join("config.toml");
+
+    let output = run(&["--config", target.to_str().expect("utf8"), "config", "init"]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        target.to_str().expect("utf8"),
+        "the path is the result, so it goes to stdout"
+    );
+
+    // And the file it wrote is one the tool can read back.
+    let fixture = node_modules_dir();
+    let reread = run(&[
+        "--config",
+        target.to_str().expect("utf8"),
+        "clean",
+        fixture.path().to_str().expect("utf8"),
+    ]);
+    assert!(reread.status.success(), "{:?}", reread.status);
+    assert!(String::from_utf8_lossy(&reread.stdout).contains("node-modules"));
+}
+
+/// A config is something a user edits, and "show me the defaults" must not be
+/// able to throw those edits away.
+#[test]
+fn config_init_refuses_to_overwrite_without_force() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = write(home.path(), "config.toml", "# mine\n");
+
+    let output = run(&["--config", target.to_str().expect("utf8"), "config", "init"]);
+
+    assert!(!output.status.success(), "{:?}", output.status);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--force"));
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read"),
+        "# mine\n",
+        "the edits are still there"
+    );
+
+    let forced = run(&[
+        "--config",
+        target.to_str().expect("utf8"),
+        "config",
+        "init",
+        "--force",
+    ]);
+    assert!(forced.status.success(), "{:?}", forced.status);
+    assert!(
+        std::fs::read_to_string(&target)
+            .expect("read")
+            .contains("[[rules]]")
+    );
+}

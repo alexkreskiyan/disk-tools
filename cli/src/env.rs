@@ -26,6 +26,16 @@ pub fn user_dirs() -> UserDirs {
     }
 }
 
+/// `$XDG_CONFIG_HOME`, if this environment sets one.
+///
+/// Consulted on **every** platform, not only where XDG is the convention: a user
+/// who exports it has said where their configuration lives, and ignoring that on
+/// Windows because the platform has its own habit would be overruling them. The
+/// platform path is the fallback, not the rule.
+pub fn xdg_config_home() -> Option<PathBuf> {
+    read("XDG_CONFIG_HOME")
+}
+
 /// `%USERPROFILE%` first on Windows, and the order is not arbitrary.
 ///
 /// Git Bash, MSYS2 and Cygwin all set `HOME` to a POSIX path like

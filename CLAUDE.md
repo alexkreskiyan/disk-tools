@@ -7,8 +7,8 @@ regenerable junk and stale files and removes them **to the OS trash**, dry-run b
 default.
 
 **v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete;
-v0.3 (config + declarative rules) is specced, with Task 1 of 6 done — detection
-is declarative.** A TUI follows on
+v0.3 (config + declarative rules) is specced, with Tasks 1-2 of 6 done —
+detection is declarative and reads a TOML config.** A TUI follows on
 the same core. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
@@ -83,11 +83,12 @@ disc-tools/
 │       ├── clean.rs    # denylist, tiers, totals → CleanPlan. Writes nothing
 │       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
 ├── cli/                # disk-tools (bin) — CLI frontend
-│   ├── Cargo.toml      # clap, terminal_size, serde_json, indicatif, unicode-width
+│   ├── Cargo.toml      # clap, toml, serde, serde_ignored, indicatif, unicode-width
 │   ├── src/
 │   │   ├── main.rs     # verb dispatch (scan | clean); spinner to stderr
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
-│   │   ├── env.rs      # UserDirs from the environment — what the core refuses
+│   │   ├── config.rs   # locate/parse/validate the TOML file; `config init`
+│   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
 │   │   └── render/
 │   │       ├── mod.rs
 │   │       ├── tree.rs     # dust-style tree, parent-relative bars
@@ -122,6 +123,7 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `SkippedEntry` / `SkipReason` | `core/src/tree.rs` | Failures returned **as data** — the core never prints |
 | `RenderOptions` | `cli/src/render/tree.rs` | Display-only knobs |
 | `Intent` | `cli/src/render/clean.rs` | Whether the plan is a dry run or a preview — the closing line differs |
+| `Config` / `Environment` | `cli/src/config.rs`, `cli/src/args.rs` | The file's contents, and everything the frontend resolved before the args became work |
 
 Invariants worth keeping in mind:
 
@@ -158,8 +160,18 @@ Invariants worth keeping in mind:
 
 ## Configuration
 
-The tool reads **no** configuration — `<PATH>` and the flags are its entire input
-(`--config` and a TOML file arrive in v0.3). What configuration exists is build-time:
+`disk-tools` reads a TOML file: `$XDG_CONFIG_HOME/disk-tools/config.toml` when
+that is set (on **every** platform), otherwise `%APPDATA%\disk-tools\config.toml`
+on Windows and `~/.config/disk-tools/config.toml` elsewhere. `--config <PATH>`
+overrides it; `disk-tools config init` writes the commented defaults.
+
+The file supplies the **rules**. An absent `[[rules]]` leaves the built-ins
+alone; an empty list means none. `root` is required, and `"*"` is how a rule says
+it applies wherever the scan goes. The **denylist is not in the file** and cannot
+be put there. Precedence of the other sections over their flags lands in v0.3
+Task 3.
+
+What configuration exists beyond that is build-time:
 
 | File | Holds |
 |------|-------|

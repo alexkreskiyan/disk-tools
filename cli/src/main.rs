@@ -5,10 +5,11 @@
 //! summary go to stderr, keeping stdout clean for pipes.
 
 mod args;
+mod config;
 mod env;
 mod render;
 
-use args::{Args, Mode, validate_root};
+use args::{Args, Environment, Mode, validate_root};
 use clap::Parser;
 use disk_tools_core::{
     CleanOptions, CleanPlan, Removal, ScanOptions, ScanTree, Tier, apply, plan, scan,
@@ -26,9 +27,48 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let verbose = args.verbose;
 
-    // The core reads no clock and no environment, so both are resolved here and
-    // handed over. Once, at the top, so every rule sees the same "now".
-    match args.resolve(SystemTime::now(), env::user_dirs()) {
+    // The core reads no clock, no environment and no config file, so all three
+    // are resolved here and handed over. The clock once, at the top, so every
+    // rule in one run sees the same "now".
+    let user_dirs = env::user_dirs();
+    let xdg = env::xdg_config_home();
+    let config_path = config::locate(args.config.as_deref(), &user_dirs, xdg.clone());
+
+    // Before anything is scanned: a config that cannot be understood means the
+    // rules are unknown, and the rules decide what may be deleted.
+    //
+    // Skipped for the `config` verb, which writes the file rather than obeying
+    // it. Reading first would make `--config <new path> config init` fail on the
+    // absence of exactly the file it was asked to create.
+    let config = if matches!(args.command, args::Command::Config { .. }) {
+        config::Config::default()
+    } else {
+        match config::load(args.config.as_deref(), &user_dirs, xdg) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("disk-tools: config: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    };
+    for warning in &config.warnings {
+        eprintln!("disk-tools: config: unknown key `{warning}` (ignored)");
+    }
+
+    let mode = match args.resolve(Environment {
+        now: SystemTime::now(),
+        user_dirs,
+        config,
+        config_path,
+    }) {
+        Ok(mode) => mode,
+        Err(err) => {
+            eprintln!("disk-tools: config: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match mode {
         Mode::Scan {
             options,
             number,
@@ -40,6 +80,24 @@ fn main() -> ExitCode {
             apply,
             removal,
         } => run_clean(scan, *clean, apply, removal, verbose),
+        Mode::ConfigInit { target, force } => run_config_init(&target, force),
+    }
+}
+
+/// Write the default configuration where this platform keeps one.
+///
+/// The path goes to **stdout**: it is the result of the command, and the obvious
+/// next thing a user does with it is open it.
+fn run_config_init(target: &std::path::Path, force: bool) -> ExitCode {
+    match config::init(target, force) {
+        Ok(()) => {
+            println!("{}", target.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("disk-tools: config: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
