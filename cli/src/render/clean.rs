@@ -108,7 +108,7 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
 /// delete is acceptable; leaving the user to guess which half happened is not.
 /// So a failure names its path and what the OS said, and the closing line states
 /// plainly that something is still there.
-pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, purged: bool) -> String {
+pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, recoverable: bool) -> String {
     let mut out = String::new();
     let attempted = outcome.removed.len() + outcome.failed.len();
 
@@ -155,7 +155,11 @@ pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, purged: bool
     // sitting directly under the failure list, reads as promising exactly the
     // items that are *not* in the trash. This is the sentence a user reads to
     // find out whether their work survived.
-    if !outcome.removed.is_empty() && !purged {
+    //
+    // Phrased as `recoverable` rather than `!purged`: a double negative guarding
+    // the one sentence that tells a user whether their data still exists is a
+    // negation too many.
+    if !outcome.removed.is_empty() && recoverable {
         let removed = outcome.removed.len();
         let (noun, verb) = if removed == 1 {
             ("candidate", "is")
@@ -527,7 +531,7 @@ mod outcome_tests {
             reclaimed: 2048,
         };
 
-        let report = render_outcome(&outcome, false, false);
+        let report = render_outcome(&outcome, false, true);
 
         assert!(report.contains("Removed 1 of 1"), "{report}");
         assert!(report.contains("Freed 2.0K"), "{report}");
@@ -548,7 +552,7 @@ mod outcome_tests {
             reclaimed: 0,
         };
 
-        let report = render_outcome(&outcome, false, false);
+        let report = render_outcome(&outcome, false, true);
 
         assert!(report.contains("Removed nothing."), "{report}");
         assert!(report.contains("2 candidates still on disk"), "{report}");
@@ -569,7 +573,7 @@ mod outcome_tests {
             reclaimed: 1024,
         };
 
-        let report = render_outcome(&outcome, false, false);
+        let report = render_outcome(&outcome, false, true);
 
         assert!(report.contains("1 candidate still on disk"), "{report}");
         assert!(
@@ -594,12 +598,12 @@ mod outcome_tests {
         };
 
         assert!(
-            render_outcome(&outcome, true, false).contains("Freed at most 4.0K"),
+            render_outcome(&outcome, true, true).contains("Freed at most 4.0K"),
             "{}",
-            render_outcome(&outcome, true, false)
+            render_outcome(&outcome, true, true)
         );
         assert!(
-            render_outcome(&outcome, false, false).contains("Freed 4.0K"),
+            render_outcome(&outcome, false, true).contains("Freed 4.0K"),
             "and without sharing the figure is exact"
         );
     }
@@ -613,7 +617,7 @@ mod outcome_tests {
         };
 
         assert!(
-            render_outcome(&outcome, false, false).contains("1 candidate still on disk"),
+            render_outcome(&outcome, false, true).contains("1 candidate still on disk"),
             "not `1 candidates`"
         );
     }
@@ -701,7 +705,7 @@ mod purge_tests {
     /// trash to put back.
     #[test]
     fn a_purged_run_never_claims_anything_can_be_put_back() {
-        let report = render_outcome(&partial(), false, true);
+        let report = render_outcome(&partial(), false, false);
 
         assert!(report.contains("1 candidate still on disk"), "{report}");
         assert!(
@@ -714,7 +718,7 @@ mod purge_tests {
     /// both.
     #[test]
     fn a_trashed_run_still_says_what_can_be_put_back() {
-        let report = render_outcome(&partial(), false, false);
+        let report = render_outcome(&partial(), false, true);
 
         assert!(
             report.contains("in the trash and can be put back"),

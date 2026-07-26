@@ -1382,3 +1382,48 @@ fn yes_without_apply_is_a_usage_error() {
     assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
     assert_eq!(before, snapshot(dir.path()));
 }
+
+/// The count is said aloud only when there is something to say.
+///
+/// `confirm > 0` mutated to `>=` survived every test: with `--yes` on a plan of
+/// only regenerable candidates the tool would have announced "0 of these are not
+/// regenerable — removing anyway", which is both false and alarming.
+#[test]
+fn nothing_is_announced_when_nothing_needs_confirming() {
+    let dir = cleanable_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--apply",
+        "--purge",
+        "--yes",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("not regenerable"),
+        "an all-auto plan has nothing to say about confirmation:\n{stderr}"
+    );
+}
+
+/// The refusal counts in words as well as digits. One candidate is "1 candidate
+/// is", not "1 candidates are".
+#[test]
+fn one_refused_candidate_reads_singular() {
+    let dir = mixed_tiers_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--apply",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 candidate is not regenerable"),
+        "the verb agrees with the noun, not only the noun with the count:\n{stderr}"
+    );
+}

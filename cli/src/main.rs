@@ -12,7 +12,8 @@ mod render;
 use args::{Args, Environment, Mode, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOptions, CleanPlan, Removal, ScanOptions, ScanTree, SkippedEntry, Tier, apply, plan, scan,
+    CleanOptions, CleanOutcome, CleanPlan, Removal, ScanOptions, ScanTree, SkippedEntry, Tier,
+    apply, plan, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{Intent, render_clean, render_outcome};
@@ -153,6 +154,19 @@ struct Removing {
     apply: bool,
     removal: Removal,
     confirm_tier_allowed: bool,
+}
+
+impl Removing {
+    /// May the outcome describe what it removed as still retrievable?
+    ///
+    /// Only the trash makes that true. Named rather than written inline as
+    /// `!= Removal::Purge` because it guards the one sentence a user reads to
+    /// find out whether their data still exists — and because inline it was
+    /// untestable: that sentence prints only after a partial failure, which
+    /// cannot be provoked against the macOS trash.
+    fn recoverable(&self) -> bool {
+        self.removal == Removal::Trash
+    }
 }
 
 fn run_clean(
@@ -318,16 +332,12 @@ fn remove(
     let outcome = apply(planned, removing.removal, |_| {});
     spinner.finish_and_clear();
 
-    // Whether the freed figure needs the same hedge the dry run's total carried:
-    // a removed candidate that shares content with something outside it did not
-    // free everything its size claimed.
-    let shared_removed = planned
-        .candidates
-        .iter()
-        .any(|c| c.shared && outcome.removed.contains(&c.path));
-
     let code = emit(
-        &render_outcome(&outcome, shared_removed, removing.removal == Removal::Purge),
+        &render_outcome(
+            &outcome,
+            shared_was_removed(planned, &outcome),
+            removing.recoverable(),
+        ),
         skipped,
         verbose,
     );
@@ -392,6 +402,21 @@ fn emit(report: &str, skipped: &[SkippedEntry], verbose: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Does the freed figure need the same hedge the dry run's total carried?
+///
+/// A candidate that shares content with something outside it did not free
+/// everything its size claimed — but only if it actually went. Both halves
+/// matter and neither is testable through the binary: the sentence they control
+/// appears only after a **partial** failure, and a partial trash failure cannot
+/// be provoked on macOS (v0.2 measured that). Pulled out here so the decision can
+/// be driven directly, the way `already_gone` was for the same reason.
+fn shared_was_removed(planned: &CleanPlan, outcome: &CleanOutcome) -> bool {
+    planned
+        .candidates
+        .iter()
+        .any(|candidate| candidate.shared && outcome.removed.contains(&candidate.path))
+}
+
 /// Write the finished report to stdout in one buffered pass.
 ///
 /// Deliberately not `print!`: those macros **panic** when the reader goes away,
@@ -410,4 +435,122 @@ fn terminal_width() -> usize {
     terminal_size::terminal_size()
         .map(|(width, _)| width.0 as usize)
         .unwrap_or(80)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use disk_tools_core::{Candidate, TrashFailure};
+
+    fn candidate(path: &str, shared: bool) -> Candidate {
+        Candidate {
+            path: PathBuf::from(path),
+            rule: "node-modules".into(),
+            tier: Tier::Auto,
+            allocated: 4096,
+            shared,
+        }
+    }
+
+    fn plan_of(candidates: Vec<Candidate>) -> CleanPlan {
+        CleanPlan {
+            reclaimable: candidates.iter().map(|c| c.allocated).sum(),
+            candidates,
+            ..CleanPlan::default()
+        }
+    }
+
+    fn outcome(removed: &[&str], failed: &[&str]) -> CleanOutcome {
+        CleanOutcome {
+            removed: removed.iter().map(PathBuf::from).collect(),
+            failed: failed
+                .iter()
+                .map(|path| TrashFailure {
+                    path: PathBuf::from(path),
+                    reason: "denied".into(),
+                })
+                .collect(),
+            reclaimed: 0,
+        }
+    }
+
+    /// Both halves of the predicate, driven apart.
+    ///
+    /// Mutation testing found neither was covered: the sentence they control
+    /// appears only after a partial failure, and a partial *trash* failure cannot
+    /// be provoked on macOS. Replacing the `&&` with `||` left every test passing.
+    #[test]
+    fn the_hedge_needs_a_shared_candidate_that_actually_went() {
+        let shared = plan_of(vec![candidate("/p/a", true)]);
+        let plain = plan_of(vec![candidate("/p/a", false)]);
+
+        assert!(
+            shared_was_removed(&shared, &outcome(&["/p/a"], &[])),
+            "shared and removed: the freed figure is an upper bound"
+        );
+        assert!(
+            !shared_was_removed(&shared, &outcome(&[], &["/p/a"])),
+            "shared but it stayed — nothing it shares was freed either way"
+        );
+        assert!(
+            !shared_was_removed(&plain, &outcome(&["/p/a"], &[])),
+            "removed but unshared: the figure is exact, and hedging it would be \
+             the report doubting a number it knows"
+        );
+    }
+
+    /// One shared candidate among many is enough — the total covers them all.
+    #[test]
+    fn one_shared_removal_among_several_is_enough() {
+        let plan = plan_of(vec![
+            candidate("/p/a", false),
+            candidate("/p/b", true),
+            candidate("/p/c", false),
+        ]);
+
+        assert!(shared_was_removed(
+            &plan,
+            &outcome(&["/p/a", "/p/b", "/p/c"], &[])
+        ));
+        assert!(
+            !shared_was_removed(&plan, &outcome(&["/p/a", "/p/c"], &["/p/b"])),
+            "the only shared one failed, so what did go was measured exactly"
+        );
+    }
+
+    #[test]
+    fn nothing_removed_needs_no_hedge() {
+        let plan = plan_of(vec![candidate("/p/a", true)]);
+
+        assert!(!shared_was_removed(&plan, &outcome(&[], &[])));
+        assert!(!shared_was_removed(
+            &CleanPlan::default(),
+            &outcome(&[], &[])
+        ));
+    }
+}
+
+#[cfg(test)]
+mod removing_tests {
+    use super::*;
+
+    /// The one sentence a user reads to find out whether their data still
+    /// exists. Inline as `removal == Removal::Purge` it was untestable — the
+    /// line prints only after a partial failure, which cannot be provoked
+    /// against the macOS trash — and mutation testing showed nothing caught it
+    /// being inverted.
+    #[test]
+    fn only_the_trash_is_recoverable() {
+        let removing = |removal| Removing {
+            apply: true,
+            removal,
+            confirm_tier_allowed: false,
+        };
+
+        assert!(removing(Removal::Trash).recoverable());
+        assert!(
+            !removing(Removal::Purge).recoverable(),
+            "there is nothing in the trash to put back"
+        );
+    }
 }

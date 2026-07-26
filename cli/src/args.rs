@@ -426,6 +426,67 @@ mod tests {
         Args::try_parse_from(std::iter::once("disk-tools").chain(args.iter().copied()))
     }
 
+    /// `config init` resolves to a target, or to the one error that says why it
+    /// cannot. Covered end to end already; here so that a change to `resolve`
+    /// fails at the unit that owns the decision.
+    #[test]
+    fn config_init_resolves_to_the_located_path() {
+        let mode = parse(&["config", "init"])
+            .expect("parse")
+            .resolve(env(Config::default()))
+            .expect("resolve");
+
+        assert!(matches!(
+            mode,
+            Mode::ConfigInit { ref target, force: false } if target == Path::new("/cfg/config.toml")
+        ));
+
+        let forced = parse(&["config", "init", "--force"])
+            .expect("parse")
+            .resolve(env(Config::default()))
+            .expect("resolve");
+        assert!(matches!(forced, Mode::ConfigInit { force: true, .. }));
+    }
+
+    /// No home, no `%APPDATA%`, no `XDG_CONFIG_HOME`: there is nowhere to write.
+    /// Guessing would put the file somewhere the user would never look for it.
+    #[test]
+    fn config_init_without_a_known_directory_says_so() {
+        let err = parse(&["config", "init"])
+            .expect("parse")
+            .resolve(Environment {
+                config_path: None,
+                ..env(Config::default())
+            })
+            .expect_err("nowhere to write");
+
+        assert!(matches!(err, ResolveError::NoConfigPath));
+        assert!(err.to_string().contains("--config"));
+    }
+
+    /// Both variants say something a user has to act on, so both are asserted.
+    /// Mutation testing found the whole `Display` impl could be replaced with
+    /// `Ok(())` — an empty message — with every test still passing.
+    #[test]
+    fn resolve_errors_say_what_to_do_about_them() {
+        let rule = ResolveError::Rule(RuleError {
+            rule: "mine".into(),
+            pattern: "**/[".into(),
+            message: "unclosed".into(),
+        })
+        .to_string();
+        assert!(
+            rule.contains("mine") && rule.contains("**/["),
+            "a bad glob must name the rule and the pattern the user wrote: {rule}"
+        );
+
+        let no_path = ResolveError::NoConfigPath.to_string();
+        assert!(
+            no_path.contains("--config"),
+            "and the one remedy has to be named: {no_path}"
+        );
+    }
+
     /// A fixed stand-in for everything the frontend resolves, so no test here
     /// depends on this machine's clock, home or config file.
     fn env(config: Config) -> Environment {
