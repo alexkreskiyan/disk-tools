@@ -1186,3 +1186,199 @@ fn a_named_path_that_is_gone_is_still_an_error() {
     assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
     assert!(String::from_utf8_lossy(&output.stderr).contains("nope"));
 }
+
+// ---- confirmation --------------------------------------------------------
+//
+// The concept asks that a non-regenerable candidate never go without explicit
+// consent. v0.3 gives that as a refusal rather than a prompt, which is why every
+// test below is an ordinary one: refusing deletes nothing, so the headline
+// property is checkable in a normal run rather than behind `just smoke-trash`.
+//
+// The three that do get past the refusal pass `--purge`, and not for speed. The
+// refusal is decided before the removal method matters, so either flag exercises
+// the same branch — but `--apply` alone would put a temp fixture into the real
+// Trash of whoever ran the suite, which is exactly what this project keeps
+// behind `#[ignore]`. `--purge` confines the deletion to the temp directory.
+// (It is also 70x faster: measured at 121 s for these three against the trash.)
+
+/// A `node_modules` (auto tier) beside something only the age rule can claim,
+/// which is confirm tier.
+fn mixed_tiers_dir() -> tempfile::TempDir {
+    let dir = cleanable_dir();
+    let stale = dir.path().join("notes.txt");
+    std::fs::write(&stale, b"old").expect("write");
+    // 2001-01-01, comfortably past any threshold a test will use.
+    let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(978_307_200);
+    filetime_set(&stale, long_ago);
+    dir
+}
+
+fn filetime_set(path: &Path, when: std::time::SystemTime) {
+    let secs = when
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    // No dev-dependency for this: `touch -t` is on every platform CI runs, and
+    // the alternative is a crate pulled in for one line of a test.
+    let stamp = std::process::Command::new("touch")
+        .arg("-d")
+        .arg(format!("@{secs}"))
+        .arg(path)
+        .status();
+    if !matches!(stamp, Ok(status) if status.success()) {
+        // BSD `touch` spells it differently.
+        let _ = std::process::Command::new("touch")
+            .args(["-t", "200101010000"])
+            .arg(path)
+            .status();
+    }
+}
+
+/// The headline property: `--apply` alone does not take what cannot be
+/// regenerated.
+#[test]
+fn apply_refuses_while_a_confirm_tier_candidate_remains() {
+    let dir = mixed_tiers_dir();
+    let before = snapshot(dir.path());
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--apply",
+    ]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an incomplete invitation is a usage answer, got {:?}",
+        output.status
+    );
+    assert_eq!(
+        before,
+        snapshot(dir.path()),
+        "and absolutely nothing was removed"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not regenerable") && stderr.contains("nothing was removed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--safe") && stderr.contains("--yes"),
+        "both remedies must be named:\n{stderr}"
+    );
+}
+
+/// The refusal prints the plan as a **dry run**. Printing "about to apply" and
+/// then declining would make the last thing a user reads before the outcome the
+/// one sentence in the report that is false — the defect `Intent` exists for.
+#[test]
+fn the_refusal_does_not_promise_a_removal() {
+    let dir = mixed_tiers_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--apply",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Dry run — nothing was removed"),
+        "the plan must close as a dry run:\n{stdout}"
+    );
+}
+
+/// A plan of only regenerable candidates needs no confirmation, so `--apply`
+/// proceeds. This is also why every pre-existing `--apply` test still passes.
+#[test]
+fn apply_proceeds_when_nothing_needs_confirming() {
+    let dir = cleanable_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--apply",
+        "--purge",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Add --safe"),
+        "an auto-tier plan must not be refused:\n{stderr}"
+    );
+}
+
+/// `--safe` keeps confirm-tier candidates out of the plan, so the count is zero
+/// and there is nothing to refuse. Pinned rather than left a coincidence.
+#[test]
+fn safe_removes_the_regenerable_ones_without_a_refusal() {
+    let dir = mixed_tiers_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--safe",
+        "--apply",
+        "--purge",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Add --safe"),
+        "--safe already answered the question:\n{stderr}"
+    );
+}
+
+/// Turning the setting off restores v0.2's behaviour: the confirmation is having
+/// read the list and typed `--apply`.
+#[test]
+fn the_setting_can_be_turned_off() {
+    let dir = mixed_tiers_dir();
+    let home = isolated();
+    let config = write(
+        home.path(),
+        "config.toml",
+        "[clean]\nrequire-confirmation = false\n",
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--apply",
+        "--purge",
+    ]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Add --safe"),
+        "the file said not to ask:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("removing anyway, as asked"),
+        "but the count is still said out loud:\n{stderr}"
+    );
+}
+
+/// "I confirm" without "remove" is a statement about nothing.
+#[test]
+fn yes_without_apply_is_a_usage_error() {
+    let dir = cleanable_dir();
+    let before = snapshot(dir.path());
+
+    let output = run(&["clean", dir.path().to_str().expect("utf8"), "--yes"]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert_eq!(before, snapshot(dir.path()));
+}

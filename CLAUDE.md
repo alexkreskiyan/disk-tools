@@ -7,9 +7,10 @@ regenerable junk and stale files and removes them **to the OS trash**, dry-run b
 default.
 
 **v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete;
-v0.3 (config + declarative rules) is specced, with Tasks 1-4 of 6 done —
-detection is declarative, reads a TOML config, flags beat the file, and `clean`
-walks the rule roots when given no path.** A TUI follows on
+v0.3 (config + declarative rules) is specced, with Tasks 1-5 of 6 done —
+detection is declarative, reads a TOML config, flags beat the file, `clean`
+walks the rule roots when given no path, and `--apply` refuses while anything
+not regenerable is in the plan.** A TUI follows on
 the same core. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
@@ -147,6 +148,9 @@ Invariants worth keeping in mind:
   `~`, a non-UTF-8 root. Unknown reads as *no*, never as *any*.
 - **`deny(unsafe_code)` is exempted per function, never per module** — four
   `#[cfg(windows)]` functions, each listed in `core/src/lib.rs`.
+- **`--apply` refuses while a confirm-tier candidate remains,** unless `--safe`
+  or `--yes`. There is no interactive prompt and no config key for `--yes`: a
+  file that answered yes in advance would cancel the confirmation invisibly.
 - **Nothing is deleted without `--apply`,** and the default destination is the OS
   trash. `--purge` deletes outright — an opt-in reversal of that rule, which
   requires `--apply` and which the report never describes as recoverable. The

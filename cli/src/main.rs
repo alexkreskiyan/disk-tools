@@ -77,11 +77,22 @@ fn main() -> ExitCode {
         } => run_scan(options, number, json, verbose),
         Mode::Clean {
             roots,
+            confirm_tier_allowed,
             roots_from_rules,
             clean,
             apply,
             removal,
-        } => run_clean(&roots, roots_from_rules, *clean, apply, removal, verbose),
+        } => run_clean(
+            &roots,
+            roots_from_rules,
+            *clean,
+            Removing {
+                apply,
+                removal,
+                confirm_tier_allowed,
+            },
+            verbose,
+        ),
         Mode::ConfigInit { target, force } => run_config_init(&target, force),
     }
 }
@@ -133,12 +144,22 @@ fn run_scan(options: ScanOptions, number: Option<usize>, json: bool, verbose: bo
     emit(&report, &tree.skipped, verbose)
 }
 
+/// What `--apply` was asked to do, and how far it is allowed to go.
+///
+/// Three booleans that only mean anything together: applying at all, whether the
+/// trash is bypassed, and whether the non-regenerable candidates may go. Passed
+/// as one value so no caller can supply two of the three.
+struct Removing {
+    apply: bool,
+    removal: Removal,
+    confirm_tier_allowed: bool,
+}
+
 fn run_clean(
     roots: &[PathBuf],
     roots_from_rules: bool,
     clean: CleanOptions,
-    apply: bool,
-    removal: Removal,
+    removing: Removing,
     verbose: bool,
 ) -> ExitCode {
     if roots.is_empty() {
@@ -195,8 +216,8 @@ fn run_clean(
 
     let planned = CleanPlan::merge(plans);
 
-    if apply {
-        return remove(&planned, removal, &skipped, verbose);
+    if removing.apply {
+        return remove(&planned, &removing, &skipped, verbose);
     }
 
     // The count of what `--safe` hid comes back with the plan. It used to come
@@ -220,7 +241,7 @@ fn run_clean(
 /// a dry run would have given them.
 fn remove(
     planned: &CleanPlan,
-    removal: Removal,
+    removing: &Removing,
     skipped: &[SkippedEntry],
     verbose: bool,
 ) -> ExitCode {
@@ -232,22 +253,54 @@ fn remove(
         );
     }
 
-    // To stderr: this is context for the operation, not the report. It also
-    // keeps stdout to the outcome alone for anything reading it.
-    eprint!("{}", render_clean(planned, None, Intent::AboutToApply));
     let confirm = planned
         .candidates
         .iter()
         .filter(|c| c.tier == Tier::Confirm)
         .count();
+
+    // Decided **before** anything is printed. The plan below goes out with an
+    // intent, and `AboutToApply`'s closing line promises a removal — printing
+    // that and then declining would make the last thing a user reads before the
+    // outcome the one sentence in the report that is false. That is the defect
+    // `Intent` was introduced for.
+    //
+    // `--safe` needs no case of its own: it keeps confirm-tier candidates out of
+    // the plan, so the count is zero and there is nothing to refuse.
+    if confirm > 0 && !removing.confirm_tier_allowed {
+        let code = emit(
+            &render_clean(planned, None, Intent::DryRun),
+            skipped,
+            verbose,
+        );
+        let (noun, verb) = if confirm == 1 {
+            ("candidate", "is")
+        } else {
+            ("candidates", "are")
+        };
+        eprintln!(
+            "\n{confirm} {noun} {verb} not regenerable, and nothing was removed.\n\
+             Add --safe to take only the regenerable ones, or --yes to take all of them."
+        );
+        // The flags were well formed; the invitation was incomplete. That is a
+        // usage answer, not an operation that failed.
+        return if code == ExitCode::SUCCESS {
+            ExitCode::from(2)
+        } else {
+            code
+        };
+    }
+
+    // To stderr: this is context for the operation, not the report. It also
+    // keeps stdout to the outcome alone for anything reading it.
+    eprint!("{}", render_clean(planned, None, Intent::AboutToApply));
     if confirm > 0 {
-        // The concept asks for per-target confirmation on this tier; v0.2's
-        // confirmation is having read the list above and typed `--apply`. Saying
-        // the number out loud is what keeps that from being a blind yes.
+        // Reached only with `--yes`, or with `require-confirmation` turned off.
+        // Saying the number out loud is what keeps either from being a blind yes.
         eprintln!("{confirm} of these are not regenerable — removing anyway, as asked.");
     }
 
-    if removal == Removal::Purge {
+    if removing.removal == Removal::Purge {
         // The last word before something becomes unrecoverable. `--purge` is a
         // deliberate reversal of this tool's central promise, so it is said
         // plainly rather than assumed understood.
@@ -262,7 +315,7 @@ fn remove(
     let spinner = ProgressBar::new_spinner();
     spinner.set_message(format!("Removing {} items…", planned.candidates.len()));
     spinner.enable_steady_tick(Duration::from_millis(100));
-    let outcome = apply(planned, removal, |_| {});
+    let outcome = apply(planned, removing.removal, |_| {});
     spinner.finish_and_clear();
 
     // Whether the freed figure needs the same hedge the dry run's total carried:
@@ -274,7 +327,7 @@ fn remove(
         .any(|c| c.shared && outcome.removed.contains(&c.path));
 
     let code = emit(
-        &render_outcome(&outcome, shared_removed, removal == Removal::Purge),
+        &render_outcome(&outcome, shared_removed, removing.removal == Removal::Purge),
         skipped,
         verbose,
     );

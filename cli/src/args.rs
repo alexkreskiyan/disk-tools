@@ -136,6 +136,14 @@ pub struct CleanArgs {
     #[arg(long, requires = "apply")]
     pub purge: bool,
 
+    /// Remove candidates that are not regenerable too. Requires --apply.
+    ///
+    /// Without it, --apply stops when the plan holds anything that needs
+    /// confirming. There is no config key for this: a file that answered yes in
+    /// advance would cancel the confirmation, and cancel it invisibly.
+    #[arg(long, requires = "apply")]
+    pub yes: bool,
+
     /// Include build output whose project has uncommitted changes.
     #[arg(long = "allow-dirty")]
     pub allow_dirty: bool,
@@ -169,6 +177,14 @@ pub enum Mode {
         /// disabled, or dropped. The caller says so; an empty plan would read as
         /// "nothing to clean", which is a different statement.
         roots: Vec<PathBuf>,
+
+        /// May the removal take candidates that are not regenerable?
+        ///
+        /// `--yes`, or a config that turned `require-confirmation` off. Resolved
+        /// to one boolean because the decision is made once — leaving both
+        /// inputs to be re-combined at the point of deletion is how they come to
+        /// disagree.
+        confirm_tier_allowed: bool,
 
         /// Whether those roots came from the rules rather than the command line.
         ///
@@ -275,6 +291,12 @@ impl Args {
 
                 Ok(Mode::Clean {
                     roots,
+                    // **True** when nothing says otherwise. The concept asks for
+                    // confirmation on this tier, and the asymmetry the denylist
+                    // already states applies: refusing too readily costs a user
+                    // one extra flag, refusing too rarely costs them data.
+                    confirm_tier_allowed: clean.yes
+                        || !clean_settings.require_confirmation.unwrap_or(true),
                     roots_from_rules,
                     clean: Box::new(CleanOptions {
                         detect: DetectOptions { rules, now },
