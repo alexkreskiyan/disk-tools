@@ -118,13 +118,25 @@ pub struct CleanPlan {
     /// A count is what was wanted; a count is what this is.
     pub filtered_out: usize,
 
-    /// How many candidates fell below [`CleanOptions::min_size`].
+    /// How many candidates fell below [`CleanOptions::min_size`] — the flag.
     ///
     /// Counted separately from `filtered_out` because the two are different
     /// answers to "why is it not here": one needs confirmation, the other is
     /// small. Merging them would let the report offer `--safe` as the remedy for
     /// something `--safe` had nothing to do with.
     pub too_small: usize,
+
+    /// How many fell below the **rule's** own `min_size` instead.
+    ///
+    /// Split from `too_small` for exactly the reason `too_small` is split from
+    /// `filtered_out`: the remedy differs. One is answered by lowering a flag,
+    /// the other by editing the rule in the config file, and a report naming
+    /// `--min-size` for a threshold the user never passed on the command line
+    /// sends them to change something they never set.
+    ///
+    /// A candidate below **both** counts here, since the rule is the narrower
+    /// statement and the one the user would have to go and find.
+    pub below_rule_minimum: usize,
 }
 
 /// Everything a cleanup needs to know.
@@ -192,6 +204,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
     let mut excluded = Vec::new();
     let mut filtered_out = 0;
     let mut too_small = 0;
+    let mut below_rule_minimum = 0;
     // One `git status` per repository, not per candidate: a tree of sibling
     // Rust projects would otherwise spawn a process for each, and a workspace
     // whose members share a repository would ask the same question repeatedly.
@@ -220,11 +233,19 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
             continue;
         }
 
-        // The user's own narrowings, both after the refusals above so that a
-        // denied or guarded path is still reported as such. The rule's own
-        // threshold and the global `--min-size` both apply; the larger wins.
-        let floor = options.min_size.max(rule.map_or(0, |rule| rule.min_size));
-        if detection.allocated < floor {
+        // The user's own narrowings, all after the refusals above so that a
+        // denied or guarded path is still reported as such.
+        //
+        // Both thresholds apply and the larger wins, but *which* one dropped it
+        // is counted apart, because the remedy differs: lower the flag, or go
+        // and edit the rule. The rule is checked first, since it is the narrower
+        // statement and the harder one to find.
+        let rule_minimum = rule.map_or(0, |rule| rule.min_size);
+        if detection.allocated < rule_minimum {
+            below_rule_minimum += 1;
+            continue;
+        }
+        if detection.allocated < options.min_size {
             too_small += 1;
             continue;
         }
@@ -268,6 +289,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
         excluded,
         filtered_out,
         too_small,
+        below_rule_minimum,
     }
 }
 
@@ -973,7 +995,93 @@ mod tests {
         );
 
         assert_eq!(paths(&plan), vec![Path::new("/p/big/node_modules")]);
-        assert_eq!(plan.too_small, 1, "and the one dropped is counted");
+        assert_eq!(
+            plan.below_rule_minimum, 1,
+            "counted against the rule's threshold, since that is what dropped it"
+        );
+        assert_eq!(
+            plan.too_small, 0,
+            "and not against the flag, which was never passed"
+        );
+    }
+
+    /// The two thresholds are counted apart because their remedies differ: one
+    /// is a flag on this command line, the other a line in a config file the
+    /// user has to go and find. A report naming `--min-size` for a rule's
+    /// threshold sends them to change something they never set.
+    #[test]
+    fn the_two_size_thresholds_are_counted_separately() {
+        let options = CleanOptions {
+            min_size: 1_048_576,
+            ..with(
+                UserDirs::default(),
+                vec![
+                    Rule {
+                        name: "strict".into(),
+                        includes: vec!["**/__pycache__/".into()],
+                        min_size: 4_194_304,
+                        tier: Tier::Auto,
+                        ..Rule::default()
+                    },
+                    Rule {
+                        name: "loose".into(),
+                        includes: vec!["**/node_modules/".into()],
+                        tier: Tier::Auto,
+                        ..Rule::default()
+                    },
+                ],
+            )
+        };
+
+        let plan = plan(
+            &tree(dir(
+                "/p",
+                vec![
+                    // Over the flag, under its own rule's threshold.
+                    dir(
+                        "/p/a",
+                        vec![dir(
+                            "/p/a/__pycache__",
+                            vec![file("/p/a/__pycache__/x.bin", 2_000_000)],
+                        )],
+                    ),
+                    // Under the flag; its rule sets no threshold of its own.
+                    dir("/p/b", vec![dir("/p/b/node_modules", vec![])]),
+                ],
+            )),
+            &options,
+        );
+
+        assert!(plan.candidates.is_empty(), "{:?}", paths(&plan));
+        assert_eq!(plan.below_rule_minimum, 1, "the pycache, by its own rule");
+        assert_eq!(plan.too_small, 1, "the node_modules, by the flag");
+    }
+
+    /// A candidate under both is counted once, against the rule — the narrower
+    /// statement, and the one the user would have to hunt for.
+    #[test]
+    fn below_both_thresholds_counts_against_the_rule() {
+        let options = CleanOptions {
+            min_size: 1_048_576,
+            ..with(
+                UserDirs::default(),
+                vec![Rule {
+                    name: "strict".into(),
+                    includes: vec!["**/node_modules/".into()],
+                    min_size: 4_194_304,
+                    tier: Tier::Auto,
+                    ..Rule::default()
+                }],
+            )
+        };
+
+        let plan = plan(
+            &tree(dir("/p", vec![dir("/p/node_modules", vec![])])),
+            &options,
+        );
+
+        assert_eq!(plan.below_rule_minimum, 1);
+        assert_eq!(plan.too_small, 0, "counted once, not twice");
     }
 
     #[test]

@@ -916,6 +916,41 @@ mod tests {
         assert_eq!(config.rules, builtin_rules());
     }
 
+    /// A file that **exists but cannot be read** is not the same as one that is
+    /// not there, and only the second may fall back to defaults. Mutation
+    /// testing found this: replacing the `NotFound` guard with `true` left every
+    /// test passing, which meant an unreadable config would silently become the
+    /// built-in rules — and the user would be cleaning under rules they did not
+    /// write, with nothing said.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_an_error_rather_than_a_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Where `locate` will actually look, given this as `$XDG_CONFIG_HOME`.
+        let path = config_file(dir.path());
+        std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+        std::fs::write(&path, DEFAULT_CONFIG).expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        // Privileges that ignore the mode would read it fine and make this pass
+        // for the wrong reason.
+        if std::fs::read_to_string(&path).is_ok() {
+            eprintln!("skipping: privileges ignore the unreadable mode");
+            return;
+        }
+
+        let result = load(None, &UserDirs::default(), Some(dir.path().to_path_buf()));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("restore");
+
+        let err = result.expect_err("an unreadable config must not become the defaults");
+        assert!(
+            matches!(err, ConfigError::Read(..)),
+            "and it must say so, not claim the file is absent: {err}"
+        );
+    }
+
     /// But a path the user named and that is not there is a typo, and defaults
     /// substituted for it would mean cleaning under rules they never wrote.
     #[test]

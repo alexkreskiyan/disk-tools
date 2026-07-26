@@ -67,24 +67,31 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
         );
     }
 
+    // Three separate lines, and deliberately so: each names the thing a user
+    // would have to change to see what is missing. Offering `--safe` as the
+    // answer to "where did the rest go" when the answer is `--min-size` sends
+    // them at the wrong flag — and naming `--min-size` when the threshold came
+    // from a rule sends them to change something they never set.
     if plan.too_small > 0 {
-        // A separate line from the `--safe` one above, and deliberately so: the
-        // remedy differs. Offering `--safe` as the answer to "where did the rest
-        // go" when the answer is `--min-size` would send the user at the wrong
-        // flag, the same way an undifferentiated exclusion list would.
-        let noun = if plan.too_small == 1 {
-            "candidate is"
-        } else {
-            "candidates are"
-        };
-        // Both thresholds are named, because since v0.3 either could be the one
-        // that applied: `--min-size` on the command line, or a `min-size` on the
-        // rule that matched. Naming only the flag would send a user to change
-        // something they never set.
         let _ = writeln!(
             out,
-            "\n{} more {noun} below --min-size or their rule's own min-size.",
-            plan.too_small
+            "\n{} more {} below --min-size.",
+            plan.too_small,
+            are(plan.too_small)
+        );
+    }
+
+    if plan.below_rule_minimum > 0 {
+        let _ = writeln!(
+            out,
+            "\n{} more {} below their rule's own min-size; edit the rule to see {}.",
+            plan.below_rule_minimum,
+            are(plan.below_rule_minimum),
+            if plan.below_rule_minimum == 1 {
+                "it"
+            } else {
+                "them"
+            }
         );
     }
 
@@ -162,6 +169,16 @@ pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, purged: bool
     }
 
     out
+}
+
+/// "candidate is" / "candidates are" — the verb has to agree with the noun, not
+/// only the noun with the count.
+fn are(count: usize) -> &'static str {
+    if count == 1 {
+        "candidate is"
+    } else {
+        "candidates are"
+    }
 }
 
 fn write_candidates(candidates: &[Candidate], out: &mut String) {
@@ -277,6 +294,7 @@ mod tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 0,
+            below_rule_minimum: 0,
         }
     }
 
@@ -619,6 +637,7 @@ mod intent_tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 0,
+            below_rule_minimum: 0,
         }
     }
 
@@ -726,6 +745,7 @@ mod min_size_tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 150,
+            below_rule_minimum: 0,
         };
 
         let report = render_clean(&plan, None, Intent::DryRun);
@@ -739,14 +759,73 @@ mod min_size_tests {
             "the remedy is the size flag, not the tier one: {report}"
         );
 
-        // And with both narrowings in effect, both are stated.
+        // And with all three narrowings in effect, all three are stated.
         plan.filtered_out = 3;
-        let both = render_clean(&plan, Some(3), Intent::DryRun);
+        plan.below_rule_minimum = 7;
+        let all = render_clean(&plan, Some(3), Intent::DryRun);
+        assert!(all.contains("3 more candidates need confirmation"), "{all}");
         assert!(
-            both.contains("3 more candidates need confirmation"),
-            "{both}"
+            all.contains("150 more candidates are below --min-size"),
+            "{all}"
         );
-        assert!(both.contains("150 more candidates are below"), "{both}");
+        assert!(
+            all.contains("7 more candidates are below their rule's own min-size"),
+            "{all}"
+        );
+    }
+
+    /// The two size thresholds are not the same statement, and they do not have
+    /// the same remedy: one is a flag on this command line, the other is a line
+    /// in a file the user has to go and find. Naming `--min-size` for a rule's
+    /// threshold sends them to change something they never set.
+    #[test]
+    fn a_rules_own_threshold_is_reported_apart_from_the_flag() {
+        let plan = CleanPlan {
+            candidates: Vec::new(),
+            reclaimable: 0,
+            excluded: Vec::new(),
+            filtered_out: 0,
+            too_small: 0,
+            below_rule_minimum: 2,
+        };
+
+        let report = render_clean(&plan, None, Intent::DryRun);
+
+        assert!(
+            report.contains("2 more candidates are below their rule's own min-size"),
+            "{report}"
+        );
+        assert!(
+            report.contains("edit the rule"),
+            "and it must say where to go: {report}"
+        );
+        assert!(
+            !report.contains("--min-size"),
+            "naming a flag the user never passed is the bug this splits: {report}"
+        );
+    }
+
+    #[test]
+    fn one_below_a_rules_threshold_reads_singular() {
+        let plan = CleanPlan {
+            candidates: Vec::new(),
+            reclaimable: 0,
+            excluded: Vec::new(),
+            filtered_out: 0,
+            too_small: 0,
+            below_rule_minimum: 1,
+        };
+
+        let report = render_clean(&plan, None, Intent::DryRun);
+
+        assert!(
+            report.contains("1 more candidate is below their rule's own min-size"),
+            "{report}"
+        );
+        assert!(
+            report.contains("edit the rule to see it."),
+            "the pronoun agrees too: {report}"
+        );
     }
 
     #[test]
@@ -757,6 +836,7 @@ mod min_size_tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 0,
+            below_rule_minimum: 0,
         };
 
         assert!(!render_clean(&plan, None, Intent::DryRun).contains("--min-size"));
@@ -770,6 +850,7 @@ mod min_size_tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 1,
+            below_rule_minimum: 0,
         };
 
         assert!(

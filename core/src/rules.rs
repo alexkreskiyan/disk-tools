@@ -429,25 +429,23 @@ fn resolve_root(root: Option<&str>, dirs: &UserDirs) -> Option<Option<PathBuf>> 
         return Some(None);
     };
 
-    let expanded = match split_token(root) {
-        Some(("~", rest)) => dirs.home.as_ref()?.join(rest),
-        Some(("%LOCALAPPDATA%", rest)) => dirs.local_app_data.as_ref()?.join(rest),
-        Some(("%APPDATA%", rest)) => dirs.app_data.as_ref()?.join(rest),
-        Some((_, _)) | None => PathBuf::from(root),
-    };
-    Some(Some(expanded))
-}
-
-/// Split a leading `~` / `%VAR%` token from the rest of the path, if the path
-/// starts with one. The remainder is relative and may be empty.
-fn split_token(root: &str) -> Option<(&str, &str)> {
+    // The first path segment, and whatever follows it. Nothing checks whether
+    // that segment *looks* like a token — a `%FOO%` this build knows nothing
+    // about and a plain `Projects` both fall to the same arm below, so asking
+    // the question could not change the answer. Mutation testing is what showed
+    // that: three mutants of the shape test survived, all of them equivalent.
     let end = root.find(['/', '\\']).unwrap_or(root.len());
     let (token, rest) = root.split_at(end);
-    if token == "~" || (token.starts_with('%') && token.ends_with('%') && token.len() > 2) {
-        Some((token, rest.trim_start_matches(['/', '\\'])))
-    } else {
-        None
-    }
+    let rest = rest.trim_start_matches(['/', '\\']);
+
+    let expanded = match token {
+        "~" => dirs.home.as_ref()?.join(rest),
+        "%LOCALAPPDATA%" => dirs.local_app_data.as_ref()?.join(rest),
+        "%APPDATA%" => dirs.app_data.as_ref()?.join(rest),
+        // Not a token this build knows: the whole thing is a literal path.
+        _ => PathBuf::from(root),
+    };
+    Some(Some(expanded))
 }
 
 /// A resolved root as a glob prefix, or `None` if it is not UTF-8.
@@ -746,6 +744,116 @@ mod tests {
             "an ancestor of the root"
         );
         assert!(!rules.prunes(Path::new("/")), "and the way to it");
+    }
+
+    /// All three tokens resolve, including `%APPDATA%` — which no built-in rule
+    /// uses, since the roaming profile is a *denylist* root rather than a
+    /// candidate one. It is still a token the config documents, so a user may
+    /// root a rule there, and mutation testing found nothing exercising it.
+    #[test]
+    fn every_documented_token_resolves_from_user_dirs() {
+        let dirs = UserDirs {
+            home: Some(PathBuf::from("/home/me")),
+            local_app_data: Some(PathBuf::from("/local")),
+            app_data: Some(PathBuf::from("/roaming")),
+        };
+
+        for (token, resolved) in [
+            ("~", "/home/me"),
+            ("%LOCALAPPDATA%", "/local"),
+            ("%APPDATA%", "/roaming"),
+        ] {
+            let rules = Rules::new(
+                vec![Rule {
+                    root: Some(format!("{token}/inner")),
+                    ..rule("t", &["x/"])
+                }],
+                &dirs,
+            )
+            .expect("compile");
+
+            assert_eq!(
+                matches(&rules, &format!("{resolved}/inner/x"), true),
+                vec!["t"],
+                "`{token}` must expand to `{resolved}`"
+            );
+        }
+    }
+
+    /// And each is dropped on its own when the frontend could not find it —
+    /// never widened to some other directory that happens to be known.
+    #[test]
+    fn a_token_whose_directory_is_unknown_drops_its_rule() {
+        for token in ["~", "%LOCALAPPDATA%", "%APPDATA%"] {
+            let rules = Rules::new(
+                vec![Rule {
+                    root: Some(token.into()),
+                    ..rule("t", &["x/"])
+                }],
+                &UserDirs::default(),
+            )
+            .expect("compile");
+
+            assert!(rules.is_empty(), "`{token}` had nothing to resolve against");
+        }
+    }
+
+    /// A path whose first segment is not a token this build knows is a literal,
+    /// whatever it looks like. Nothing distinguishes `%FOO%` from `Projects`
+    /// here, and nothing should: inventing an expansion for an unknown variable
+    /// is guessing about where a delete rule points.
+    #[test]
+    fn an_unknown_token_is_a_literal_path() {
+        for root in ["%FOO%", "%", "%%", "~sam", "Projects"] {
+            let rules = Rules::new(
+                vec![Rule {
+                    root: Some(root.into()),
+                    ..rule("literal", &["x/"])
+                }],
+                &dirs("/home/me"),
+            )
+            .expect("compile");
+
+            assert_eq!(
+                matches(&rules, &format!("{root}/x"), true),
+                vec!["literal"],
+                "`{root}` must be taken as written"
+            );
+        }
+    }
+
+    /// The one place `is_empty` is load-bearing: a config whose rules all failed
+    /// to resolve leaves nothing that could ever match, and the caller has to be
+    /// able to say so rather than report a silent empty plan.
+    #[test]
+    fn rules_that_all_drop_leave_an_empty_set() {
+        let rules = Rules::new(
+            vec![Rule {
+                root: Some("~".into()),
+                ..rule("needs-home", &[".cache/"])
+            }],
+            &UserDirs::default(),
+        )
+        .expect("compile");
+
+        assert!(rules.is_empty(), "every rule was dropped");
+        assert!(
+            !Rules::builtin(&UserDirs::default()).is_empty(),
+            "and a set with anything in it is not empty"
+        );
+    }
+
+    /// Confirm tier, and stated rather than inherited: "you have not touched
+    /// this in a while" is not evidence that it regenerates, and a later change
+    /// to `Rule::default` must not be able to make age matches auto by accident.
+    #[test]
+    fn the_age_rule_is_confirm_tier_by_its_own_statement() {
+        let rule = age_rule(Duration::from_secs(1));
+
+        assert_eq!(rule.tier, Tier::Confirm);
+        assert_eq!(rule.name, "old");
+        assert_eq!(rule.older_than, Some(Duration::from_secs(1)));
+        assert_eq!(rule.root, None, "it applies wherever the scan goes");
     }
 
     #[test]

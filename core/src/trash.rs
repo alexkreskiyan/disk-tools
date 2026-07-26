@@ -289,6 +289,7 @@ mod tests {
             excluded: Vec::new(),
             filtered_out: 0,
             too_small: 0,
+            below_rule_minimum: 0,
         }
     }
 
