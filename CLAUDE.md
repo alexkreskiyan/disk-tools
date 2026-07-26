@@ -18,8 +18,8 @@ its Roadmap for what lands when; the
 [v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) and
 [v0.3](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md) specs are
 the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
-(the TUI) has Task 1 of 7 done — `disk-tools ui` opens and, more to the point,
-closes. User-facing usage, flags, the safety model and
+(the TUI) has Tasks 1-2 of 7 done — `disk-tools ui` opens a directory, navigates
+and sorts, and always gives the terminal back. User-facing usage, flags, the safety model and
 the documented limitations live in the [README](README.md).
 
 ## Important: Documentation Requirements

@@ -40,6 +40,17 @@ pub(crate) fn measure(path: &Path, metadata: &Metadata) -> io::Result<Sizes> {
     })
 }
 
+/// What one file occupies on disk.
+///
+/// Public because the TUI lists directories itself and must report the **same**
+/// number `scan` does. `metadata.len()` is the apparent size, and showing that
+/// in one verb and this in another would make the same file read two ways —
+/// worse once directory totals arrive, since those are allocated and would sit
+/// in the same column.
+pub fn allocated_size(path: &Path, metadata: &Metadata) -> io::Result<u64> {
+    allocated(path, metadata)
+}
+
 /// `st_blocks` counts 512-byte units by POSIX definition, whatever the
 /// filesystem's real block size is — this is deliberately not `blksize()`,
 /// which is the preferred I/O chunk and a common mix-up.
