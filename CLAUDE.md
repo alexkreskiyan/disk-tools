@@ -7,8 +7,9 @@ regenerable junk and stale files and removes them **to the OS trash**, dry-run b
 default.
 
 **v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete;
-v0.3 (config + declarative rules) is specced, with Tasks 1-3 of 6 done —
-detection is declarative, reads a TOML config, and flags beat the file.** A TUI follows on
+v0.3 (config + declarative rules) is specced, with Tasks 1-4 of 6 done —
+detection is declarative, reads a TOML config, flags beat the file, and `clean`
+walks the rule roots when given no path.** A TUI follows on
 the same core. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
@@ -114,6 +115,7 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 |------|-------|------|
 | `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs` | Walk → dedup → aggregate, in that order |
 | `plan(&ScanTree, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | Decides what may go and what that frees. **Writes nothing** |
+| `CleanPlan::merge(Vec<CleanPlan>)` | `core/src/clean.rs` | One plan from several roots. Additive **only because** `Rules::scan_roots` drops nested roots |
 | `apply(&CleanPlan, Removal, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. `Removal::Trash` batches; `Removal::Purge` deletes outright |
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |

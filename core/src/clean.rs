@@ -139,6 +139,44 @@ pub struct CleanPlan {
     pub below_rule_minimum: usize,
 }
 
+impl CleanPlan {
+    /// Combine the plans of several disjoint roots into one.
+    ///
+    /// `clean` with no path walks a root per rule, and each walk produces its own
+    /// plan. Merging the **plans** rather than the trees is what avoids inventing
+    /// a synthetic node above them — one that would need a path and a size it
+    /// does not have.
+    ///
+    /// Every field is additive, and safely so **only because the roots do not
+    /// overlap**: [`crate::Rules::scan_roots`] drops any root that lies inside
+    /// another, so no path can appear in two plans and no byte is summed twice.
+    /// Handed overlapping roots this would double both.
+    ///
+    /// Candidates are re-sorted, since concatenating two sorted lists does not
+    /// give a sorted one — and a plan whose order shifts between runs cannot be
+    /// reviewed.
+    pub fn merge(plans: Vec<CleanPlan>) -> CleanPlan {
+        let mut merged = CleanPlan::default();
+
+        for plan in plans {
+            merged.candidates.extend(plan.candidates);
+            merged.excluded.extend(plan.excluded);
+            merged.reclaimable += plan.reclaimable;
+            merged.filtered_out += plan.filtered_out;
+            merged.too_small += plan.too_small;
+            merged.below_rule_minimum += plan.below_rule_minimum;
+        }
+
+        merged
+            .candidates
+            .sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+        merged
+            .excluded
+            .sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+        merged
+    }
+}
+
 /// Everything a cleanup needs to know.
 #[derive(Debug, Clone, Default)]
 pub struct CleanOptions {
@@ -1346,6 +1384,95 @@ mod tests {
         let mut sorted = first.candidates.clone();
         sorted.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
         assert_eq!(first.candidates, sorted, "candidates are ordered by path");
+    }
+
+    // ---- merging the plans of several roots ------------------------------
+
+    /// `clean` with no path plans one root at a time, and the report has to read
+    /// as one plan. Concatenating two sorted lists does not give a sorted one,
+    /// and an order that shifts between runs cannot be reviewed.
+    #[test]
+    fn merge_orders_the_combined_candidates_by_path() {
+        let first = plan(
+            &tree(dir("/z", vec![dir("/z/node_modules", vec![])])),
+            &opts(),
+        );
+        let second = plan(
+            &tree(dir("/a", vec![dir("/a/node_modules", vec![])])),
+            &opts(),
+        );
+
+        let merged = CleanPlan::merge(vec![first, second]);
+
+        assert_eq!(
+            paths(&merged),
+            vec![Path::new("/a/node_modules"), Path::new("/z/node_modules")],
+            "the later root's candidate sorts ahead of the earlier one's"
+        );
+    }
+
+    #[test]
+    fn merge_sums_the_total_and_every_counter() {
+        let fixture = |root: &str| {
+            let nm = format!("{root}/node_modules");
+            let small = format!("{root}/tiny");
+            let pyc = format!("{small}/__pycache__");
+            tree(dir(
+                root,
+                vec![
+                    dir(&nm, vec![file(&format!("{nm}/x.bin"), 2_000_000)]),
+                    dir(&small, vec![dir(&pyc, vec![])]),
+                ],
+            ))
+        };
+        let options = CleanOptions {
+            min_size: 1_048_576,
+            ..opts()
+        };
+
+        let merged = CleanPlan::merge(vec![
+            plan(&fixture("/a"), &options),
+            plan(&fixture("/b"), &options),
+        ]);
+
+        assert_eq!(merged.candidates.len(), 2);
+        assert_eq!(
+            merged.reclaimable,
+            merged.candidates.iter().map(|c| c.allocated).sum::<u64>()
+        );
+        assert_eq!(merged.too_small, 2, "one from each root");
+    }
+
+    #[test]
+    fn merging_nothing_yields_an_empty_plan() {
+        let merged = CleanPlan::merge(Vec::new());
+
+        assert_eq!(merged, CleanPlan::default());
+    }
+
+    /// The refusals survive the merge too. A denylisted path dropped here would
+    /// be the tool protecting something and then not saying so.
+    #[test]
+    fn merge_keeps_every_refusal() {
+        let denied = plan(
+            &tree(dir("/Windows", vec![dir("/Windows/node_modules", vec![])])),
+            &opts(),
+        );
+        let ordinary = plan(
+            &tree(dir("/p", vec![dir("/p/node_modules", vec![])])),
+            &opts(),
+        );
+
+        let merged = CleanPlan::merge(vec![ordinary, denied]);
+
+        assert_eq!(paths(&merged), vec![Path::new("/p/node_modules")]);
+        assert_eq!(
+            merged.excluded,
+            vec![Excluded {
+                path: PathBuf::from("/Windows/node_modules"),
+                reason: ExcludeReason::Denylisted,
+            }]
+        );
     }
 
     // ---- the shared marker -----------------------------------------------

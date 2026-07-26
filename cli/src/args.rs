@@ -111,9 +111,13 @@ pub struct ScanArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct CleanArgs {
-    /// Directory to examine.
+    /// Directory to examine. Without one, the roots of your configured rules.
+    ///
+    /// Omitting it is not the same as `.` — nothing here ever falls back to the
+    /// working directory. With no path and no rooted rule there is nothing to
+    /// examine, and the tool says so rather than guessing.
     #[arg(value_name = "PATH")]
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
 
     /// Only offer regenerable safe-list categories; skip anything needing
     /// per-item confirmation.
@@ -158,7 +162,20 @@ pub enum Mode {
         json: bool,
     },
     Clean {
-        scan: ScanOptions,
+        /// What to walk: the path if one was given, otherwise the roots of the
+        /// enabled rules, already merged so none contains another.
+        ///
+        /// **Empty means there is nothing to examine** — every rule unrooted,
+        /// disabled, or dropped. The caller says so; an empty plan would read as
+        /// "nothing to clean", which is a different statement.
+        roots: Vec<PathBuf>,
+
+        /// Whether those roots came from the rules rather than the command line.
+        ///
+        /// Only then are they worth announcing: a user who named a path knows
+        /// where they pointed, and one who did not is entitled to be told before
+        /// a walk of their whole home directory begins.
+        roots_from_rules: bool,
         /// Boxed: the compiled rule set carries two glob automata, and without
         /// the indirection every `Mode::Scan` — which needs none of it — would
         /// pay for the space anyway.
@@ -245,16 +262,22 @@ impl Args {
                     rules.push(age_rule(older_than));
                 }
 
+                let rules = Rules::new(rules, &user_dirs).map_err(ResolveError::Rule)?;
+                // A path narrows the walk to itself; the rules still apply
+                // within it, and one rooted elsewhere simply matches nothing —
+                // `Rules::prunes` sees to that. With no path, the rules say
+                // where to look, which is what `root` is required for.
+                let roots_from_rules = clean.path.is_none();
+                let roots = match clean.path {
+                    Some(path) => vec![path],
+                    None => rules.scan_roots(),
+                };
+
                 Ok(Mode::Clean {
-                    scan: ScanOptions {
-                        root: clean.path,
-                        ..ScanOptions::default()
-                    },
+                    roots,
+                    roots_from_rules,
                     clean: Box::new(CleanOptions {
-                        detect: DetectOptions {
-                            rules: Rules::new(rules, &user_dirs).map_err(ResolveError::Rule)?,
-                            now,
-                        },
+                        detect: DetectOptions { rules, now },
                         user_dirs,
                         safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
                         // Deliberately not configurable: a file that quietly
@@ -546,8 +569,15 @@ mod tests {
     fn scan_options(args: &[&str]) -> ScanOptions {
         match resolved(args).expect("resolve") {
             Mode::Scan { options, .. } => options,
-            Mode::Clean { scan, .. } => scan,
-            other => panic!("expected a scan or a clean, got {other:?}"),
+            other => panic!("expected a scan, got {other:?}"),
+        }
+    }
+
+    /// What a `clean` invocation will walk.
+    fn clean_roots(args: &[&str]) -> Vec<PathBuf> {
+        match resolved(args).expect("resolve") {
+            Mode::Clean { roots, .. } => roots,
+            other => panic!("expected a clean, got {other:?}"),
         }
     }
 
@@ -572,15 +602,16 @@ mod tests {
         );
         assert_eq!(err.exit_code(), 2, "still a usage error, not a success");
 
-        // And each verb keeps its own required path.
-        for verb in ["scan", "clean"] {
-            let err = parse(&[verb]).expect_err("{verb} needs a path");
-            assert_eq!(
-                err.kind(),
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "{verb} must demand a path"
-            );
-        }
+        // `scan` still demands one; `clean` no longer does, having the rules to
+        // ask instead. Neither ever falls back to the working directory, which
+        // is the guarantee that has not moved.
+        let err = parse(&["scan"]).expect_err("scan needs a path");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        assert!(
+            parse(&["clean"]).is_ok(),
+            "clean without a path asks the rules where to look"
+        );
     }
 
     #[test]
@@ -788,12 +819,15 @@ mod tests {
         .expect("parse");
 
         let Mode::Clean {
-            scan, clean, apply, ..
+            roots,
+            clean,
+            apply,
+            ..
         } = mode
         else {
             panic!("expected the clean subcommand");
         };
-        assert_eq!(scan.root, PathBuf::from("/x"));
+        assert_eq!(roots, vec![PathBuf::from("/x")]);
         assert!(clean.safe_only);
         assert!(clean.allow_dirty);
         assert!(apply);
@@ -942,9 +976,77 @@ mod tests {
         );
     }
 
+    // ---- what `clean` walks ---------------------------------------------
+
+    /// The promise Task 2 made when it required `root` in the file: without a
+    /// path, the rules say where to look.
     #[test]
-    fn clean_without_a_path_is_a_usage_error() {
-        let err = parse(&["clean"]).expect_err("clean needs a path");
+    fn without_a_path_the_rule_roots_are_walked() {
+        let config = crate::config::parse_for_test(
+            "[[rules]]\nname = \"a\"\nroot = \"/tmp/a\"\nincludes = [\"**/x/\"]\n\n\
+             [[rules]]\nname = \"b\"\nroot = \"/tmp/b\"\nincludes = [\"**/y/\"]\n",
+        );
+        let mode = parse(&["clean"])
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve");
+
+        let Mode::Clean {
+            roots,
+            roots_from_rules,
+            ..
+        } = mode
+        else {
+            panic!("expected a clean");
+        };
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+        assert!(roots_from_rules, "so the caller can announce them");
+    }
+
+    /// A path narrows the walk to itself. The rules still apply within it — one
+    /// rooted elsewhere simply matches nothing, which `Rules::prunes` decides.
+    #[test]
+    fn a_path_is_the_only_thing_walked() {
+        let config = crate::config::parse_for_test(
+            "[[rules]]\nname = \"a\"\nroot = \"/tmp/a\"\nincludes = [\"**/x/\"]\n",
+        );
+        let mode = parse(&["clean", "/elsewhere"])
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve");
+
+        let Mode::Clean {
+            roots,
+            roots_from_rules,
+            ..
+        } = mode
+        else {
+            panic!("expected a clean");
+        };
+        assert_eq!(roots, vec![PathBuf::from("/elsewhere")]);
+        assert!(
+            !roots_from_rules,
+            "a user who named a path knows where they pointed"
+        );
+    }
+
+    /// Every built-in rule but the cache ones is unrooted, so with no home and
+    /// no path there is nothing to walk. That is a statement about the
+    /// configuration, and the caller has to make it — an empty plan would read
+    /// as "nothing to clean".
+    #[test]
+    fn unrooted_rules_alone_leave_nothing_to_walk() {
+        assert!(clean_roots(&["clean"]).is_empty());
+    }
+
+    /// Unlike `clean`, a scan has no rules to ask and never falls back to the
+    /// working directory.
+    #[test]
+    fn scan_still_demands_a_path() {
+        let err = parse(&["scan"]).expect_err("scan needs a path");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 

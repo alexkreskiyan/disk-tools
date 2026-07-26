@@ -289,12 +289,33 @@ impl Rules {
         self.rules.is_empty()
     }
 
-    /// The resolved roots of the rules that survived compilation.
+    /// What `clean` with no path walks: the resolved roots of the rules that
+    /// survived compilation, sorted, with any root that lies inside another
+    /// dropped.
     ///
-    /// What `clean` with no path walks (v0.3 Task 4), and what a caller needs to
-    /// tell a user that their rules cover nothing.
-    pub fn roots(&self) -> impl Iterator<Item = &Path> {
-        self.roots.iter().filter_map(Option::as_deref)
+    /// Empty when no rule names a directory — every rule unrooted (`root = "*"`
+    /// in the file), disabled, or dropped for a token that would not resolve.
+    /// The caller has to say so rather than report an empty plan, which would
+    /// read as "nothing to clean".
+    pub fn scan_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<&Path> = self.roots.iter().filter_map(Option::as_deref).collect();
+        // Sorted so a containing root always precedes what it contains, and so
+        // the answer does not depend on the order rules were written in.
+        roots.sort_unstable();
+        roots.dedup();
+
+        let mut merged: Vec<PathBuf> = Vec::with_capacity(roots.len());
+        for root in roots {
+            // Dropping a nested root is not tidiness. Walking `~` and
+            // `~/Projects` both would put every candidate under the latter into
+            // the plan twice, and `reclaimable` would report double what
+            // removing them frees.
+            if merged.iter().any(|kept| is_within(root, kept)) {
+                continue;
+            }
+            merged.push(root.to_path_buf());
+        }
+        merged
     }
 
     pub(crate) fn rule_at(&self, index: usize) -> &Rule {
@@ -438,10 +459,22 @@ fn resolve_root(root: Option<&str>, dirs: &UserDirs) -> Option<Option<PathBuf>> 
     let (token, rest) = root.split_at(end);
     let rest = rest.trim_start_matches(['/', '\\']);
 
+    // `join("")` appends a separator, so a bare `~` would resolve to
+    // `/home/me/`. Harmless to every comparison here — they are component-wise —
+    // but the resolved root is also printed, and a stray trailing slash reads as
+    // a mistake.
+    let under = |base: &PathBuf| {
+        if rest.is_empty() {
+            base.clone()
+        } else {
+            base.join(rest)
+        }
+    };
+
     let expanded = match token {
-        "~" => dirs.home.as_ref()?.join(rest),
-        "%LOCALAPPDATA%" => dirs.local_app_data.as_ref()?.join(rest),
-        "%APPDATA%" => dirs.app_data.as_ref()?.join(rest),
+        "~" => under(dirs.home.as_ref()?),
+        "%LOCALAPPDATA%" => under(dirs.local_app_data.as_ref()?),
+        "%APPDATA%" => under(dirs.app_data.as_ref()?),
         // Not a token this build knows: the whole thing is a literal path.
         _ => PathBuf::from(root),
     };
@@ -958,14 +991,121 @@ mod tests {
         assert!(matches(&rules, "/home/me/.cache/pip", true).is_empty());
     }
 
+    /// A bare `~` resolves to the home directory itself, with no trailing
+    /// separator — the resolved root is printed to the user before a walk.
     #[test]
-    fn roots_lists_only_the_rooted_rules() {
+    fn a_bare_token_resolves_to_the_directory_itself() {
+        let rules = Rules::new(
+            vec![Rule {
+                root: Some("~".into()),
+                ..rule("t", &["x/"])
+            }],
+            &dirs("/home/me"),
+        )
+        .expect("compile");
+
+        assert_eq!(rules.scan_roots(), vec![PathBuf::from("/home/me")]);
+    }
+
+    #[test]
+    fn scan_roots_lists_only_the_rooted_rules() {
         let rules = Rules::builtin(&dirs("/home/me"));
 
         assert_eq!(
-            rules.roots().collect::<Vec<_>>(),
-            vec![Path::new("/home/me")],
+            rules.scan_roots(),
+            vec![PathBuf::from("/home/me")],
             "only user-caches is rooted when there is no %LOCALAPPDATA%"
+        );
+    }
+
+    /// The reason this merges rather than merely collects: walking `~` and
+    /// `~/Projects` both would put every candidate under the latter into the
+    /// plan twice, and the total would claim double what removing them frees.
+    #[test]
+    fn a_root_inside_another_is_dropped() {
+        let rules = Rules::new(
+            vec![
+                Rule {
+                    root: Some("~/Projects".into()),
+                    ..rule("inner", &["**/target/"])
+                },
+                Rule {
+                    root: Some("~".into()),
+                    ..rule("outer", &["**/node_modules/"])
+                },
+                Rule {
+                    root: Some("~/Projects/github".into()),
+                    ..rule("deeper", &["**/x/"])
+                },
+            ],
+            &dirs("/home/me"),
+        )
+        .expect("compile");
+
+        assert_eq!(
+            rules.scan_roots(),
+            vec![PathBuf::from("/home/me")],
+            "the outermost root covers the other two"
+        );
+    }
+
+    /// The component-wise comparison matters here as much as in the denylist:
+    /// `/home/mine` shares a string prefix with `/home/min` and is not inside
+    /// it, so dropping it would leave a configured directory unwalked.
+    #[test]
+    fn a_sibling_that_merely_shares_a_prefix_is_kept() {
+        let rules = Rules::new(
+            vec![
+                Rule {
+                    root: Some("/home/min".into()),
+                    ..rule("a", &["**/x/"])
+                },
+                Rule {
+                    root: Some("/home/mine".into()),
+                    ..rule("b", &["**/y/"])
+                },
+            ],
+            &UserDirs::default(),
+        )
+        .expect("compile");
+
+        assert_eq!(
+            rules.scan_roots(),
+            vec![PathBuf::from("/home/min"), PathBuf::from("/home/mine")]
+        );
+    }
+
+    /// Two rules on the same directory are one directory to walk.
+    #[test]
+    fn duplicate_roots_collapse() {
+        let rules = Rules::new(
+            vec![
+                Rule {
+                    root: Some("~".into()),
+                    ..rule("a", &["**/x/"])
+                },
+                Rule {
+                    root: Some("~".into()),
+                    ..rule("b", &["**/y/"])
+                },
+            ],
+            &dirs("/home/me"),
+        )
+        .expect("compile");
+
+        assert_eq!(rules.scan_roots(), vec![PathBuf::from("/home/me")]);
+    }
+
+    /// Every rule unrooted: nothing names a directory, so there is nothing to
+    /// walk without a path. The caller has to say so.
+    #[test]
+    fn unrooted_rules_contribute_no_scan_root() {
+        let rules = Rules::builtin(&UserDirs::default());
+
+        assert!(!rules.is_empty(), "three built-ins still compiled");
+        assert!(
+            rules.scan_roots().is_empty(),
+            "but none of them names a directory to walk"
         );
     }
 

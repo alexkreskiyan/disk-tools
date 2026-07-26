@@ -12,7 +12,7 @@ mod render;
 use args::{Args, Environment, Mode, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOptions, CleanPlan, Removal, ScanOptions, ScanTree, Tier, apply, plan, scan,
+    CleanOptions, CleanPlan, Removal, ScanOptions, ScanTree, SkippedEntry, Tier, apply, plan, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{Intent, render_clean, render_outcome};
@@ -20,6 +20,7 @@ use render::json::render_json;
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
 use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
@@ -75,11 +76,12 @@ fn main() -> ExitCode {
             json,
         } => run_scan(options, number, json, verbose),
         Mode::Clean {
-            scan,
+            roots,
+            roots_from_rules,
             clean,
             apply,
             removal,
-        } => run_clean(scan, *clean, apply, removal, verbose),
+        } => run_clean(&roots, roots_from_rules, *clean, apply, removal, verbose),
         Mode::ConfigInit { target, force } => run_config_init(&target, force),
     }
 }
@@ -128,27 +130,75 @@ fn run_scan(options: ScanOptions, number: Option<usize>, json: bool, verbose: bo
         render_tree(&tree, &render_options)
     };
 
-    emit(&report, &tree, verbose)
+    emit(&report, &tree.skipped, verbose)
 }
 
 fn run_clean(
-    options: ScanOptions,
+    roots: &[PathBuf],
+    roots_from_rules: bool,
     clean: CleanOptions,
     apply: bool,
     removal: Removal,
     verbose: bool,
 ) -> ExitCode {
-    // The git guard runs a `git status` per repository, so a tree of many
-    // projects spends real time after the walk finishes.
-    let Some(tree) = scan_or_report(&options, "Scanning…") else {
-        return ExitCode::from(2);
-    };
-
-    if apply {
-        return remove(&plan(&tree, &clean), removal, &tree, verbose);
+    if roots.is_empty() {
+        // Not an error and not an empty plan. "Nothing to clean" would be a
+        // claim about the disk; this is a statement about the configuration, and
+        // the two remedies are different things to go and do.
+        eprintln!(
+            "disk-tools: no rule names a directory to clean.\n\
+             Pass a path, or give a rule a `root` other than \"*\"."
+        );
+        return ExitCode::SUCCESS;
     }
 
-    let planned = plan(&tree, &clean);
+    if roots_from_rules {
+        // Announced only when the rules chose them. The default config roots
+        // `user-caches` at the home directory, so a bare `disk-tools clean`
+        // walks all of it — slow rather than dangerous, the default still being
+        // a dry run, but no one should have to guess why it is taking a minute.
+        let listed: Vec<String> = roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect();
+        eprintln!("disk-tools: examining {}", listed.join(", "));
+    } else {
+        // A path the user **named** and that is not there is a typo, and an
+        // empty report would hide it. A root that came from a rule is only a
+        // description, which may have gone stale — that one is a skip, since a
+        // single missing directory is no reason to leave the others uncleaned.
+        for root in roots {
+            if let Err(problem) = validate_root(root) {
+                eprintln!("disk-tools: {problem}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // The git guard runs a `git status` per repository, so a tree of many
+    // projects spends real time after the walk finishes.
+    let mut plans = Vec::with_capacity(roots.len());
+    let mut skipped = Vec::new();
+    for root in roots {
+        let options = ScanOptions {
+            root: root.clone(),
+            ..ScanOptions::default()
+        };
+        // No `validate_root` here. A path the user *named* is checked before
+        // this function is reached; a root that came from a rule is a
+        // description that may have gone stale, and one missing directory is no
+        // reason to leave the others uncleaned. `scan` reports it as a skip.
+        let tree = scan_with_spinner(&options, "Scanning…");
+        plans.push(plan(&tree, &clean));
+        skipped.extend(tree.skipped);
+    }
+
+    let planned = CleanPlan::merge(plans);
+
+    if apply {
+        return remove(&planned, removal, &skipped, verbose);
+    }
+
     // The count of what `--safe` hid comes back with the plan. It used to come
     // from planning a second time without the flag, which cost a full extra pass
     // of the git guard — measured at ~23 ms per repository, so `--safe` was the
@@ -158,7 +208,7 @@ fn run_clean(
 
     emit(
         &render_clean(&planned, hidden, Intent::DryRun),
-        &tree,
+        &skipped,
         verbose,
     )
 }
@@ -168,9 +218,18 @@ fn run_clean(
 /// The plan is printed **before** it is carried out, so the last thing a user
 /// sees before the removal is the list of what is about to go — the same report
 /// a dry run would have given them.
-fn remove(planned: &CleanPlan, removal: Removal, tree: &ScanTree, verbose: bool) -> ExitCode {
+fn remove(
+    planned: &CleanPlan,
+    removal: Removal,
+    skipped: &[SkippedEntry],
+    verbose: bool,
+) -> ExitCode {
     if planned.candidates.is_empty() {
-        return emit(&render_clean(planned, None, Intent::DryRun), tree, verbose);
+        return emit(
+            &render_clean(planned, None, Intent::DryRun),
+            skipped,
+            verbose,
+        );
     }
 
     // To stderr: this is context for the operation, not the report. It also
@@ -216,7 +275,7 @@ fn remove(planned: &CleanPlan, removal: Removal, tree: &ScanTree, verbose: bool)
 
     let code = emit(
         &render_outcome(&outcome, shared_removed, removal == Removal::Purge),
-        tree,
+        skipped,
         verbose,
     );
     if !outcome.is_complete() {
@@ -227,12 +286,21 @@ fn remove(planned: &CleanPlan, removal: Removal, tree: &ScanTree, verbose: bool)
 }
 
 /// Scan, with a spinner, or report why the root is unusable.
+///
+/// The check belongs to a path the **user named**: one that does not exist is a
+/// typo, and an empty report would hide it. A root that came from a rule gets
+/// [`scan_with_spinner`] instead, and a missing one there is a skip.
 fn scan_or_report(options: &ScanOptions, message: &'static str) -> Option<ScanTree> {
     if let Err(problem) = validate_root(&options.root) {
         eprintln!("disk-tools: {problem}");
         return None;
     }
 
+    Some(scan_with_spinner(options, message))
+}
+
+/// Scan, with a spinner, whatever the root turns out to be.
+fn scan_with_spinner(options: &ScanOptions, message: &'static str) -> ScanTree {
     // indicatif draws to stderr and hides itself when stderr isn't a tty, so a
     // piped run shows no spinner and stdout stays clean.
     let spinner = ProgressBar::new_spinner();
@@ -241,11 +309,15 @@ fn scan_or_report(options: &ScanOptions, message: &'static str) -> Option<ScanTr
     let tree = scan(options);
     spinner.finish_and_clear();
 
-    Some(tree)
+    tree
 }
 
 /// Report to stdout, skips to stderr.
-fn emit(report: &str, tree: &ScanTree, verbose: bool) -> ExitCode {
+///
+/// Takes the skips rather than the tree they came from: `clean` with no path
+/// walks a root per rule and has several trees, one report, and one combined
+/// list of what it could not read.
+fn emit(report: &str, skipped: &[SkippedEntry], verbose: bool) -> ExitCode {
     if let Err(err) = write_report(report) {
         // `disk-tools <path> | head` closes the pipe after a few lines. For a
         // Unix filter that is a normal end of output, not a failure — stop
@@ -261,7 +333,7 @@ fn emit(report: &str, tree: &ScanTree, verbose: bool) -> ExitCode {
     // stdout stays valid JSON). Errors are dropped: stderr closing (`2>&1 | head`)
     // must not turn a successful scan into a failure, and there is nowhere left
     // to report it anyway.
-    if let Some(summary) = render_skipped(&tree.skipped, verbose) {
+    if let Some(summary) = render_skipped(skipped, verbose) {
         let _ = write!(io::stderr(), "{summary}");
     }
     ExitCode::SUCCESS
