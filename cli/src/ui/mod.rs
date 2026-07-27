@@ -1,15 +1,18 @@
 //! `disk-tools ui` — a terminal file manager over the same core.
 //!
-//! Task 1 gave it a frame that always closes; Task 2 puts a directory in it.
-//! Directory sizes, rule colours and the rule editor arrive after.
+//! Task 1 gave it a frame that always closes, Task 2 put a directory in it, and
+//! Task 3 made the directories measure themselves. Rule colours and the rule
+//! editor arrive after.
 //!
-//! All the thinking lives in [`app`], [`listing`] and [`sort`], as plain
-//! functions over values — CI has no terminal, so anything only a screen could
-//! check would be untested. What is left here is drawing and key dispatch.
+//! All the thinking lives in [`app`], [`listing`], [`sort`], [`layout`] and
+//! [`measure`], as plain functions over values — CI has no terminal, so anything
+//! only a screen could check would be untested. What is left here is drawing and
+//! key dispatch.
 
 mod app;
 mod layout;
 mod listing;
+mod measure;
 mod sort;
 mod term;
 
@@ -41,6 +44,7 @@ pub fn run(root: &Path) -> io::Result<()> {
         // Read once per frame rather than held on the `App`: ages are relative,
         // so a browser left open overnight would otherwise still say "2m".
         let now = SystemTime::now();
+        app.absorb_sizes();
         terminal.draw(|frame| draw(frame, &app, now))?;
 
         // A timeout rather than a blocking read: without one, a resize or a
@@ -55,6 +59,11 @@ pub fn run(root: &Path) -> io::Result<()> {
             break;
         }
     }
+
+    // Before the screen is handed back, so the process is not still walking a
+    // tree while the user has their prompt again. `Drop` would do it too; doing
+    // it here means it happens in a knowable order.
+    app.stop_sizing();
 
     // Explicit rather than left to `Drop`, so a failure to restore is *reported*
     // rather than swallowed. `Drop` still runs, and does nothing the second time.
@@ -73,6 +82,9 @@ fn handle(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.enter(),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.leave(),
+
+        // Sizes are a statement about a moment; this asks again.
+        KeyCode::Char('r') => app.size_directories(),
 
         KeyCode::Char('n') => app.sort_by(Order::Name),
         KeyCode::Char('s') => app.sort_by(Order::Size),
@@ -109,17 +121,27 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
         bands[1],
     );
 
+    // The denominator for every percentage on screen: what is known right now.
+    // A directory still being walked is excluded, so the figure does not move
+    // under the rows that are already settled.
+    let sized: u64 = app
+        .entries()
+        .iter()
+        .filter(|entry| !entry.measuring)
+        .filter_map(|entry| entry.size)
+        .sum();
+
     let rows: Vec<ListItem<'_>> = app
         .entries()
         .iter()
-        .map(|entry| ListItem::new(layout::row(entry, now, &cols)))
+        .map(|entry| ListItem::new(layout::row(entry, now, sized, &cols)))
         .collect();
     let list = List::new(rows).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected(Some(app.cursor()));
     frame.render_stateful_widget(list, bands[2], &mut state);
 
     frame.render_widget(
-        Paragraph::new("q quit  ↵ enter  ← up  n/s/c/m sort (again to reverse)")
+        Paragraph::new("q quit  ↵ enter  ← up  n/s/c/m sort (again to reverse)  r re-measure")
             .style(Style::default().add_modifier(Modifier::DIM)),
         bands[3],
     );
@@ -202,7 +224,26 @@ mod tests {
     /// alternative this task started with: a real pty from `script` reports a
     /// size of 0x0, so nothing renders and layout cannot be seen at all.
     fn painted(root: &Path, width: u16, height: u16) -> Vec<String> {
-        let app = App::open(root).expect("open");
+        paint(App::open(root).expect("open"), width, height)
+    }
+
+    /// The same, once every background walk has posted its total.
+    ///
+    /// Bounded, so a worker that never finishes fails rather than hangs.
+    fn painted_settled(root: &Path, width: u16, height: u16) -> Vec<String> {
+        let mut app = App::open(root).expect("open");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.absorb_sizes();
+            if app.entries().iter().all(|entry| !entry.measuring) {
+                return paint(app, width, height);
+            }
+            assert!(std::time::Instant::now() < deadline, "sizes never settled");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn paint(app: App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal
             .draw(|frame| draw(frame, &app, SystemTime::now()))
@@ -275,10 +316,10 @@ mod tests {
         );
     }
 
-    /// A directory has no size until it is measured, and an empty column says
-    /// that better than a `0B` would.
+    /// Sizing runs in the background, so the first frame after opening shows a
+    /// spinner rather than a number that is not known yet.
     #[test]
-    fn a_directory_carries_no_size_yet() {
+    fn a_directory_being_measured_shows_a_spinner() {
         let dir = fixture();
 
         let lines = painted(dir.path(), 70, 10);
@@ -288,9 +329,64 @@ mod tests {
             .expect("the directory is listed");
 
         assert!(
-            !row.contains('B') && !row.contains('K'),
-            "no size on a directory row: {row:?}"
+            row.chars()
+                .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)),
+            "no spinner on a directory being walked: {row:?}"
         );
+    }
+
+    /// And once the walk finishes, the same row carries a size and its share of
+    /// what is on screen.
+    #[test]
+    fn a_measured_directory_shows_a_size_and_a_share() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("sub/inner.bin"), vec![b'x'; 8192]).expect("write");
+
+        let lines = painted_settled(dir.path(), 70, 10);
+        let row = lines
+            .iter()
+            .find(|line| line.contains("sub/"))
+            .expect("the directory is listed");
+
+        assert!(row.contains('K'), "a size in the first column: {row:?}");
+        assert!(row.contains('%'), "and a share in the last: {row:?}");
+        assert!(
+            !row.chars()
+                .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)),
+            "the spinner is gone: {row:?}"
+        );
+    }
+
+    /// Percentages are against the sum of the rows on screen, so they add up to
+    /// a hundred once nothing is left to measure.
+    #[test]
+    fn the_shares_on_a_settled_screen_add_up() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("sub/inner.bin"), vec![b'x'; 8192]).expect("write");
+
+        let lines = painted_settled(dir.path(), 70, 12);
+        let total: u32 = lines
+            .iter()
+            .filter_map(|line| line.rsplit_once('\u{2502}'))
+            // The cell is a bar and then a number, so take the digits off the
+            // end rather than trying to parse past the blocks.
+            .filter_map(|(_, cell)| cell.trim().strip_suffix('%'))
+            .filter_map(|cell| {
+                cell.chars()
+                    .rev()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>()
+                    .parse::<u32>()
+                    .ok()
+            })
+            .sum();
+
+        // Each share is rounded to a whole percent, so the sum lands near 100
+        // rather than on it.
+        assert!((98..=102).contains(&total), "{total}% across {lines:?}");
     }
 
     /// A label that does not sit over its own cells is a legend, not a header —

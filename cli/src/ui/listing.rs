@@ -36,6 +36,14 @@ pub struct Entry {
     /// error worth refusing to list a directory over — it is one column with
     /// nothing in it, and the sort deals with that.
     pub created: Option<SystemTime>,
+
+    /// A size is being computed for this row right now.
+    ///
+    /// Distinct from `size.is_none()`: a directory part-way through a walk has a
+    /// number, and it is climbing. Everything that reads a size has to know the
+    /// difference — the spinner shows it, the share-of-listing arithmetic
+    /// excludes it, and a partial figure never becomes a total.
+    pub measuring: bool,
 }
 
 /// Read `dir`, one metadata call per entry.
@@ -65,6 +73,9 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
                 .and_then(|metadata| allocated_size(&path, metadata).ok()),
             modified: metadata.as_ref().and_then(|m| m.modified().ok()),
             created: metadata.as_ref().and_then(|m| m.created().ok()),
+            // Set by the browser when it asks for a size; listing one directory
+            // starts no work of its own.
+            measuring: false,
         });
     }
 

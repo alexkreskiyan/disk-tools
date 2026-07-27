@@ -24,10 +24,9 @@ use unicode_width::UnicodeWidthStr;
 const SIZE: usize = 8;
 const CREATED: usize = 7;
 const MODIFIED: usize = 8;
-/// The share-of-parent bar and its percentage. Empty until directory sizes
-/// exist (v0.4 Task 3); the column is reserved now so the header does not move
-/// under the user when they arrive.
-const TOTAL: usize = 12;
+/// The bar, a space, and `100%`.
+const BAR: usize = 7;
+const TOTAL: usize = BAR + 1 + 4;
 const SEP: &str = " │ ";
 /// Below this the name is unreadable, so a column is dropped instead.
 const MIN_NAME: usize = 8;
@@ -129,10 +128,20 @@ pub fn header(cols: &Columns, order: Order, reverse: bool) -> String {
 }
 
 /// One entry, in the same columns as the header.
-pub fn row(entry: &Entry, now: SystemTime, cols: &Columns) -> String {
+///
+/// `sized` is the sum of the listing's *known* sizes — see [`share`].
+pub fn row(entry: &Entry, now: SystemTime, sized: u64, cols: &Columns) -> String {
     let mut parts = Vec::new();
     if cols.size {
-        let size = entry.size.map(format_size).unwrap_or_default();
+        // The spinner sits beside the figure rather than replacing it, so a
+        // directory being walked shows both that it is working and how far it
+        // has got.
+        let size = match (entry.measuring, entry.size) {
+            (true, Some(bytes)) => format!("{} {}", spinner(now), format_size(bytes)),
+            (true, None) => spinner(now).to_string(),
+            (false, Some(bytes)) => format_size(bytes),
+            (false, None) => String::new(),
+        };
         parts.push(format!("{size:>SIZE$}"));
     }
 
@@ -149,10 +158,54 @@ pub fn row(entry: &Entry, now: SystemTime, cols: &Columns) -> String {
         parts.push(format!("{:>MODIFIED$}", age(now, entry.modified)));
     }
     if cols.total {
-        // Filled in once directories are measured.
-        parts.push(" ".repeat(TOTAL));
+        parts.push(match share(entry, sized) {
+            Some(fraction) => format!("{} {:>3}%", bar(fraction), (fraction * 100.0).round()),
+            None => " ".repeat(TOTAL),
+        });
     }
     parts.join(SEP)
+}
+
+/// What fraction of the listing this entry accounts for, or `None` when there is
+/// nothing honest to say.
+///
+/// **The denominator is the sum of what is known**, not the parent's total —
+/// which nobody has asked for and which would cost a second walk. So the
+/// percentages describe the rows on screen, and they climb towards 100% as the
+/// unmeasured directories arrive rather than starting there and being wrong.
+///
+/// An entry still being measured is excluded from both sides: its figure is
+/// rising, and a denominator that moved under the other rows would have every
+/// percentage on screen drifting for a reason none of them show.
+pub fn share(entry: &Entry, sized: u64) -> Option<f64> {
+    if entry.measuring || sized == 0 {
+        return None;
+    }
+    entry.size.map(|bytes| bytes as f64 / sized as f64)
+}
+
+/// Right-aligned fill, as in the `scan` report.
+fn bar(fraction: f64) -> String {
+    let filled = (fraction * BAR as f64).round().max(0.0) as usize;
+    let blocks = "\u{2588}".repeat(filled.min(BAR));
+    format!("{blocks:>BAR$}")
+}
+
+/// Which frame of the spinner belongs to this instant.
+///
+/// Derived from the clock rather than counted per frame: the event loop wakes on
+/// a keypress as well as on its timeout, so a counter would race ahead while the
+/// user typed and stall while they did not.
+fn spinner(now: SystemTime) -> char {
+    const FRAMES: [char; 10] = [
+        '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}',
+        '\u{2827}', '\u{2807}', '\u{280f}',
+    ];
+    let millis = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    FRAMES[(millis / 100) as usize % FRAMES.len()]
 }
 
 /// How long ago, in one unit and at most four columns.
@@ -203,6 +256,7 @@ mod tests {
             size: Some(4096),
             modified: ago(3 * 24 * 60 * 60),
             created: ago(90 * 24 * 60 * 60),
+            measuring: false,
         }
     }
 
@@ -213,7 +267,7 @@ mod tests {
         let cols = columns(100);
 
         let header = header(&cols, Order::Name, false);
-        let row = row(&entry("readme.md"), now(), &cols);
+        let row = row(&entry("readme.md"), now(), 0, &cols);
 
         // Counted in characters, not bytes: `↑` is three bytes wide and would
         // shift every offset after it in the header but not in the row.
@@ -270,7 +324,7 @@ mod tests {
         for width in [0, 1, 5, 12, 40] {
             let cols = columns(width);
             assert!(cols.name >= 1, "width {width}");
-            let row = row(&entry("some-long-name.txt"), now(), &cols);
+            let row = row(&entry("some-long-name.txt"), now(), 0, &cols);
             assert!(!row.is_empty(), "width {width}");
         }
     }
@@ -284,7 +338,7 @@ mod tests {
             ..entry("src")
         };
 
-        let row = row(&dir, now(), &cols);
+        let row = row(&dir, now(), 0, &cols);
 
         assert!(row.contains("src/"), "{row}");
         assert!(
@@ -334,5 +388,124 @@ mod tests {
     #[test]
     fn an_absent_timestamp_leaves_the_cell_empty() {
         assert_eq!(age(now(), None), "");
+    }
+
+    /// The percentages describe the rows on screen, so they are against the sum
+    /// of what is known — not against a parent total nobody asked for.
+    #[test]
+    fn a_share_is_of_the_sum_of_the_measured() {
+        let entry = Entry {
+            size: Some(250),
+            ..entry("f")
+        };
+
+        assert_eq!(share(&entry, 1000), Some(0.25));
+        assert_eq!(share(&entry, 250), Some(1.0));
+    }
+
+    /// A rising figure has no share: including it would move the denominator
+    /// under every settled row, for a reason none of them show.
+    #[test]
+    fn an_entry_still_being_measured_has_no_share() {
+        let running = Entry {
+            size: Some(500),
+            measuring: true,
+            ..entry("busy")
+        };
+
+        assert_eq!(share(&running, 1000), None);
+    }
+
+    #[test]
+    fn nothing_measured_yet_is_no_share_rather_than_a_division() {
+        assert_eq!(share(&entry("f"), 0), None);
+        assert_eq!(
+            share(
+                &Entry {
+                    size: None,
+                    ..entry("f")
+                },
+                1000
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_bar_fills_from_empty_to_full_and_no_further() {
+        assert_eq!(bar(0.0).trim(), "");
+        assert_eq!(bar(1.0).chars().count(), BAR);
+        assert!(bar(1.0).chars().all(|ch| ch == '\u{2588}'));
+        assert_eq!(
+            bar(2.0).chars().count(),
+            BAR,
+            "a share over one is still one bar wide"
+        );
+    }
+
+    /// Both cells sit in fixed columns, so neither may grow when it fills.
+    #[test]
+    fn a_full_bar_and_a_spinner_still_fit_their_columns() {
+        let cols = columns(100);
+        let busy = Entry {
+            size: Some(999_999_999),
+            measuring: true,
+            ..entry("working")
+        };
+
+        let header = header(&cols, Order::Name, false).chars().count();
+        for entry in [&busy, &entry("done")] {
+            assert_eq!(
+                row(entry, now(), 1_000_000_000, &cols).chars().count(),
+                header
+            );
+        }
+    }
+
+    /// A row being walked shows both that it is working and how far it has got.
+    #[test]
+    fn a_measuring_row_carries_a_spinner_beside_its_figure() {
+        let cols = columns(100);
+        let busy = Entry {
+            size: Some(4096),
+            measuring: true,
+            ..entry("working")
+        };
+
+        let row = row(&busy, now(), 8192, &cols);
+
+        assert!(row.contains("4.0K"), "the figure so far: {row}");
+        assert!(
+            row.chars()
+                .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)),
+            "and a spinner beside it: {row}"
+        );
+        assert!(
+            !row.contains('%'),
+            "but no share, because the figure is still climbing: {row}"
+        );
+    }
+
+    /// The frame comes from the clock, so it advances whether or not the event
+    /// loop happened to wake.
+    #[test]
+    fn the_spinner_turns_with_time() {
+        let frames: Vec<char> = (0..10)
+            .map(|tick| spinner(now() + Duration::from_millis(tick * 100)))
+            .collect();
+
+        assert_eq!(
+            frames
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            10,
+            "a second apart, every frame differs: {frames:?}"
+        );
+        assert_eq!(
+            spinner(now()),
+            spinner(now() + Duration::from_secs(1)),
+            "and it comes round"
+        );
     }
 }

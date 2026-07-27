@@ -30,6 +30,7 @@ mod clean;
 mod dedup;
 mod detect;
 mod git;
+mod measure;
 mod options;
 mod paths;
 mod rules;
@@ -43,6 +44,7 @@ mod windows_dir;
 
 pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, plan};
 pub use detect::{DetectOptions, Detection, detect};
+pub use measure::{Measured, measure};
 pub use options::ScanOptions;
 pub use rules::{Rule, RuleError, Rules, Tier, UserDirs, age_rule, builtin_rules};
 pub use size::allocated_size;

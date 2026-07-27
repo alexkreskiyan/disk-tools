@@ -15,6 +15,7 @@
 //! were, and says why. Half-moving would be worse than not moving.
 
 use super::listing::{self, Entry};
+use super::measure::Sizer;
 use super::sort::{Applied, Order, sort};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,9 @@ pub struct App {
     /// The last thing that went wrong, for the header. Cleared by anything that
     /// succeeds, so it describes the present rather than accumulating.
     notice: Option<String>,
+
+    /// Directory sizes, computed in the background.
+    sizer: Sizer,
 }
 
 impl App {
@@ -53,12 +57,14 @@ impl App {
                 fell_back: false,
             },
             notice: None,
+            sizer: Sizer::new(),
         };
         app.entries = app.read(root)?;
         // Sorted, then the cursor put at the top. `resort` would instead hold
         // onto whatever `read_dir` happened to return first and follow it to
         // wherever the sort put it — which is a cursor landing at random.
         app.applied = sort(&mut app.entries, app.order, app.reverse);
+        app.size_directories();
         Ok(app)
     }
 
@@ -71,6 +77,7 @@ impl App {
                 size: None,
                 modified: None,
                 created: None,
+                measuring: false,
             });
         }
         Ok(entries)
@@ -140,6 +147,75 @@ impl App {
             .unwrap_or(0);
     }
 
+    /// Measure every subdirectory here, abandoning any walk still running.
+    ///
+    /// Automatic on arrival, and repeatable with a key — a size is a statement
+    /// about a moment, and the directory may have changed since.
+    pub fn size_directories(&mut self) {
+        let mut names = Vec::new();
+        for entry in &mut self.entries {
+            // The parent is not part of this listing; measuring it would walk
+            // everything on screen a second time, through itself.
+            entry.measuring = entry.is_dir && entry.name != PARENT;
+            if entry.measuring {
+                // Whatever was there is from the previous walk, and stale.
+                entry.size = None;
+                names.push(entry.name.clone());
+            }
+        }
+        self.sizer.start(self.cwd.clone(), names);
+    }
+
+    /// Take in whatever the background walks have posted since the last frame.
+    ///
+    /// Results from an abandoned request are dropped: without that, a size for
+    /// the directory just left would land on a same-named row in the one just
+    /// entered.
+    pub fn absorb_sizes(&mut self) {
+        let mut completed = false;
+
+        for update in self.sizer.drain() {
+            completed |= self.apply(update);
+        }
+
+        // Only on completion, and only when size is the order in force. Sorting
+        // on every climbing figure would have rows swap places continuously;
+        // never sorting would leave "by size" showing an order that is no longer
+        // true. The cursor holds its entry across the move, as always.
+        if completed && self.order == Order::Size {
+            self.resort();
+        }
+    }
+
+    /// Take one update in, if it is still wanted. Returns whether it was final.
+    ///
+    /// Separate from [`Self::absorb_sizes`] so the generation check can be
+    /// tested without racing a real background walk to be late.
+    fn apply(&mut self, update: super::measure::Update) -> bool {
+        if update.generation != self.sizer.generation() {
+            return false;
+        }
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == update.name)
+        else {
+            return false;
+        };
+
+        entry.size = Some(update.allocated);
+        if update.complete {
+            entry.measuring = false;
+            return true;
+        }
+        false
+    }
+
+    /// Stop the background walk and wait for it.
+    pub fn stop_sizing(&mut self) {
+        self.sizer.stop();
+    }
+
     /// Enter the directory under the cursor, or go up if it is `..`.
     ///
     /// A file does nothing: opening one is not something this browser claims to
@@ -183,6 +259,9 @@ impl App {
                 {
                     self.cursor = at;
                 }
+                // After the move, not before: a walk of the directory being left
+                // would go on competing for the pool with the one being entered.
+                self.size_directories();
             }
             Err(err) => {
                 // Nothing moves. A refused entry that shifted the cursor would
@@ -393,6 +472,131 @@ mod tests {
             app.move_down();
         }
         assert_eq!(app.cursor(), app.entries().len() - 1, "nor below the last");
+    }
+
+    /// Wait for every directory here to finish being measured.
+    ///
+    /// Bounded, so a worker that never posts fails the test rather than hanging
+    /// the suite.
+    fn await_sizes(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            app.absorb_sizes();
+            if app.entries().iter().all(|entry| !entry.measuring) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("sizes never settled: {:?}", names(app));
+    }
+
+    fn size_of(app: &App, name: &str) -> Option<u64> {
+        app.entries()
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("listed")
+            .size
+    }
+
+    /// Opening asks for the sizes; nothing has to be pressed for the column to
+    /// fill.
+    #[test]
+    fn opening_starts_measuring_every_subdirectory() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
+
+        let mut app = App::open(dir.path()).expect("open");
+
+        assert!(
+            app.entries()
+                .iter()
+                .any(|entry| entry.measuring && entry.name == "alpha"),
+            "asked for on arrival: {:?}",
+            names(&app)
+        );
+        await_sizes(&mut app);
+        assert!(
+            size_of(&app, "alpha").is_some_and(|size| size >= 8192),
+            "and the answer lands"
+        );
+    }
+
+    /// The parent is not part of this listing. Walking it would measure
+    /// everything on screen a second time, through itself.
+    #[test]
+    fn the_parent_row_is_never_measured() {
+        let dir = fixture();
+
+        let mut app = App::open(dir.path()).expect("open");
+        await_sizes(&mut app);
+
+        let parent = app
+            .entries()
+            .iter()
+            .find(|entry| entry.name == PARENT)
+            .expect("the way back");
+        assert!(!parent.measuring);
+        assert_eq!(parent.size, None);
+    }
+
+    /// Without the generation check, a size for the directory just left lands on
+    /// a same-named row in the one just entered.
+    #[test]
+    fn a_result_from_an_abandoned_walk_is_dropped() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+
+        // A reply that was in flight when the request was replaced.
+        let stale = crate::ui::measure::Update {
+            generation: 0,
+            name: OsString::from("alpha"),
+            allocated: 999_999,
+            complete: true,
+        };
+        app.apply(stale);
+
+        assert_eq!(size_of(&app, "alpha"), None, "not from a previous request");
+    }
+
+    /// Asking again is the point of the key: a size describes a moment, and the
+    /// directory may have changed since.
+    #[test]
+    fn measuring_again_clears_what_was_there() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+        await_sizes(&mut app);
+        assert!(size_of(&app, "alpha").is_some());
+
+        app.size_directories();
+
+        assert_eq!(size_of(&app, "alpha"), None, "the old figure is stale");
+        assert!(
+            app.entries()
+                .iter()
+                .any(|entry| entry.measuring && entry.name == "alpha")
+        );
+    }
+
+    /// "By size" that stops re-ordering as the sizes arrive is showing an order
+    /// that is no longer true.
+    #[test]
+    fn sizes_arriving_reorder_a_listing_sorted_by_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, bytes) in [("small", 4096usize), ("large", 200_000)] {
+            let sub = dir.path().join(name);
+            std::fs::create_dir(&sub).expect("mkdir");
+            std::fs::write(sub.join("f.bin"), vec![b'x'; bytes]).expect("write");
+        }
+
+        let mut app = App::open(dir.path()).expect("open");
+        app.sort_by(Order::Size);
+        await_sizes(&mut app);
+
+        let directories: Vec<String> = names(&app)
+            .into_iter()
+            .filter(|name| name == "small" || name == "large")
+            .collect();
+        assert_eq!(directories, ["small", "large"], "ascending, as asked");
     }
 
     /// The root of the filesystem has no parent, so there is no `..` and
