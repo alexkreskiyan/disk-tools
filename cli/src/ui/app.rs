@@ -240,15 +240,18 @@ impl App {
         };
 
         entry.size = Some(update.allocated);
-        if update.complete {
-            entry.measuring = false;
-            // Only a completed total is worth keeping — and the generation
-            // matched, so `cwd` is still the directory it was measured under.
-            let path = self.cwd.join(&update.name);
-            self.sizer.remember(path, update.allocated);
-            return true;
+        if !update.complete {
+            return false;
         }
-        false
+        entry.measuring = false;
+
+        // Everything the walk saw, not just what was asked for. The subtree
+        // beneath this directory has already been measured; recomputing it when
+        // the user steps inside would be the same work a second time.
+        for (path, allocated) in update.directories {
+            self.sizer.remember(path, allocated);
+        }
+        true
     }
 
     /// Stop the background walk and wait for it.
@@ -592,6 +595,7 @@ mod tests {
             name: OsString::from("alpha"),
             allocated: 999_999,
             complete: true,
+            directories: Vec::new(),
         };
         app.apply(stale);
 
@@ -659,6 +663,7 @@ mod tests {
             name: OsString::from("anything"),
             allocated: 999_999,
             complete: true,
+            directories: Vec::new(),
         };
         assert!(!app.apply(stale), "a reply from before the move is dropped");
     }

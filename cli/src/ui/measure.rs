@@ -4,6 +4,11 @@
 //! running total back. The screen never blocks on it: it drains whatever has
 //! arrived each frame and draws that.
 //!
+//! **Cancelling never blocks the screen.** A worker is told to stop and set
+//! aside, not waited for: the flag is read often, but "often" is still a `stat`
+//! or two away, and the key that triggered it would visibly stick. Waiting
+//! happens once, on the way out. The generation is what makes not-waiting safe.
+//!
 //! **A new request stops the old one** rather than racing it. Two things are
 //! needed for that and neither is sufficient alone: the cancel flag, which stops
 //! the work, and the generation number, which discards results already in flight
@@ -45,6 +50,14 @@ pub struct Update {
     pub allocated: u64,
     /// Whether this is the total or a figure still climbing.
     pub complete: bool,
+
+    /// Every directory the walk visited, with its own total. Empty until the
+    /// walk completes.
+    ///
+    /// The walk of one directory already visited everything beneath it. Keeping
+    /// what it found is what stops the browser recomputing a subtree the moment
+    /// the user steps into it.
+    pub directories: Vec<(PathBuf, u64)>,
 }
 
 /// The background sizing of whatever directory is open.
@@ -53,6 +66,13 @@ pub struct Sizer {
     post: Sender<Update>,
     generation: u64,
     running: Option<Job>,
+
+    /// Workers told to stop, not yet joined.
+    ///
+    /// Joining them where they are cancelled would put a subtree walk in the way
+    /// of a keypress. They are pruned as they finish and waited for on the way
+    /// out, so none outlives the browser.
+    retiring: Vec<Job>,
 
     /// Every total computed this session, by absolute path.
     ///
@@ -75,6 +95,7 @@ impl Sizer {
             post,
             generation: 0,
             running: None,
+            retiring: Vec::new(),
             known: HashMap::new(),
         }
     }
@@ -104,7 +125,7 @@ impl Sizer {
     /// Returns the new generation. Sizing nothing still bumps it, so a listing
     /// with no subdirectories invalidates the previous one's results too.
     pub fn start(&mut self, parent: PathBuf, names: Vec<OsString>) -> u64 {
-        self.stop();
+        self.retire();
         self.generation += 1;
         let generation = self.generation;
 
@@ -136,6 +157,7 @@ impl Sizer {
                             name: name.clone(),
                             allocated,
                             complete: false,
+                            directories: Vec::new(),
                         });
                     };
                     measure(&parent.join(&name), &flag, &report)
@@ -149,6 +171,7 @@ impl Sizer {
                         name,
                         allocated: measured.allocated,
                         complete: true,
+                        directories: measured.directories,
                     });
                 }
             }
@@ -171,13 +194,29 @@ impl Sizer {
         }
     }
 
-    /// Stop the worker and wait for it.
+    /// Tell the running worker to stop, without waiting for it.
     ///
-    /// Waiting is the point: the flag is read on entering every directory, so
-    /// this returns in about the time one directory takes, and the thread is
-    /// provably gone rather than merely asked to leave.
-    pub fn stop(&mut self) {
+    /// Called from key handling, where waiting even a fraction of a second is
+    /// visible as a stuck screen. Anything it still posts is discarded by the
+    /// generation check, so letting it wind down on its own is safe.
+    fn retire(&mut self) {
+        // Cheap, and it keeps the list from growing over a long session of
+        // walking about.
+        self.retiring.retain(|job| !job.thread.is_finished());
+
         if let Some(job) = self.running.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+            self.retiring.push(job);
+        }
+    }
+
+    /// Stop every worker and wait for all of them.
+    ///
+    /// The one place that waits, and the reason the flag is read as often as it
+    /// is: nothing may outlive the browser.
+    pub fn stop(&mut self) {
+        self.retire();
+        for job in self.retiring.drain(..) {
             job.cancel.store(true, Ordering::Relaxed);
             let _ = job.thread.join();
         }
@@ -298,7 +337,64 @@ mod tests {
         sizer.start(dir.path().to_path_buf(), vec![OsString::from("tree")]);
         sizer.stop();
 
-        assert!(sizer.running.is_none(), "the handle is gone, having joined");
+        assert!(sizer.running.is_none());
+        assert!(sizer.retiring.is_empty(), "every worker was waited for");
+    }
+
+    /// The screen must not wait on a subtree walk to answer a keypress.
+    #[test]
+    fn a_new_request_does_not_wait_for_the_old_one() {
+        let dir = big();
+        let mut sizer = Sizer::new();
+
+        sizer.start(dir.path().to_path_buf(), vec![OsString::from("tree")]);
+        let started = Instant::now();
+        sizer.start(dir.path().to_path_buf(), Vec::new());
+        let waited = started.elapsed();
+
+        assert_eq!(sizer.retiring.len(), 1, "set aside rather than joined");
+        assert!(
+            waited < Duration::from_millis(50),
+            "cancelling took {waited:?}"
+        );
+        sizer.stop();
+    }
+
+    /// Set aside is not forgotten: a long session of walking about must not
+    /// accumulate finished threads.
+    #[test]
+    fn finished_workers_are_pruned_rather_than_kept() {
+        let dir = fixture();
+        let mut sizer = Sizer::new();
+
+        for _ in 0..5 {
+            sizer.start(dir.path().to_path_buf(), vec![OsString::from("alpha")]);
+            await_complete(&sizer, &["alpha"]);
+        }
+
+        assert!(sizer.retiring.len() <= 1, "{} kept", sizer.retiring.len());
+    }
+
+    /// The walk of one directory visits everything beneath it, and says so.
+    #[test]
+    fn a_completed_walk_reports_every_directory_it_visited() {
+        let dir = fixture();
+        std::fs::create_dir(dir.path().join("alpha/inner")).expect("mkdir");
+        std::fs::write(dir.path().join("alpha/inner/f.bin"), vec![b'x'; 4096]).expect("write");
+        let mut sizer = Sizer::new();
+
+        sizer.start(dir.path().to_path_buf(), vec![OsString::from("alpha")]);
+        let done = await_complete(&sizer, &["alpha"]);
+
+        let update = done.first().expect("a total arrives");
+        assert!(
+            update
+                .directories
+                .iter()
+                .any(|(path, bytes)| path.ends_with("alpha/inner") && *bytes >= 4096),
+            "{:?}",
+            update.directories
+        );
     }
 
     /// Nothing was completed, so nothing may claim to be a size.
