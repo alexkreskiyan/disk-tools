@@ -46,8 +46,9 @@ rather than as ad-hoc commands.
 | `just build` | Build the workspace (`cargo build --workspace`) |
 | `just test` | Run all tests (`cargo test --workspace`) |
 | `just lint` | Clippy, warnings as errors |
+| `just lint-windows` | The same, cross-checked against `x86_64-pc-windows-msvc` — clippy only sees what the host compiles, so `#[cfg(windows)]` code is otherwise linted by CI alone |
 | `just fmt` / `just fmt-check` | Format / check formatting |
-| `just verify` | Pre-commit gate: `fmt-check` + `lint` + `doc` + `check-minimal` + `test` |
+| `just verify` | Pre-commit gate: `fmt-check` + `lint` + `lint-windows` + `doc` + `check-minimal` + `test` |
 | `just doc` | Build docs with warnings as errors — catches a public item linking to a private one, which clippy cannot see |
 | `just check-minimal` | Core without default features: proves a scan-only consumer still compiles without the trash backend |
 | `just smoke-trash` | The `#[ignore]`d tests that move real files to the OS trash, in both crates |

@@ -1210,28 +1210,29 @@ fn mixed_tiers_dir() -> tempfile::TempDir {
     // 2001-01-01, comfortably past any threshold a test will use.
     let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(978_307_200);
     filetime_set(&stale, long_ago);
+    assert_eq!(
+        std::fs::metadata(&stale).expect("stat").modified().ok(),
+        Some(long_ago),
+        "every confirm-tier test below rests on this file being old"
+    );
     dir
 }
 
+/// Backdate a file, so an `--older-than` threshold has something to find.
+///
+/// `File::set_times` rather than shelling out to `touch`. The subprocess version
+/// tried the GNU spelling, printed its failure to the suite's stderr on every
+/// BSD run, and fell back to a **hardcoded** date that merely happened to equal
+/// the one caller's argument. Worse, it ignored both exit statuses: on a
+/// platform where neither form worked, the file would keep its current mtime and
+/// the age tests would pass without testing anything.
 fn filetime_set(path: &Path, when: std::time::SystemTime) {
-    let secs = when
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    // No dev-dependency for this: `touch -t` is on every platform CI runs, and
-    // the alternative is a crate pulled in for one line of a test.
-    let stamp = std::process::Command::new("touch")
-        .arg("-d")
-        .arg(format!("@{secs}"))
-        .arg(path)
-        .status();
-    if !matches!(stamp, Ok(status) if status.success()) {
-        // BSD `touch` spells it differently.
-        let _ = std::process::Command::new("touch")
-            .args(["-t", "200101010000"])
-            .arg(path)
-            .status();
-    }
+    let file = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for its timestamps");
+    file.set_times(std::fs::FileTimes::new().set_modified(when))
+        .expect("set mtime");
 }
 
 /// The headline property: `--apply` alone does not take what cannot be

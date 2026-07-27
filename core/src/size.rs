@@ -310,15 +310,14 @@ mod tests {
 
         assert_eq!(sizes.apparent, 10);
         #[cfg(unix)]
-        assert_eq!(
-            sizes.allocated % 512,
-            0,
+        assert!(
+            sizes.allocated.is_multiple_of(512),
             "allocated should be a whole number of 512-byte units, got {}",
             sizes.allocated
         );
         #[cfg(windows)]
         assert!(
-            sizes.allocated % 512 == 0 || sizes.allocated == sizes.apparent,
+            sizes.allocated.is_multiple_of(512) || sizes.allocated == sizes.apparent,
             "allocated should be whole 512-byte units or — as Windows documents \
              for an uncompressed file — the logical length, got {}",
             sizes.allocated

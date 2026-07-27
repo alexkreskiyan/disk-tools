@@ -75,6 +75,17 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# Clippy only sees the code the host compiles, so every `#[cfg(windows)]` block —
+# `windows_dir.rs`, the four unsafe functions, half a dozen tests — is invisible
+# on a Unix machine. A lint fired in one of them and only CI found it, three
+# commits later. Clippy does not link, so cross-checking costs nothing but the
+# target being installed.
+
+# Lint the Windows-only code, from any host.
+lint-windows:
+    rustup target add x86_64-pc-windows-msvc
+    cargo clippy --target x86_64-pc-windows-msvc --workspace --all-targets -- -D warnings
+
 # rustdoc catches what clippy cannot: a public item documenting a link to a
 # private one resolves to nothing in the built docs. Two of those reached code
 # review before this recipe existed, which is why it does.
@@ -114,7 +125,7 @@ check:
 # enforced there too.
 
 # Pre-commit gate: formatting, lints, docs, feature minimality, tests.
-verify: fmt-check lint doc check-minimal test
+verify: fmt-check lint lint-windows doc check-minimal test
 
 # =============================================================================
 # Benchmarks
