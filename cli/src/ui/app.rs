@@ -147,23 +147,59 @@ impl App {
             .unwrap_or(0);
     }
 
-    /// Measure every subdirectory here, abandoning any walk still running.
+    /// Fill in the subdirectory sizes here, walking only what is not already
+    /// known.
     ///
-    /// Automatic on arrival, and repeatable with a key — a size is a statement
-    /// about a moment, and the directory may have changed since.
+    /// Run on arrival. Navigation is not a reason to recompute: a total costs a
+    /// walk of the whole subtree, and stepping into a directory and back out
+    /// would otherwise pay for the parent twice. The disk does change — but the
+    /// user is the one changing it, and [`Self::remeasure`] is how they say so.
     pub fn size_directories(&mut self) {
         let mut names = Vec::new();
+
         for entry in &mut self.entries {
             // The parent is not part of this listing; measuring it would walk
             // everything on screen a second time, through itself.
-            entry.measuring = entry.is_dir && entry.name != PARENT;
-            if entry.measuring {
-                // Whatever was there is from the previous walk, and stale.
-                entry.size = None;
-                names.push(entry.name.clone());
+            if !entry.is_dir || entry.name == PARENT {
+                entry.measuring = false;
+                continue;
+            }
+
+            match self.sizer.known(&self.cwd.join(&entry.name)) {
+                Some(allocated) => {
+                    entry.size = Some(allocated);
+                    entry.measuring = false;
+                }
+                None => {
+                    entry.size = None;
+                    entry.measuring = true;
+                    names.push(entry.name.clone());
+                }
             }
         }
+
+        // Even with nothing to walk: the generation has to move, or a reply
+        // still in flight from the directory just left would be taken as this
+        // one's.
         self.sizer.start(self.cwd.clone(), names);
+    }
+
+    /// Forget the sizes here and walk them again.
+    ///
+    /// The one thing that invalidates a total, because deleting is the one way
+    /// it goes stale that the browser cannot see.
+    pub fn remeasure(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_dir && entry.name != PARENT)
+            .map(|entry| self.cwd.join(&entry.name))
+            .collect();
+
+        for path in paths {
+            self.sizer.forget(&path);
+        }
+        self.size_directories();
     }
 
     /// Take in whatever the background walks have posted since the last frame.
@@ -206,6 +242,10 @@ impl App {
         entry.size = Some(update.allocated);
         if update.complete {
             entry.measuring = false;
+            // Only a completed total is worth keeping — and the generation
+            // matched, so `cwd` is still the directory it was measured under.
+            let path = self.cwd.join(&update.name);
+            self.sizer.remember(path, update.allocated);
             return true;
         }
         false
@@ -558,23 +598,69 @@ mod tests {
         assert_eq!(size_of(&app, "alpha"), None, "not from a previous request");
     }
 
-    /// Asking again is the point of the key: a size describes a moment, and the
-    /// directory may have changed since.
+    /// `r` is the one thing that makes a total stale on purpose, because
+    /// deleting is the one way it goes stale that the browser cannot see.
     #[test]
-    fn measuring_again_clears_what_was_there() {
+    fn re_measuring_forgets_what_was_there_and_walks_again() {
         let dir = fixture();
         let mut app = App::open(dir.path()).expect("open");
         await_sizes(&mut app);
         assert!(size_of(&app, "alpha").is_some());
 
-        app.size_directories();
+        app.remeasure();
 
-        assert_eq!(size_of(&app, "alpha"), None, "the old figure is stale");
+        assert_eq!(size_of(&app, "alpha"), None, "the old figure is dropped");
         assert!(
             app.entries()
                 .iter()
                 .any(|entry| entry.measuring && entry.name == "alpha")
         );
+        await_sizes(&mut app);
+        assert!(size_of(&app, "alpha").is_some(), "and computed afresh");
+    }
+
+    /// Stepping into a directory and back out must not pay for the parent
+    /// twice. Navigation is not a reason to recompute anything.
+    #[test]
+    fn returning_to_a_directory_reuses_the_sizes_already_computed() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
+        let mut app = App::open(dir.path()).expect("open");
+        await_sizes(&mut app);
+        let before = size_of(&app, "alpha").expect("measured once");
+
+        point_at(&mut app, "alpha");
+        app.enter();
+        app.leave();
+
+        // No `absorb_sizes` between: if this needed a walk, the figure would not
+        // be here yet.
+        assert_eq!(size_of(&app, "alpha"), Some(before));
+        assert!(
+            app.entries().iter().all(|entry| !entry.measuring),
+            "and nothing is spinning: {:?}",
+            names(&app)
+        );
+    }
+
+    /// Sizes survive the trip; the generation still has to move, or a reply
+    /// still in flight from the directory just left is taken as this one's.
+    #[test]
+    fn arriving_somewhere_fully_known_still_invalidates_what_was_in_flight() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+        await_sizes(&mut app);
+
+        point_at(&mut app, "alpha");
+        app.enter();
+
+        let stale = crate::ui::measure::Update {
+            generation: 1,
+            name: OsString::from("anything"),
+            allocated: 999_999,
+            complete: true,
+        };
+        assert!(!app.apply(stale), "a reply from before the move is dropped");
     }
 
     /// "By size" that stops re-ordering as the sizes arrive is showing an order

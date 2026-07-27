@@ -83,8 +83,9 @@ fn handle(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.enter(),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.leave(),
 
-        // Sizes are a statement about a moment; this asks again.
-        KeyCode::Char('r') => app.size_directories(),
+        // Sizes are kept for the session, so this is the only thing that makes
+        // one stale on purpose.
+        KeyCode::Char('r') => app.remeasure(),
 
         KeyCode::Char('n') => app.sort_by(Order::Name),
         KeyCode::Char('s') => app.sort_by(Order::Size),

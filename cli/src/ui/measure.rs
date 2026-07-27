@@ -11,13 +11,20 @@
 //! the same rayon pool its replacement is queued behind; without the generation,
 //! a size for the directory you just left lands in the directory you are in.
 //!
+//! **Totals are remembered for the session.** A size is expensive and does not
+//! change on its own, so walking into a directory and back out must not pay for
+//! it twice — the browser is navigated far more often than the disk changes
+//! under it. What the user deletes, the user knows about, and `r` is how they
+//! say so.
+//!
 //! The clock lives here. [`disk_tools_core::measure`] calls back on every
 //! directory — thousands a second on a warm cache — and this throttles that to
 //! something a screen can use, because the core reads no clock and should not.
 
 use disk_tools_core::measure;
+use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
@@ -46,6 +53,13 @@ pub struct Sizer {
     post: Sender<Update>,
     generation: u64,
     running: Option<Job>,
+
+    /// Every total computed this session, by absolute path.
+    ///
+    /// Grows with the directories visited and is never evicted: a path and a
+    /// `u64` against a walk of the subtree is not a trade worth thinking about,
+    /// and a browser is closed long before the map is interesting.
+    known: HashMap<PathBuf, u64>,
 }
 
 struct Job {
@@ -61,7 +75,23 @@ impl Sizer {
             post,
             generation: 0,
             running: None,
+            known: HashMap::new(),
         }
+    }
+
+    /// The total for `path`, if it has already been computed.
+    pub fn known(&self, path: &Path) -> Option<u64> {
+        self.known.get(path).copied()
+    }
+
+    /// Keep a total. Only ever called with a completed one.
+    pub fn remember(&mut self, path: PathBuf, allocated: u64) {
+        self.known.insert(path, allocated);
+    }
+
+    /// Drop what is known about `path`, so it is walked again when asked for.
+    pub fn forget(&mut self, path: &Path) {
+        self.known.remove(path);
     }
 
     /// The request whose results are worth keeping.
