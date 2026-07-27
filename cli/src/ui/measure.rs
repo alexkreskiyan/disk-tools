@@ -11,6 +11,14 @@
 //! came from. A total belongs to a place on disk and stays true after the screen
 //! has moved on.
 //!
+//! **A walk of a directory subsumes the walks of everything inside it.** Asking
+//! for `~` measures `~/Projects` on the way; asking separately for the children
+//! of `Projects` while that is under way would do the same work a second time.
+//! So a path with an ancestor already being walked is not queued — it is already
+//! being measured, and it says so. The core reports each directory as that
+//! directory finishes, so the inner answers arrive as the outer walk reaches
+//! them rather than all at the end.
+//!
 //! **One worker, a queue, newest first.** Several workers would each be walking
 //! a tree through the same rayon pool, competing for it. A queue bounds that to
 //! one, and pushing new requests to the front means the directory being looked
@@ -26,7 +34,7 @@
 //! directory — thousands a second on a warm cache — and this throttles that to
 //! something a screen can use, because the core reads no clock and should not.
 
-use disk_tools_core::measure;
+use disk_tools_core::{Finished, measure};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,21 +47,20 @@ use std::time::{Duration, Instant};
 /// above it the figure looks stuck.
 const TICK: Duration = Duration::from_millis(80);
 
-/// One directory's size, as it stands.
+/// What one walk has to say, batched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
-    /// What was measured. Absolute, because the screen may have moved on.
+    /// What was asked for. Absolute, because the screen may have moved on.
     pub root: PathBuf,
-    pub allocated: u64,
-    /// Whether this is the total or a figure still climbing.
+    /// How far the walk of `root` has got. Not a total until `complete`.
+    pub running_total: u64,
+    /// Whether the walk of `root` has finished.
     pub complete: bool,
 
-    /// Every directory the walk visited, with its own total. Empty until the
-    /// walk completes.
+    /// Directories whose subtrees are done, `root` included once it is.
     ///
-    /// The walk of one directory already visited everything beneath it. Keeping
-    /// what it found is what stops the browser recomputing a subtree the moment
-    /// the user steps into it.
+    /// Every one of these is final, even if the walk is later cut short: that
+    /// subtree finished, whatever happened to its neighbours.
     pub directories: Vec<(PathBuf, u64)>,
 }
 
@@ -118,9 +125,19 @@ impl Sizer {
             .copied()
     }
 
-    /// Whether a walk of `path` is queued or under way.
+    /// Whether a walk that will produce `path` is queued or under way.
+    ///
+    /// An ancestor being walked counts: that walk reaches here on its way, and
+    /// reports this directory when it does.
     pub fn is_measuring(&self, path: &Path) -> bool {
-        self.pending.contains(path)
+        self.pending.contains(path) || self.covered(path)
+    }
+
+    /// Whether some directory above `path` is already being walked.
+    fn covered(&self, path: &Path) -> bool {
+        path.ancestors()
+            .skip(1)
+            .any(|above| self.pending.contains(above))
     }
 
     /// Ask for the sizes of `paths`, skipping anything known or already asked
@@ -130,7 +147,13 @@ impl Sizer {
     pub fn request(&mut self, paths: Vec<PathBuf>) {
         let wanted: Vec<PathBuf> = paths
             .into_iter()
-            .filter(|path| !self.known.contains_key(path) && !self.pending.contains(path))
+            .filter(|path| {
+                !self.known.contains_key(path)
+                    && !self.pending.contains(path)
+                    // A walk already under way above here will measure this on
+                    // its way through. Queueing it would be the same work twice.
+                    && !self.covered(path)
+            })
             .collect();
         if wanted.is_empty() {
             return;
@@ -179,37 +202,44 @@ impl Sizer {
                     }
                 };
 
-                // Scoped so the throttling closure stops borrowing `next` before
-                // the final update takes ownership of it.
+                // Batched behind the tick rather than sent per directory: a
+                // home directory is a hundred thousand of them, and the screen
+                // redraws twelve times a second.
+                let batch = Mutex::new((Instant::now(), Vec::new(), 0u64));
+
+                // Scoped so the closure stops borrowing `next` before the final
+                // update takes ownership of it.
                 let measured = {
-                    let sent = Mutex::new(Instant::now());
-                    let report = |allocated| {
-                        let mut last = sent.lock().expect("no panics under this lock");
-                        if last.elapsed() < TICK {
+                    let report = |done: Finished<'_>| {
+                        let mut batch = batch.lock().expect("no panics under this lock");
+                        batch.1.push((done.path.to_path_buf(), done.allocated));
+                        batch.2 = done.running_total;
+
+                        if batch.0.elapsed() < TICK {
                             return;
                         }
-                        *last = Instant::now();
+                        batch.0 = Instant::now();
                         let _ = post.send(Update {
                             root: next.clone(),
-                            allocated,
+                            running_total: batch.2,
                             complete: false,
-                            directories: Vec::new(),
+                            directories: std::mem::take(&mut batch.1),
                         });
                     };
                     measure(&next, &cancel, &report)
                 };
 
-                // The final figure goes out unthrottled, and is the only one
-                // marked complete. A partial total from a cancelled walk is not
-                // a size, so it is not sent at all.
-                if measured.complete {
-                    let _ = post.send(Update {
-                        root: next,
-                        allocated: measured.allocated,
-                        complete: true,
-                        directories: measured.directories,
-                    });
-                }
+                // Whatever the tick did not carry, plus the verdict. Sent even
+                // when the walk was cut short: the subtrees in it did finish,
+                // and only `complete` says whether `root` itself did.
+                let leftover =
+                    std::mem::take(&mut batch.lock().expect("no panics under this lock").1);
+                let _ = post.send(Update {
+                    root: next,
+                    running_total: measured.allocated,
+                    complete: measured.complete,
+                    directories: leftover,
+                });
             }
         })
     }
@@ -226,21 +256,22 @@ impl Sizer {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return completed,
             };
 
-            if !update.complete {
-                self.running.insert(update.root, update.allocated);
-                continue;
+            // Each of these is a subtree that finished, whatever became of the
+            // walk carrying it — so they are totals even when `complete` is not.
+            for (path, allocated) in update.directories {
+                self.running.remove(&path);
+                self.pending.remove(&path);
+                self.known.insert(path, allocated);
+                completed = true;
             }
 
-            // Everything the walk saw, not just what was asked for: the subtree
-            // beneath it has been measured, and recomputing that when the user
-            // steps inside would be the same work a second time.
-            for (path, allocated) in update.directories {
-                self.known.insert(path, allocated);
+            if update.complete {
+                self.running.remove(&update.root);
+                self.pending.remove(&update.root);
+                completed = true;
+            } else if !self.known.contains_key(&update.root) {
+                self.running.insert(update.root, update.running_total);
             }
-            self.known.insert(update.root.clone(), update.allocated);
-            self.running.remove(&update.root);
-            self.pending.remove(&update.root);
-            completed = true;
         }
     }
 
@@ -465,6 +496,60 @@ mod tests {
             !sizer.known.contains_key(&tree),
             "a partial figure is not a size"
         );
+    }
+
+    /// The bug: walking into `Projects` while `~` was measuring it queued each
+    /// of its children as well, so the same tree was walked twice — and coming
+    /// back out, the outer walk was still going over ground already covered.
+    #[test]
+    fn a_walk_already_running_above_is_not_asked_for_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tree = big(dir.path(), "tree");
+        let mut sizer = Sizer::new();
+
+        sizer.request(vec![tree.clone()]);
+        // What entering it looks like: every child asked about at once.
+        let children: Vec<PathBuf> = (0..800).map(|n| tree.join(format!("sub{n}"))).collect();
+        sizer.request(children.clone());
+
+        assert!(
+            sizer.work.lock().expect("lock").queue.len() <= 1,
+            "the children are already covered by the walk above them"
+        );
+        assert!(
+            children.iter().all(|path| sizer.is_measuring(path)),
+            "and they say so, so the screen shows a spinner rather than nothing"
+        );
+
+        settle(&mut sizer, std::slice::from_ref(&tree));
+        assert!(children.iter().all(|path| sizer.size_of(path).is_some()));
+    }
+
+    /// The inner answers have to arrive while the outer walk is still going, or
+    /// stepping inside shows an empty column until the whole thing finishes.
+    #[test]
+    fn subtrees_are_known_before_the_walk_above_them_finishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tree = big(dir.path(), "tree");
+        let mut sizer = Sizer::new();
+
+        sizer.request(vec![tree.clone()]);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            sizer.absorb();
+            let inner = sizer.size_of(&tree.join("sub0")).is_some();
+            if inner && sizer.size_of(&tree).is_none() {
+                return; // a child was known while the parent still was not
+            }
+            if sizer.size_of(&tree).is_some() {
+                // The walk finished before the check could catch it in the act;
+                // the children still have to be there.
+                assert!(inner);
+                return;
+            }
+            assert!(Instant::now() < deadline, "never settled");
+        }
     }
 
     /// The walk of one directory visits everything beneath it, and says so.

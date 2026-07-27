@@ -15,16 +15,15 @@
 //! competing for the same rayon pool as whatever replaced it — which is what a
 //! user produces by walking quickly through a deep tree.
 //!
-//! **It reports as it goes**, so a figure can rise on screen instead of
-//! appearing at the end. The callback runs on pool threads and may be called
-//! concurrently.
+//! **It reports every directory as that directory finishes**, not once at the
+//! end. Walking a directory visits every directory beneath it, so its walk
+//! already contains all of theirs — and a caller that waits for the whole thing
+//! before learning any of it will start those inner walks itself and do the same
+//! work twice. Reporting as it goes is what makes the outer walk *subsume* the
+//! inner ones instead of racing them.
 //!
-//! **It hands back everything it measured**, not just the one total it was asked
-//! for. Walking a directory visits every directory beneath it, and throwing
-//! those subtotals away means computing them again the moment the user steps
-//! inside — the walk that just finished had the answer and dropped it. The cost
-//! is a `PathBuf` and a `u64` per directory, which is the order
-//! [`scan`](crate::scan) already pays for its tree.
+//! A subtotal reported this way is final. It survives the walk above it being
+//! cancelled: that subtree did finish, whatever happened to its neighbours.
 //!
 //! Unreadable entries contribute nothing and are not reported. `scan` returns
 //! them as [`SkippedEntry`](crate::SkippedEntry) because its report has a place
@@ -41,44 +40,47 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// atomic load is lost in the noise of a `stat` per entry.
 const CANCEL_EVERY: usize = 512;
 
-/// A total, what it was made of, and whether it is the whole answer.
+/// A total, and whether it is the whole answer.
 ///
 /// `complete` is the point of the type: a cancelled walk still has a number, and
 /// presenting that number as a size would be a lie that grows with the tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Measured {
     pub allocated: u64,
     pub complete: bool,
+}
 
-    /// Every directory walked, with its own subtree total — the root included.
-    ///
-    /// Empty when the walk was cancelled: a subtree that did not finish has no
-    /// total, and neither has anything above it.
-    pub directories: Vec<(PathBuf, u64)>,
+/// One directory, done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Finished<'a> {
+    /// The directory whose subtree has just been added up.
+    pub path: &'a Path,
+    /// What that subtree comes to. Final — nothing will be added to it.
+    pub allocated: u64,
+    /// Bytes counted anywhere in this walk so far, for a figure that climbs.
+    pub running_total: u64,
 }
 
 /// Total allocated bytes under `root`, stoppable through `cancel`.
 ///
-/// `progress` is called with the running total as it climbs, from whichever pool
-/// thread got there — throttling, if any is wanted, belongs to the caller, since
-/// this crate reads no clock.
+/// `finished` is called once for every directory whose subtree has been added
+/// up, including `root` itself, from whichever pool thread got there.
+/// Throttling, if any is wanted, belongs to the caller, since this crate reads
+/// no clock.
 ///
 /// Symlinks are not followed: a link's own metadata is what counts, exactly as
 /// in [`scan`](crate::scan), or a loop would never terminate.
-pub fn measure(root: &Path, cancel: &AtomicBool, progress: &(dyn Fn(u64) + Sync)) -> Measured {
+pub fn measure(
+    root: &Path,
+    cancel: &AtomicBool,
+    finished: &(dyn Fn(Finished<'_>) + Sync),
+) -> Measured {
     let running = AtomicU64::new(0);
-    let walked = walk(root, cancel, &running, progress);
+    let walked = walk(root, cancel, &running, finished);
 
     Measured {
         allocated: walked.allocated,
         complete: !walked.stopped,
-        // A partial breakdown would be a set of directories claiming totals they
-        // do not have.
-        directories: if walked.stopped {
-            Vec::new()
-        } else {
-            walked.directories
-        },
     }
 }
 
@@ -86,44 +88,42 @@ pub fn measure(root: &Path, cancel: &AtomicBool, progress: &(dyn Fn(u64) + Sync)
 struct Walked {
     allocated: u64,
     stopped: bool,
-    directories: Vec<(PathBuf, u64)>,
 }
 
 fn walk(
     dir: &Path,
     cancel: &AtomicBool,
     running: &AtomicU64,
-    progress: &(dyn Fn(u64) + Sync),
+    finished: &(dyn Fn(Finished<'_>) + Sync),
 ) -> Walked {
-    let stopped = Walked {
-        allocated: 0,
-        stopped: true,
-        directories: Vec::new(),
-    };
-
     // Checked on entry to every directory, which is what makes a cancelled walk
     // stop rather than merely be ignored.
     if cancel.load(Ordering::Relaxed) {
-        return stopped;
+        return Walked {
+            allocated: 0,
+            stopped: true,
+        };
     }
 
     let Some((here, subdirs)) = level(dir, cancel) else {
+        // An unreadable directory is a zero, not a cancellation: the answer is
+        // complete, it just does not include what could not be read.
+        finished(Finished {
+            path: dir,
+            allocated: 0,
+            running_total: running.load(Ordering::Relaxed),
+        });
         return Walked {
             allocated: 0,
-            // An unreadable directory is a zero, not a cancellation: the answer
-            // is complete, it just does not include what could not be read.
             stopped: false,
-            directories: vec![(dir.to_path_buf(), 0)],
         };
     };
-    if cancel.load(Ordering::Relaxed) {
-        return stopped;
-    }
 
+    // One add per directory rather than one per file: the running figure exists
+    // to move a number on screen, not to count.
+    let mut allocated = here;
     if here > 0 {
-        // One add per directory rather than one per file: the callback exists to
-        // move a number on screen, not to count.
-        progress(running.fetch_add(here, Ordering::Relaxed) + here);
+        running.fetch_add(here, Ordering::Relaxed);
     }
 
     // Directory-level parallelism, as in `walk.rs` — and through the same global
@@ -131,23 +131,26 @@ fn walk(
     // the user walks into.
     let nested: Vec<Walked> = subdirs
         .into_par_iter()
-        .map(|subdir| walk(&subdir, cancel, running, progress))
+        .map(|subdir| walk(&subdir, cancel, running, finished))
         .collect();
 
-    let mut walked = Walked {
-        allocated: here,
-        stopped: false,
-        directories: Vec::new(),
-    };
+    let mut stopped = false;
     for child in nested {
-        walked.allocated += child.allocated;
-        walked.stopped |= child.stopped;
-        walked.directories.extend(child.directories);
+        allocated += child.allocated;
+        stopped |= child.stopped;
     }
-    walked
-        .directories
-        .push((dir.to_path_buf(), walked.allocated));
-    walked
+
+    // Only a subtree that finished has a total. One cut short must not be
+    // reported, or a partial figure would be cached as final.
+    if !stopped {
+        finished(Finished {
+            path: dir,
+            allocated,
+            running_total: running.load(Ordering::Relaxed),
+        });
+    }
+
+    Walked { allocated, stopped }
 }
 
 /// The files' bytes and the subdirectories of one directory, or `None` when it
@@ -191,6 +194,7 @@ fn level(dir: &Path, cancel: &AtomicBool) -> Option<(u64, Vec<PathBuf>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
     /// Two levels, so cancellation has somewhere to happen and recursion has
@@ -207,11 +211,45 @@ mod tests {
         AtomicBool::new(false)
     }
 
+    /// Collect what the walk reports, so a test can ask what it was told.
+    #[derive(Default)]
+    struct Reported {
+        directories: Mutex<Vec<(PathBuf, u64)>>,
+    }
+
+    impl Reported {
+        fn record(&self) -> impl Fn(Finished<'_>) + Sync {
+            move |done: Finished<'_>| {
+                self.directories
+                    .lock()
+                    .expect("no panics")
+                    .push((done.path.to_path_buf(), done.allocated));
+            }
+        }
+
+        fn total_for(&self, suffix: &str) -> Option<u64> {
+            self.directories
+                .lock()
+                .expect("no panics")
+                .iter()
+                .find(|(path, _)| path.ends_with(suffix))
+                .map(|(_, bytes)| *bytes)
+        }
+
+        fn count(&self) -> usize {
+            self.directories.lock().expect("no panics").len()
+        }
+    }
+
+    fn quietly(root: &Path, cancel: &AtomicBool) -> Measured {
+        measure(root, cancel, &|_| {})
+    }
+
     #[test]
     fn a_total_covers_the_whole_subtree() {
         let dir = fixture();
 
-        let measured = measure(dir.path(), &never(), &|_| {});
+        let measured = quietly(dir.path(), &never());
 
         assert!(measured.complete);
         assert!(
@@ -224,15 +262,21 @@ mod tests {
     #[test]
     fn an_empty_directory_measures_zero_and_is_complete() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let reported = Reported::default();
 
-        let measured = measure(dir.path(), &never(), &|_| {});
+        let measured = measure(dir.path(), &never(), &reported.record());
 
-        assert_eq!(measured.allocated, 0);
-        assert!(measured.complete);
         assert_eq!(
-            measured.directories,
-            vec![(dir.path().to_path_buf(), 0)],
-            "the root is measured even when it is empty"
+            measured,
+            Measured {
+                allocated: 0,
+                complete: true
+            }
+        );
+        assert_eq!(
+            reported.count(),
+            1,
+            "the root is reported even when it is empty"
         );
     }
 
@@ -242,7 +286,7 @@ mod tests {
     fn a_vanished_directory_is_zero_rather_than_a_failure() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        let measured = measure(&dir.path().join("gone"), &never(), &|_| {});
+        let measured = quietly(&dir.path().join("gone"), &never());
 
         assert_eq!(measured.allocated, 0);
         assert!(measured.complete, "nothing was cancelled");
@@ -253,15 +297,16 @@ mod tests {
     #[test]
     fn a_flag_already_set_stops_before_anything_is_counted() {
         let dir = fixture();
-        let cancel = AtomicBool::new(true);
+        let reported = Reported::default();
 
-        let measured = measure(dir.path(), &cancel, &|_| {});
+        let measured = measure(dir.path(), &AtomicBool::new(true), &reported.record());
 
         assert_eq!(measured.allocated, 0);
         assert!(
             !measured.complete,
             "and it says the number is not the answer"
         );
+        assert_eq!(reported.count(), 0, "nothing may claim a total");
     }
 
     /// Cancelling part-way returns what was counted, marked as partial. The
@@ -287,15 +332,44 @@ mod tests {
             "it stopped, so it cannot have counted everything: {}",
             measured.allocated
         );
+    }
+
+    /// A subtree that finished is a fact about that subtree. Cutting the walk
+    /// short above it does not make it less true — and throwing it away is how
+    /// the browser ended up measuring the same directory twice.
+    #[test]
+    fn a_subtree_that_finished_keeps_its_total_when_the_walk_is_cut_short() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for n in 0..40 {
+            let sub = dir.path().join(format!("sub{n}"));
+            std::fs::create_dir(&sub).expect("mkdir");
+            std::fs::write(sub.join("f.bin"), vec![b'x'; 4096]).expect("write");
+        }
+
+        let cancel = AtomicBool::new(false);
+        let reported = Reported::default();
+        let record = reported.record();
+        let measured = measure(dir.path(), &cancel, &|done| {
+            record(done);
+            cancel.store(true, Ordering::Relaxed);
+        });
+
+        assert!(!measured.complete);
+        assert!(reported.count() >= 1, "what did finish was still reported");
         assert!(
-            measured.directories.is_empty(),
-            "and no directory beneath it may claim a total either"
+            !reported
+                .directories
+                .lock()
+                .expect("no panics")
+                .iter()
+                .any(|(path, _)| path == dir.path()),
+            "but the root did not finish, so it is not among them"
         );
     }
 
     /// The figure has to climb, or there is nothing to show while it works.
     #[test]
-    fn progress_reports_a_rising_total() {
+    fn the_running_total_climbs_to_the_answer() {
         let dir = tempfile::tempdir().expect("tempdir");
         for n in 0..8 {
             let sub = dir.path().join(format!("sub{n}"));
@@ -305,12 +379,12 @@ mod tests {
 
         let calls = AtomicUsize::new(0);
         let highest = AtomicU64::new(0);
-        let measured = measure(dir.path(), &never(), &|running| {
+        let measured = measure(dir.path(), &never(), &|done| {
             calls.fetch_add(1, Ordering::Relaxed);
-            highest.fetch_max(running, Ordering::Relaxed);
+            highest.fetch_max(done.running_total, Ordering::Relaxed);
         });
 
-        assert!(calls.load(Ordering::Relaxed) >= 8, "one per directory");
+        assert!(calls.load(Ordering::Relaxed) >= 9, "one per directory");
         assert_eq!(
             highest.load(Ordering::Relaxed),
             measured.allocated,
@@ -318,43 +392,33 @@ mod tests {
         );
     }
 
-    /// An empty directory has nothing to report, and a callback firing with an
-    /// unchanged total would make the screen flicker for no reason.
+    /// The walk visits every directory beneath the root and says what each came
+    /// to — as it goes, so a caller watching one of them need not walk it again.
     #[test]
-    fn nothing_to_count_reports_nothing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(dir.path().join("empty")).expect("mkdir");
-
-        let calls = AtomicUsize::new(0);
-        measure(dir.path(), &never(), &|_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-        });
-
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-    }
-
-    /// The walk visits every directory beneath the root, so it may as well say
-    /// what each of them came to — recomputing that the moment the user steps
-    /// inside is the same work a second time.
-    #[test]
-    fn every_directory_walked_reports_its_own_total() {
+    fn every_directory_is_reported_with_its_own_total() {
         let dir = fixture();
+        let reported = Reported::default();
 
-        let measured = measure(dir.path(), &never(), &|_| {});
+        let measured = measure(dir.path(), &never(), &reported.record());
 
-        let nested = measured
-            .directories
-            .iter()
-            .find(|(path, _)| path.ends_with("nested"))
-            .expect("the subdirectory is in the breakdown");
-        assert!(nested.1 >= 8192, "with its own subtree total: {}", nested.1);
-
-        let root = measured
-            .directories
-            .iter()
-            .find(|(path, _)| path == dir.path())
-            .expect("and so is the root");
-        assert_eq!(root.1, measured.allocated);
+        assert!(
+            reported
+                .total_for("nested")
+                .is_some_and(|bytes| bytes >= 8192),
+            "{:?}",
+            reported.directories.lock().expect("no panics")
+        );
+        assert_eq!(
+            reported
+                .directories
+                .lock()
+                .expect("no panics")
+                .iter()
+                .find(|(path, _)| path == dir.path())
+                .map(|(_, bytes)| *bytes),
+            Some(measured.allocated),
+            "the root last, with the whole"
+        );
     }
 
     /// Nesting is what makes this worth having: an inner total has to be the sum
@@ -366,15 +430,9 @@ mod tests {
         std::fs::write(dir.path().join("a/mid.bin"), vec![b'x'; 4096]).expect("write");
         std::fs::write(dir.path().join("a/b/deep.bin"), vec![b'x'; 8192]).expect("write");
 
-        let measured = measure(dir.path(), &never(), &|_| {});
-        let total = |suffix: &str| {
-            measured
-                .directories
-                .iter()
-                .find(|(path, _)| path.ends_with(suffix))
-                .unwrap_or_else(|| panic!("{suffix} missing from {:?}", measured.directories))
-                .1
-        };
+        let reported = Reported::default();
+        let measured = measure(dir.path(), &never(), &reported.record());
+        let total = |suffix: &str| reported.total_for(suffix).expect(suffix);
 
         assert!(total("a/b") >= 8192);
         assert!(total("a") >= total("a/b") + 4096);
@@ -399,7 +457,8 @@ mod tests {
             return;
         }
 
-        let measured = measure(dir.path(), &never(), &|_| {});
+        let reported = Reported::default();
+        let measured = measure(dir.path(), &never(), &reported.record());
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
 
         assert!(measured.complete);
@@ -407,12 +466,21 @@ mod tests {
             measured.allocated >= 4096 + 8192,
             "the readable part is still counted"
         );
-        assert!(
-            measured
-                .directories
-                .iter()
-                .any(|(path, bytes)| path.ends_with("locked") && *bytes == 0)
-        );
+        assert_eq!(reported.total_for("locked"), Some(0));
+    }
+
+    /// An empty directory has nothing to add, and a running figure that did not
+    /// move would make the screen flicker for no reason.
+    #[test]
+    fn a_directory_with_nothing_in_it_adds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("empty")).expect("mkdir");
+
+        let reported = Reported::default();
+        let measured = measure(dir.path(), &never(), &reported.record());
+
+        assert_eq!(measured.allocated, 0);
+        assert_eq!(reported.total_for("empty"), Some(0));
     }
 
     /// Following one would count the target twice, and a loop would never end.
@@ -423,9 +491,9 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("nested"), dir.path().join("link"))
             .expect("symlink");
 
-        let with_link = measure(dir.path(), &never(), &|_| {});
+        let with_link = quietly(dir.path(), &never());
         std::fs::remove_file(dir.path().join("link")).expect("unlink");
-        let without = measure(dir.path(), &never(), &|_| {});
+        let without = quietly(dir.path(), &never());
 
         // The link itself occupies something, so this is not an equality — what
         // matters is that `nested` was not counted a second time through it.
