@@ -223,6 +223,11 @@ pub enum Mode {
         /// The same rules `clean` would apply, so the two verbs cannot disagree
         /// about what is junk.
         rules: Box<Rules>,
+        /// Everything needed to build those rules again, for the reload key.
+        /// The browser outlives the file it was started from — editing the
+        /// config and restarting to see the effect is the loop this removes.
+        reload: Box<Reload>,
+        now: SystemTime,
     },
 }
 
@@ -241,6 +246,20 @@ pub struct Environment {
     /// environment implies a path, which is also the one case `config init`
     /// cannot serve.
     pub config_path: Option<PathBuf>,
+}
+
+/// What it takes to read the rules again from scratch.
+///
+/// A copy of the inputs rather than a closure: `resolve` is a pure function of
+/// its `Environment`, and handing the browser a closure over it would make the
+/// mode inspectable only by running it.
+#[derive(Debug, Clone)]
+pub struct Reload {
+    /// The file the rules came from, already located. Passed back as the
+    /// explicit path so a reload cannot resolve to a *different* file than the
+    /// one the browser started with.
+    pub path: Option<PathBuf>,
+    pub user_dirs: UserDirs,
 }
 
 impl Args {
@@ -291,6 +310,11 @@ impl Args {
                 // No age rule: `--older-than` is a `clean` flag, and a browser
                 // that coloured every old file as junk would say nothing.
                 rules: Box::new(Rules::new(config.rules, &user_dirs).map_err(ResolveError::Rule)?),
+                reload: Box::new(Reload {
+                    path: config_path,
+                    user_dirs,
+                }),
+                now,
             }),
 
             Command::Config {

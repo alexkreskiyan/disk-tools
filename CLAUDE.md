@@ -133,7 +133,8 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
 | `Rule` / `Rules` | `core/src/rules.rs` | Detection as data. **List order is precedence**; a rule that cannot be expressed matches nothing |
-| `Rules::state -> State` | `core/src/rules.rs` | Why a row is that colour: `untracked` / `in scope` / `included` / `excluded`. A display function, sharing `matching` and `excluded` with `detect` so precedence cannot drift |
+| `Rules::state -> State` | `core/src/rules.rs` | Why a row is that colour: `untracked` / `in scope` / `included` / `excluded`. Shares `matching`, `excluded` **and `predicates_hold`** with `detect`, so `included` means exactly "detect would claim this" |
+| `Facts` | `core/src/rules.rs` | What the caller already knows — siblings, mtime, `now` — so the non-glob predicates need no filesystem and no clock |
 | `DetectOptions` / `Detection` | `core/src/detect.rs` | The pass's input and output. `now` is mandatory, so a rule's `older_than` can never be half-armed |
 | `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason; `filtered_out` / `too_small` count the user's own narrowings |
 | `CleanOutcome` | `core/src/trash.rs` | `removed` / `failed` / `reclaimed` — never a `Result` |
@@ -182,6 +183,10 @@ Invariants worth keeping in mind:
   about somewhere else.
 - **The TUI cancels only what the user asks it to** (`r`) and what exit
   requires. Cancelling on navigation destroyed work that was about to be wanted.
+- **A colour and a candidate are decided by the same code.** `detect::claim` and
+  `Rules::state` both run `matching` → `excluded` → `predicates_hold`, in that
+  order. A `target/` with no `Cargo.toml` beside it is `in scope`, not
+  `included`, because that is what `clean` would do with it.
 - **`in scope` is a state of its own.** "My rule does not cover this" and "my
   rule is not running" are different problems, and folding them together leaves
   the user unable to tell which they have.

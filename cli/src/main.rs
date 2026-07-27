@@ -96,7 +96,12 @@ fn main() -> ExitCode {
             verbose,
         ),
         Mode::ConfigInit { target, force } => run_config_init(&target, force),
-        Mode::Ui { root, rules } => run_ui(&root, *rules),
+        Mode::Ui {
+            root,
+            rules,
+            reload,
+            now,
+        } => run_ui(&root, *rules, *reload, now),
     }
 }
 
@@ -122,12 +127,17 @@ fn run_config_init(target: &std::path::Path, force: bool) -> ExitCode {
 /// Both checks happen **before** the alternate screen: a message printed inside
 /// it is erased the moment the screen is left, so the user would see a program
 /// that flickered and exited saying nothing.
-fn run_ui(root: &std::path::Path, rules: disk_tools_core::Rules) -> ExitCode {
+fn run_ui(
+    root: &std::path::Path,
+    rules: disk_tools_core::Rules,
+    reload: args::Reload,
+    now: std::time::SystemTime,
+) -> ExitCode {
     if let Err(refusal) = ui::check(root, ui::stdout_is_terminal()) {
         eprintln!("disk-tools: {refusal}");
         return ExitCode::from(2);
     }
-    match ui::run(root, rules) {
+    match ui::run(root, rules, reload, now) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("disk-tools: ui: {err}");

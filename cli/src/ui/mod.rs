@@ -16,6 +16,7 @@ mod measure;
 mod sort;
 mod term;
 
+use crate::args::Reload;
 use app::App;
 use disk_tools_core::{Rules, State};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -32,8 +33,8 @@ use term::{Crossterm, Screen};
 /// The caller has already checked that `root` exists and that stdout is a
 /// terminal — both refusals belong *outside* the alternate screen, or their
 /// message would be printed onto a screen that is about to be torn down.
-pub fn run(root: &Path, rules: Rules) -> io::Result<()> {
-    let mut app = App::open(root, rules)?;
+pub fn run(root: &Path, rules: Rules, reload: Reload, now: SystemTime) -> io::Result<()> {
+    let mut app = App::open(root, rules, now)?;
 
     term::install_panic_hook();
     let mut screen = Screen::enter(Crossterm)?;
@@ -57,7 +58,7 @@ pub fn run(root: &Path, rules: Rules) -> io::Result<()> {
         }
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && !handle(&mut app, key.code)
+            && !handle(&mut app, key.code, &reload)
         {
             break;
         }
@@ -77,7 +78,7 @@ pub fn run(root: &Path, rules: Rules) -> io::Result<()> {
 ///
 /// Separated from the loop so the bindings are one readable table rather than
 /// something to reconstruct from a match buried in I/O.
-fn handle(app: &mut App, code: KeyCode) -> bool {
+fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
     // While a filter is being typed, letters are letters. Anything else would
     // mean a directory called `q` could not be searched for.
     if app.is_filtering() {
@@ -105,6 +106,9 @@ fn handle(app: &mut App, code: KeyCode) -> bool {
         // Sizes are kept for the session, so this is the only thing that makes
         // one stale on purpose.
         KeyCode::Char('r') => app.remeasure(),
+        // Editing the config and restarting to see the effect is the loop this
+        // removes. Only the rules are re-read; the listing has not changed.
+        KeyCode::Char('R') => reread(app, reload),
 
         KeyCode::Char('n') => app.sort_by(Order::Name),
         KeyCode::Char('s') => app.sort_by(Order::Size),
@@ -201,6 +205,29 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
     );
 }
 
+/// Read the config again and repaint against it.
+///
+/// A bad file leaves the rules that were working in place and says why. Dropping
+/// them would mean a typo silently turns every colour off, which looks exactly
+/// like "my rules stopped matching" — the one thing the user is here to
+/// diagnose.
+fn reread(app: &mut App, reload: &Reload) {
+    match crate::config::load(reload.path.as_deref(), &reload.user_dirs, None)
+        .map_err(|err| err.to_string())
+        .and_then(|config| {
+            Rules::new(config.rules, &reload.user_dirs).map_err(|err| err.to_string())
+        }) {
+        Ok(rules) => {
+            app.reload_rules(rules);
+            app.say(match &reload.path {
+                Some(path) => format!("reloaded {}", path.display()),
+                None => "reloaded the built-in rules".to_owned(),
+            });
+        }
+        Err(problem) => app.say(format!("config unchanged — {problem}")),
+    }
+}
+
 /// What each rule state looks like.
 ///
 /// `Untracked` keeps the terminal's own foreground rather than taking a colour
@@ -241,7 +268,7 @@ fn keys(app: &App) -> &'static str {
     if app.is_filtering() {
         "esc cancel  ↵ keep  ↑↓ move"
     } else {
-        "q quit  ↵ enter  ← up  / filter  n/s/c/m sort  r re-measure"
+        "q quit  ↵ enter  ← up  / filter  n/s/c/m sort  r re-measure  R reload rules"
     }
 }
 
@@ -331,7 +358,7 @@ mod tests {
     /// size of 0x0, so nothing renders and layout cannot be seen at all.
     fn painted(root: &Path, width: u16, height: u16) -> Vec<String> {
         paint(
-            App::open(root, Rules::default()).expect("open"),
+            App::open(root, Rules::default(), now()).expect("open"),
             width,
             height,
         )
@@ -341,7 +368,7 @@ mod tests {
     ///
     /// Bounded, so a worker that never finishes fails rather than hangs.
     fn painted_settled(root: &Path, width: u16, height: u16) -> Vec<String> {
-        let mut app = App::open(root, Rules::default()).expect("open");
+        let mut app = App::open(root, Rules::default(), now()).expect("open");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             app.absorb_sizes();
@@ -369,6 +396,10 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_750_000_000)
     }
 
     fn fixture() -> tempfile::TempDir {
@@ -558,7 +589,7 @@ mod tests {
     #[test]
     fn the_filter_is_on_screen_while_it_is_being_typed() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         app.start_filtering();
         app.filter_push('s');
 
@@ -577,7 +608,7 @@ mod tests {
     #[test]
     fn an_accepted_filter_says_how_to_get_rid_of_it() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         app.start_filtering();
         app.filter_push('s');
         app.filter_accept();
@@ -604,7 +635,7 @@ mod tests {
         )
         .expect("compiles");
 
-        let lines = paint(App::open(dir.path(), rules).expect("open"), 78, 10);
+        let lines = paint(App::open(dir.path(), rules, now()).expect("open"), 78, 10);
         let legend = lines
             .iter()
             .find(|line| line.contains("rules:"))
