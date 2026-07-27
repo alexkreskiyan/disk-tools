@@ -17,6 +17,7 @@ mod sort;
 mod term;
 
 use app::App;
+use disk_tools_core::{Rules, State};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
@@ -31,8 +32,8 @@ use term::{Crossterm, Screen};
 /// The caller has already checked that `root` exists and that stdout is a
 /// terminal — both refusals belong *outside* the alternate screen, or their
 /// message would be printed onto a screen that is about to be torn down.
-pub fn run(root: &Path) -> io::Result<()> {
-    let mut app = App::open(root)?;
+pub fn run(root: &Path, rules: Rules) -> io::Result<()> {
+    let mut app = App::open(root, rules)?;
 
     term::install_panic_hook();
     let mut screen = Screen::enter(Crossterm)?;
@@ -142,10 +143,14 @@ fn filtering(app: &mut App, code: KeyCode) {
 /// are borderless so the labels sit directly over their cells; a box would inset
 /// the rows by one and nothing would line up.
 fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
+    // The legend costs a row, so it is only there when the colours it explains
+    // are. A directory no rule reaches has nothing to explain.
+    let legend_rows = u16::from(app.any_rule_applies());
     let bands = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(legend_rows),
         Constraint::Length(1),
     ])
     .split(frame.area());
@@ -174,8 +179,14 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
     let rows: Vec<ListItem<'_>> = app
         .entries()
         .iter()
-        .map(|entry| ListItem::new(layout::row(entry, now, sized, &cols)))
+        .map(|entry| {
+            ListItem::new(layout::row(entry, now, sized, &cols)).style(colour(entry.state))
+        })
         .collect();
+    if legend_rows > 0 {
+        frame.render_widget(Line::from(legend()), bands[3]);
+    }
+
     let list = List::new(rows)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         // Keep the cursor away from the edges: scrolling with it pinned to the
@@ -186,8 +197,42 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
 
     frame.render_widget(
         Paragraph::new(keys(app)).style(Style::default().add_modifier(Modifier::DIM)),
-        bands[3],
+        bands[4],
     );
+}
+
+/// What each rule state looks like.
+///
+/// `Untracked` keeps the terminal's own foreground rather than taking a colour
+/// of its own: most rows are untracked, and colouring those too would leave the
+/// few that matter with nothing to stand out against.
+fn colour(state: State) -> Style {
+    match state {
+        State::Untracked => Style::default(),
+        State::InScope => Style::default().fg(Color::Blue),
+        State::Included => Style::default().fg(Color::Yellow),
+        State::Excluded => Style::default().fg(Color::Green),
+    }
+}
+
+/// The colours, named.
+///
+/// Every state carries its word as well as its colour — a legend of four
+/// swatches is no legend at all to a reader who cannot tell them apart.
+fn legend() -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        "rules: ",
+        Style::default().add_modifier(Modifier::DIM),
+    )];
+    for state in [
+        State::Included,
+        State::Excluded,
+        State::InScope,
+        State::Untracked,
+    ] {
+        spans.push(Span::styled(format!("{}  ", state.label()), colour(state)));
+    }
+    spans
 }
 
 /// What the keys do — different while a filter is being typed, because most of
@@ -285,14 +330,18 @@ mod tests {
     /// alternative this task started with: a real pty from `script` reports a
     /// size of 0x0, so nothing renders and layout cannot be seen at all.
     fn painted(root: &Path, width: u16, height: u16) -> Vec<String> {
-        paint(App::open(root).expect("open"), width, height)
+        paint(
+            App::open(root, Rules::default()).expect("open"),
+            width,
+            height,
+        )
     }
 
     /// The same, once every background walk has posted its total.
     ///
     /// Bounded, so a worker that never finishes fails rather than hangs.
     fn painted_settled(root: &Path, width: u16, height: u16) -> Vec<String> {
-        let mut app = App::open(root).expect("open");
+        let mut app = App::open(root, Rules::default()).expect("open");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             app.absorb_sizes();
@@ -509,7 +558,7 @@ mod tests {
     #[test]
     fn the_filter_is_on_screen_while_it_is_being_typed() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         app.start_filtering();
         app.filter_push('s');
 
@@ -528,7 +577,7 @@ mod tests {
     #[test]
     fn an_accepted_filter_says_how_to_get_rid_of_it() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         app.start_filtering();
         app.filter_push('s');
         app.filter_accept();
@@ -537,6 +586,46 @@ mod tests {
 
         assert!(lines[0].contains("/s"), "{:?}", lines[0]);
         assert!(lines[0].contains("esc"), "{:?}", lines[0]);
+    }
+
+    /// Colour alone excludes anyone who cannot distinguish it, so the states
+    /// are named on screen.
+    #[test]
+    fn the_legend_names_every_state_when_a_rule_applies() {
+        let dir = fixture();
+        let rules = Rules::new(
+            vec![disk_tools_core::Rule {
+                name: "junk".into(),
+                root: Some(dir.path().to_string_lossy().into_owned()),
+                includes: vec!["**/sub/".into()],
+                ..disk_tools_core::Rule::default()
+            }],
+            &disk_tools_core::UserDirs::default(),
+        )
+        .expect("compiles");
+
+        let lines = paint(App::open(dir.path(), rules).expect("open"), 78, 10);
+        let legend = lines
+            .iter()
+            .find(|line| line.contains("rules:"))
+            .expect("a legend is on screen");
+
+        for word in ["included", "excluded", "in scope", "untracked"] {
+            assert!(legend.contains(word), "{word} missing from {legend:?}");
+        }
+    }
+
+    /// And a row is not spent explaining colours that are not on screen.
+    #[test]
+    fn no_rule_here_means_no_legend_row() {
+        let dir = fixture();
+
+        let lines = painted(dir.path(), 70, 10);
+
+        assert!(
+            !lines.iter().any(|line| line.contains("rules:")),
+            "{lines:?}"
+        );
     }
 
     #[test]

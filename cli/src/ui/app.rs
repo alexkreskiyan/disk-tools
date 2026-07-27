@@ -22,6 +22,7 @@
 use super::listing::{self, Entry};
 use super::measure::Sizer;
 use super::sort::{Applied, Order, sort};
+use disk_tools_core::{Rules, State};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -54,6 +55,10 @@ pub struct App {
     /// Directory sizes, computed in the background.
     sizer: Sizer,
 
+    /// What `clean` would say about each row. The same rules that verb uses, so
+    /// the two cannot disagree about what is junk.
+    rules: Rules,
+
     /// How many rows the list band has. Set by the drawing code, which is the
     /// only place that knows — a page is a screenful, so it cannot be a
     /// constant.
@@ -65,7 +70,7 @@ impl App {
     ///
     /// Fails only if `root` itself cannot be read — the caller has already
     /// checked it exists, and there would be nothing to show.
-    pub fn open(root: &Path) -> std::io::Result<Self> {
+    pub fn open(root: &Path, rules: Rules) -> std::io::Result<Self> {
         let mut app = App {
             cwd: root.to_path_buf(),
             listed: Vec::new(),
@@ -81,9 +86,11 @@ impl App {
             },
             notice: None,
             sizer: Sizer::new(),
+            rules,
             page: 1,
         };
         app.listed = app.read(root)?;
+        app.classify();
         // Sorted, then the cursor put at the top. `refilter` would instead hold
         // onto whatever `read_dir` happened to return first and follow it to
         // wherever the sort put it — which is a cursor landing at random.
@@ -102,6 +109,7 @@ impl App {
                 size: None,
                 modified: None,
                 created: None,
+                state: State::Untracked,
                 measuring: false,
             });
         }
@@ -294,6 +302,33 @@ impl App {
         }
     }
 
+    /// Ask the rules about every row.
+    ///
+    /// Once per listing, not once per frame: the rules do not change while a
+    /// directory is open, and a glob match per row per redraw would be work done
+    /// twelve times a second for an answer that never moves.
+    fn classify(&mut self) {
+        for entry in &mut self.listed {
+            entry.state = if entry.name == PARENT {
+                // The parent is a way out, not a thing in this listing. Colouring
+                // it would say something about a directory that is not on screen.
+                State::Untracked
+            } else {
+                self.rules.state(&self.cwd.join(&entry.name), entry.is_dir)
+            };
+        }
+    }
+
+    /// Whether anything here is under a rule at all.
+    ///
+    /// The legend costs a row, and a row spent explaining colours that are not
+    /// on screen is a row taken from the listing.
+    pub fn any_rule_applies(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.state != State::Untracked)
+    }
+
     /// The subdirectories here, by absolute path. The parent is not one of them:
     /// measuring it would walk everything on screen a second time, through
     /// itself.
@@ -401,6 +436,7 @@ impl App {
                 self.typing = None;
                 self.cursor = 0;
                 self.notice = None;
+                self.classify();
                 self.applied = sort(&mut self.listed, self.order, self.reverse);
                 self.entries = self.filtered();
                 if let Some(name) = land_on
@@ -475,7 +511,7 @@ mod tests {
     fn opens_sorted_by_name_with_directories_first() {
         let dir = fixture();
 
-        let app = App::open(dir.path()).expect("open");
+        let app = App::open(dir.path(), Rules::default()).expect("open");
 
         // `..` is a directory named `..`, so it sorts among them.
         assert_eq!(names(&app), ["..", "alpha", "zulu", "big.bin", "small.bin"]);
@@ -487,7 +523,7 @@ mod tests {
     #[test]
     fn the_cursor_stays_on_the_same_entry_when_the_order_changes() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         point_at(&mut app, "small.bin");
 
@@ -504,7 +540,7 @@ mod tests {
     #[test]
     fn pressing_the_active_order_again_reverses_it() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         assert!(!app.reverse());
         app.sort_by(Order::Name);
@@ -517,7 +553,7 @@ mod tests {
     #[test]
     fn entering_and_leaving_a_directory() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         point_at(&mut app, "alpha");
         app.enter();
@@ -542,7 +578,7 @@ mod tests {
     #[test]
     fn entering_the_parent_row_goes_up() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         point_at(&mut app, "alpha");
         app.enter();
 
@@ -555,7 +591,7 @@ mod tests {
     #[test]
     fn a_file_under_the_cursor_is_not_something_to_enter() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         point_at(&mut app, "big.bin");
 
         app.enter();
@@ -582,7 +618,7 @@ mod tests {
             return;
         }
 
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         point_at(&mut app, "locked");
         let before = (app.cwd().to_path_buf(), app.cursor(), names(&app));
 
@@ -600,7 +636,7 @@ mod tests {
     #[test]
     fn a_successful_move_clears_the_notice() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         app.notice = Some("stale".into());
 
         point_at(&mut app, "alpha");
@@ -612,7 +648,7 @@ mod tests {
     #[test]
     fn the_cursor_cannot_leave_the_list() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         app.move_up();
         assert_eq!(app.cursor(), 0, "nothing above the first row");
@@ -654,7 +690,7 @@ mod tests {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
 
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         assert!(
             app.entries()
@@ -676,7 +712,7 @@ mod tests {
     fn the_parent_row_is_never_measured() {
         let dir = fixture();
 
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         await_sizes(&mut app);
 
         let parent = app
@@ -693,7 +729,7 @@ mod tests {
     #[test]
     fn re_measuring_forgets_what_was_there_and_walks_again() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         await_sizes(&mut app);
         assert!(size_of(&app, "alpha").is_some());
 
@@ -715,7 +751,7 @@ mod tests {
     fn returning_to_a_directory_reuses_the_sizes_already_computed() {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         await_sizes(&mut app);
         let before = size_of(&app, "alpha").expect("measured once");
 
@@ -744,7 +780,7 @@ mod tests {
             std::fs::write(sub.join("f.bin"), vec![b'x'; bytes]).expect("write");
         }
 
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         app.sort_by(Order::Size);
         await_sizes(&mut app);
 
@@ -766,7 +802,7 @@ mod tests {
             std::fs::write(sub.join("f.bin"), vec![b'x'; 4096]).expect("write");
         }
 
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         point_at(&mut app, "zulu");
         app.enter();
         app.leave();
@@ -782,7 +818,7 @@ mod tests {
     #[test]
     fn a_filter_narrows_the_listing_as_it_is_typed() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         app.start_filtering();
         assert!(app.is_filtering());
@@ -798,7 +834,7 @@ mod tests {
     fn matching_ignores_case() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("Projects")).expect("mkdir");
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         app.start_filtering();
         for ch in "proj".chars() {
@@ -816,7 +852,7 @@ mod tests {
     #[test]
     fn a_filter_matching_nothing_still_offers_the_way_out() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         app.start_filtering();
         for ch in "qqqq".chars() {
@@ -831,7 +867,7 @@ mod tests {
     #[test]
     fn backspace_widens_the_filter_again() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         app.start_filtering();
         for ch in "zulu".chars() {
@@ -850,7 +886,7 @@ mod tests {
     #[test]
     fn accepting_keeps_the_filter_and_clearing_drops_it() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         app.start_filtering();
         app.filter_push('z');
 
@@ -868,7 +904,7 @@ mod tests {
     #[test]
     fn moving_directory_drops_the_filter() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         app.start_filtering();
         app.filter_push('a');
         app.filter_accept();
@@ -886,7 +922,7 @@ mod tests {
     fn a_hidden_row_keeps_the_size_it_was_given() {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/f.bin"), vec![b'x'; 8192]).expect("write");
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         app.start_filtering();
         for ch in "zulu".chars() {
@@ -904,7 +940,7 @@ mod tests {
         for n in 0..30 {
             std::fs::write(dir.path().join(format!("f{n:02}.bin")), b"x").expect("write");
         }
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         app.set_page(10);
 
         app.page_down();
@@ -928,7 +964,7 @@ mod tests {
     #[test]
     fn home_and_end_go_the_whole_way() {
         let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
 
         app.jump_to_bottom();
         assert_eq!(app.cursor(), app.entries().len() - 1);
@@ -941,7 +977,7 @@ mod tests {
     #[test]
     fn paging_an_empty_listing_does_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = App::open(dir.path()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default()).expect("open");
         app.start_filtering();
         for ch in "nothing".chars() {
             app.filter_push(ch);
@@ -955,11 +991,98 @@ mod tests {
         app.jump_to_top();
     }
 
+    /// Rows carry what the rules say, and the parent row carries nothing —
+    /// colouring it would say something about a directory not on screen.
+    #[test]
+    fn rows_are_classified_and_the_parent_is_not() {
+        let dir = fixture();
+        let rules = Rules::new(
+            vec![disk_tools_core::Rule {
+                name: "junk".into(),
+                root: Some(dir.path().to_string_lossy().into_owned()),
+                includes: vec!["**/alpha/".into()],
+                ..disk_tools_core::Rule::default()
+            }],
+            &disk_tools_core::UserDirs::default(),
+        )
+        .expect("compiles");
+
+        let app = App::open(dir.path(), rules).expect("open");
+        let state_of = |name: &str| {
+            app.entries()
+                .iter()
+                .find(|entry| entry.name == name)
+                .expect(name)
+                .state
+        };
+
+        assert_eq!(state_of("alpha"), State::Included);
+        assert_eq!(state_of("zulu"), State::InScope);
+        assert_eq!(
+            state_of(PARENT),
+            State::Untracked,
+            "not part of this listing"
+        );
+        assert!(app.any_rule_applies());
+    }
+
+    /// No rule reaches here, so there is nothing for a legend to explain and it
+    /// must not take a row from the listing.
+    #[test]
+    fn a_directory_no_rule_reaches_needs_no_legend() {
+        let dir = fixture();
+
+        let app = App::open(dir.path(), Rules::default()).expect("open");
+
+        assert!(app.entries().iter().all(|e| e.state == State::Untracked));
+        assert!(!app.any_rule_applies());
+    }
+
+    /// The state follows the path, so it has to be recomputed on arrival — a row
+    /// keeping the colour of a same-named row in the previous directory would be
+    /// worse than no colour at all.
+    #[test]
+    fn moving_directory_reclassifies() {
+        let dir = fixture();
+        std::fs::create_dir(dir.path().join("alpha/target")).expect("mkdir");
+        let rules = Rules::new(
+            vec![disk_tools_core::Rule {
+                name: "junk".into(),
+                root: Some(dir.path().to_string_lossy().into_owned()),
+                includes: vec!["**/target/".into()],
+                ..disk_tools_core::Rule::default()
+            }],
+            &disk_tools_core::UserDirs::default(),
+        )
+        .expect("compiles");
+
+        let mut app = App::open(dir.path(), rules).expect("open");
+        assert!(
+            !app.any_rule_applies()
+                || app
+                    .entries()
+                    .iter()
+                    .all(|e| e.name == PARENT || e.state != State::Included)
+        );
+
+        point_at(&mut app, "alpha");
+        app.enter();
+
+        assert_eq!(
+            app.entries()
+                .iter()
+                .find(|entry| entry.name == "target")
+                .expect("listed")
+                .state,
+            State::Included
+        );
+    }
+
     /// The root of the filesystem has no parent, so there is no `..` and
     /// leaving is a no-op rather than an error.
     #[test]
     fn there_is_no_way_up_from_the_top() {
-        let mut app = App::open(Path::new("/")).expect("open /");
+        let mut app = App::open(Path::new("/"), Rules::default()).expect("open /");
 
         assert!(
             !names(&app).contains(&PARENT.to_owned()),

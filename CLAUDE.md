@@ -18,9 +18,9 @@ its Roadmap for what lands when; the
 [v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) and
 [v0.3](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md) specs are
 the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
-(the TUI) has Tasks 1-3 of 7 done — `disk-tools ui` browses a directory as a
-table, sizes its subdirectories in the background, filters with `/`, and always
-gives the terminal back. User-facing usage, flags, the safety model and
+(the TUI) has Tasks 1-4 of 7 done — `disk-tools ui` browses a directory as a
+table, sizes its subdirectories in the background, colours them by what the
+rules say, filters with `/`, and always gives the terminal back. User-facing usage, flags, the safety model and
 the documented limitations live in the [README](README.md).
 
 ## Important: Documentation Requirements
@@ -133,6 +133,7 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
 | `Rule` / `Rules` | `core/src/rules.rs` | Detection as data. **List order is precedence**; a rule that cannot be expressed matches nothing |
+| `Rules::state -> State` | `core/src/rules.rs` | Why a row is that colour: `untracked` / `in scope` / `included` / `excluded`. A display function, sharing `matching` and `excluded` with `detect` so precedence cannot drift |
 | `DetectOptions` / `Detection` | `core/src/detect.rs` | The pass's input and output. `now` is mandatory, so a rule's `older_than` can never be half-armed |
 | `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason; `filtered_out` / `too_small` count the user's own narrowings |
 | `CleanOutcome` | `core/src/trash.rs` | `removed` / `failed` / `reclaimed` — never a `Result` |
@@ -181,6 +182,9 @@ Invariants worth keeping in mind:
   about somewhere else.
 - **The TUI cancels only what the user asks it to** (`r`) and what exit
   requires. Cancelling on navigation destroyed work that was about to be wanted.
+- **`in scope` is a state of its own.** "My rule does not cover this" and "my
+  rule is not running" are different problems, and folding them together leaves
+  the user unable to tell which they have.
 - **Anything that really deletes is `#[ignore]`d** and run by `just smoke-trash`.
 
 ## Configuration

@@ -256,6 +256,7 @@ mod tests {
             size: Some(4096),
             modified: ago(3 * 24 * 60 * 60),
             created: ago(90 * 24 * 60 * 60),
+            state: disk_tools_core::State::Untracked,
             measuring: false,
         }
     }

@@ -128,6 +128,7 @@ mod tests {
             size: Some(size),
             modified: Some(at(1_000)),
             created: Some(at(1_000)),
+            state: disk_tools_core::State::Untracked,
             measuring: false,
         }
     }
@@ -139,6 +140,7 @@ mod tests {
             size: None,
             modified: Some(at(1_000)),
             created: Some(at(1_000)),
+            state: disk_tools_core::State::Untracked,
             measuring: false,
         }
     }

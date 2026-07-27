@@ -218,7 +218,12 @@ pub enum Mode {
     ConfigInit { target: PathBuf, force: bool },
 
     /// Open the browser at this directory.
-    Ui { root: PathBuf },
+    Ui {
+        root: PathBuf,
+        /// The same rules `clean` would apply, so the two verbs cannot disagree
+        /// about what is junk.
+        rules: Box<Rules>,
+    },
 }
 
 /// What the frontend resolved before the arguments could be turned into work.
@@ -283,6 +288,9 @@ impl Args {
                 // the title bar should say, and `validate_root` is about to
                 // check it either way.
                 root: ui.path.unwrap_or_else(|| PathBuf::from(".")),
+                // No age rule: `--older-than` is a `clean` flag, and a browser
+                // that coloured every old file as junk would say nothing.
+                rules: Box::new(Rules::new(config.rules, &user_dirs).map_err(ResolveError::Rule)?),
             }),
 
             Command::Config {

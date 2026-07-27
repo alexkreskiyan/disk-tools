@@ -10,7 +10,7 @@
 //! apparent size — a different number, and one that would sit incoherently
 //! beside the directory totals the next task computes.
 
-use disk_tools_core::allocated_size;
+use disk_tools_core::{State, allocated_size};
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
@@ -36,6 +36,12 @@ pub struct Entry {
     /// error worth refusing to list a directory over — it is one column with
     /// nothing in it, and the sort deals with that.
     pub created: Option<SystemTime>,
+
+    /// What the configured rules say about this path.
+    ///
+    /// Filled in by the browser, which has the rules; `list` is about one
+    /// directory and knows nothing of them.
+    pub state: State,
 
     /// A size is being computed for this row right now.
     ///
@@ -73,8 +79,9 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
                 .and_then(|metadata| allocated_size(&path, metadata).ok()),
             modified: metadata.as_ref().and_then(|m| m.modified().ok()),
             created: metadata.as_ref().and_then(|m| m.created().ok()),
-            // Set by the browser when it asks for a size; listing one directory
-            // starts no work of its own.
+            // Both set by the browser: one directory listed on its own has no
+            // rules to consult and starts no work.
+            state: State::Untracked,
             measuring: false,
         });
     }

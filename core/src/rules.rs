@@ -366,6 +366,89 @@ impl Rules {
             .into_iter()
             .any(|pattern| self.exclude_owner[pattern] == index)
     }
+
+    /// What the rules say about one path, for showing rather than for deciding.
+    ///
+    /// [`detect`](crate::detect) answers "may this be removed"; this answers
+    /// "why is that", which is a different question with a different set of
+    /// answers. In particular **[`State::InScope`] is its own state**: a path
+    /// under a rule's root that nothing matches is not the same as a path no
+    /// rule has ever heard of, and folding the two together would leave a user
+    /// unable to tell "my rule does not cover this" from "my rule is not
+    /// running".
+    ///
+    /// Precedence is the list order, as everywhere else: the first rule whose
+    /// includes match and whose excludes do not is the one that speaks.
+    ///
+    /// A rule dropped at compile time — disabled, an unresolvable `~` — is not
+    /// here at all, so paths under its intended root read as
+    /// [`State::Untracked`]. That is the honest answer: nothing is watching them.
+    pub fn state(&self, path: &Path, is_dir: bool) -> State {
+        let candidate = Candidate::new(path);
+
+        // Lowest index first, so the first rule that claims it is the one that
+        // would claim it in `detect` too.
+        let matching = self.matching(&candidate, is_dir);
+        for index in &matching {
+            if !self.excluded(*index, &candidate) {
+                return State::Included;
+            }
+        }
+        if !matching.is_empty() {
+            // Every rule that matched also declined it.
+            return State::Excluded;
+        }
+
+        let governing: Vec<usize> = (0..self.rules.len())
+            .filter(|index| match &self.roots[*index] {
+                // An unrooted rule applies wherever the scan goes.
+                None => true,
+                Some(root) => is_within(path, root),
+            })
+            .collect();
+
+        if governing.is_empty() {
+            return State::Untracked;
+        }
+        // An `excludes` that matches without any `includes` matching still says
+        // something: the user has named this path to be left alone.
+        if governing
+            .iter()
+            .any(|index| self.excluded(*index, &candidate))
+        {
+            return State::Excluded;
+        }
+        State::InScope
+    }
+}
+
+/// What the rules say about a path.
+///
+/// Four states, not three: see [`Rules::state`] for why `InScope` is not folded
+/// into either of its neighbours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// No rule's root contains it. Nothing is watching this.
+    Untracked,
+    /// Inside some rule's territory, matched by none of its patterns.
+    InScope,
+    /// A rule claims it — this is what `clean` would offer to remove.
+    Included,
+    /// A rule names it to be left alone.
+    Excluded,
+}
+
+impl State {
+    /// For a legend. Colour alone excludes anyone who cannot distinguish the
+    /// colours, so every state has to have a word too.
+    pub fn label(self) -> &'static str {
+        match self {
+            State::Untracked => "untracked",
+            State::InScope => "in scope",
+            State::Included => "included",
+            State::Excluded => "excluded",
+        }
+    }
 }
 
 /// The rule `--older-than` adds, by the name the report prints.
@@ -540,6 +623,19 @@ mod tests {
             name: name.into(),
             includes: includes.iter().map(|s| (*s).to_owned()).collect(),
             ..Rule::default()
+        }
+    }
+
+    /// The state of one path, for the four-state tests below.
+    fn state(rules: &Rules, path: &str, is_dir: bool) -> State {
+        rules.state(Path::new(path), is_dir)
+    }
+
+    /// A rooted rule, since every state but one is about roots.
+    fn rooted(name: &str, root: &str, includes: &[&str]) -> Rule {
+        Rule {
+            root: Some(root.to_owned()),
+            ..rule(name, includes)
         }
     }
 
@@ -1132,5 +1228,170 @@ mod tests {
             matches(&rules, "/home/me/.Cache", true).is_empty(),
             "`.Cache` is not `.cache` where the filesystem says so"
         );
+    }
+
+    /// The four states, on one rule, one at a time.
+    #[test]
+    fn a_path_is_untracked_in_scope_included_or_excluded() {
+        let mut rule = rooted("junk", "~/Projects", &["**/target/"]);
+        rule.excludes = vec!["**/keep/**".into()];
+        let rules = Rules::new(vec![rule], &dirs("/home/me")).expect("compiles");
+
+        assert_eq!(
+            state(&rules, "/home/me/Music/target", true),
+            State::Untracked,
+            "outside every root"
+        );
+        assert_eq!(
+            state(&rules, "/home/me/Projects/src", true),
+            State::InScope,
+            "inside the root, matched by nothing"
+        );
+        assert_eq!(
+            state(&rules, "/home/me/Projects/app/target", true),
+            State::Included
+        );
+        assert_eq!(
+            state(&rules, "/home/me/Projects/keep/target", true),
+            State::Excluded
+        );
+    }
+
+    /// The state that is easiest to get wrong by folding it into a neighbour.
+    /// "My rule does not cover this" and "my rule is not running" are different
+    /// problems, and only one of them is the user's fault.
+    #[test]
+    fn in_scope_is_a_state_of_its_own() {
+        let rules = Rules::new(
+            vec![rooted("junk", "~/Projects", &["**/target/"])],
+            &dirs("/home/me"),
+        )
+        .expect("compiles");
+
+        let inside = state(&rules, "/home/me/Projects/notes.md", false);
+        let outside = state(&rules, "/home/me/notes.md", false);
+
+        assert_eq!(inside, State::InScope);
+        assert_eq!(outside, State::Untracked);
+        assert_ne!(inside, outside);
+    }
+
+    /// A rule that could not be compiled is not there, so nothing is watching
+    /// its territory. Reading that as an error would put a red row on a screen
+    /// about a directory that is perfectly ordinary.
+    #[test]
+    fn a_dropped_rule_leaves_its_territory_untracked() {
+        // No home directory, so `~/Projects` cannot resolve and the rule goes.
+        let rules = Rules::new(
+            vec![rooted("junk", "~/Projects", &["**/target/"])],
+            &UserDirs::default(),
+        )
+        .expect("compiles: an unresolvable root drops the rule, it is not an error");
+
+        assert!(rules.is_empty());
+        assert_eq!(
+            state(&rules, "/home/me/Projects/app/target", true),
+            State::Untracked
+        );
+    }
+
+    #[test]
+    fn a_disabled_rule_leaves_its_territory_untracked() {
+        let rules = Rules::new(
+            vec![Rule {
+                enabled: false,
+                ..rooted("junk", "~/Projects", &["**/target/"])
+            }],
+            &dirs("/home/me"),
+        )
+        .expect("compiles");
+
+        assert_eq!(
+            state(&rules, "/home/me/Projects/app/target", true),
+            State::Untracked
+        );
+    }
+
+    /// List order is precedence here as everywhere: the first rule that claims a
+    /// path and does not decline it is the one that speaks.
+    #[test]
+    fn the_first_rule_that_claims_it_without_declining_it_wins() {
+        let mut first = rooted("first", "~/Projects", &["**/target/"]);
+        first.excludes = vec!["**/target/".into()];
+        let second = rooted("second", "~/Projects", &["**/target/"]);
+
+        let rules = Rules::new(vec![first, second], &dirs("/home/me")).expect("compiles");
+
+        assert_eq!(
+            state(&rules, "/home/me/Projects/app/target", true),
+            State::Included,
+            "the first declined it; the second did not"
+        );
+    }
+
+    /// Naming a path in `excludes` says something even when no `includes`
+    /// reaches it: the user has said to leave it alone.
+    #[test]
+    fn an_exclude_without_a_matching_include_still_reads_as_excluded() {
+        let mut rule = rooted("junk", "~/Projects", &["**/target/"]);
+        rule.excludes = vec!["**/vendor/**".into()];
+        let rules = Rules::new(vec![rule], &dirs("/home/me")).expect("compiles");
+
+        assert_eq!(
+            state(&rules, "/home/me/Projects/vendor/thing.c", false),
+            State::Excluded
+        );
+    }
+
+    /// An unrooted rule applies wherever the scan goes, so nothing under it is
+    /// untracked.
+    #[test]
+    fn an_unrooted_rule_puts_everything_in_scope() {
+        let rules =
+            Rules::new(vec![rule("junk", &["**/target/"])], &dirs("/home/me")).expect("compiles");
+
+        assert_eq!(state(&rules, "/anywhere/at/all", true), State::InScope);
+        assert_eq!(state(&rules, "/anywhere/target", true), State::Included);
+    }
+
+    /// No rules at all is not a special case: nothing is watching anything.
+    #[test]
+    fn without_rules_everything_is_untracked() {
+        let rules = Rules::default();
+
+        assert_eq!(state(&rules, "/home/me/Projects", true), State::Untracked);
+    }
+
+    /// The gitignore convention `matching` already honours has to hold here too,
+    /// or a file called `target` would be coloured as a build directory.
+    #[test]
+    fn a_directory_only_pattern_does_not_claim_a_file() {
+        let rules = Rules::new(
+            vec![rooted("junk", "~/Projects", &["**/target/"])],
+            &dirs("/home/me"),
+        )
+        .expect("compiles");
+
+        assert_eq!(
+            state(&rules, "/home/me/Projects/app/target", false),
+            State::InScope,
+            "a file of that name is not a build directory"
+        );
+    }
+
+    /// Colour alone excludes anyone who cannot tell the colours apart.
+    #[test]
+    fn every_state_has_a_word_for_it() {
+        let labels: Vec<&str> = [
+            State::Untracked,
+            State::InScope,
+            State::Included,
+            State::Excluded,
+        ]
+        .iter()
+        .map(|state| state.label())
+        .collect();
+
+        assert_eq!(labels, ["untracked", "in scope", "included", "excluded"]);
     }
 }

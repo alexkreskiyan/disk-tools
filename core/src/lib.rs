@@ -46,7 +46,7 @@ pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, pla
 pub use detect::{DetectOptions, Detection, detect};
 pub use measure::{Finished, Measured, measure};
 pub use options::ScanOptions;
-pub use rules::{Rule, RuleError, Rules, Tier, UserDirs, age_rule, builtin_rules};
+pub use rules::{Rule, RuleError, Rules, State, Tier, UserDirs, age_rule, builtin_rules};
 pub use size::allocated_size;
 #[cfg(feature = "trash")]
 pub use trash::{CleanOutcome, Removal, TrashFailure, apply, move_to_trash};
