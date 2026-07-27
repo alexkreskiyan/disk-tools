@@ -84,7 +84,7 @@ fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
     // A dialog takes every key. Leaving the browser's bindings live underneath
     // would make `q` quit from inside a half-typed rule.
     if app.dialog().is_some() {
-        dialog(app, code);
+        dialog(app, code, reload.path.as_deref());
         return true;
     }
 
@@ -136,7 +136,7 @@ fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
 ///
 /// `Esc` always closes without writing anything, at either step — a dialog you
 /// cannot leave by the obvious key is a dialog people learn to fear.
-fn dialog(app: &mut App, code: KeyCode) {
+fn dialog(app: &mut App, code: KeyCode, config: Option<&Path>) {
     match app.dialog() {
         Some(Dialog::Choosing(_)) => match code {
             KeyCode::Esc => app.close_dialog(),
@@ -147,7 +147,7 @@ fn dialog(app: &mut App, code: KeyCode) {
         },
         Some(Dialog::Editing(_)) => match code {
             KeyCode::Esc => app.close_dialog(),
-            KeyCode::Enter => app.confirm_form(),
+            KeyCode::Enter => app.confirm_form(config),
             KeyCode::Tab | KeyCode::Down => app.form_next(),
             KeyCode::BackTab | KeyCode::Up => app.form_previous(),
             // The one key both choice fields answer to. Left and right because
@@ -880,7 +880,7 @@ mod tests {
         for _ in 0..20 {
             app.form_pop();
         }
-        app.confirm_form();
+        app.confirm_form(None);
 
         let lines = paint(app, 78, 20);
 

@@ -23,6 +23,7 @@ use super::edit::{Chooser, Dialog, Form};
 use super::listing::{self, Entry};
 use super::measure::Sizer;
 use super::sort::{Applied, Order, sort};
+use crate::config::write;
 use disk_tools_core::{Facts, Rule, Rules, State, UserDirs};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -466,12 +467,12 @@ impl App {
         self.dialog = Some(Dialog::Editing(Box::new(form)));
     }
 
-    /// Try to close the form, putting the rule into effect if it is valid.
+    /// Try to close the form, writing the rule and putting it into effect.
     ///
-    /// **For this session only.** The file is Task 6's; until then a confirmed
-    /// rule recolours the screen and says that it has not been written, which is
-    /// better than a dialog that appears to do nothing.
-    pub fn confirm_form(&mut self) {
+    /// The file first, then the screen. A rule that recoloured the listing and
+    /// then failed to save would leave the user believing something that is not
+    /// on disk — and the next run would disagree with what they are looking at.
+    pub fn confirm_form(&mut self, config: Option<&Path>) {
         let Some(Dialog::Editing(form)) = &mut self.dialog else {
             return;
         };
@@ -481,34 +482,64 @@ impl App {
             // The form stays open with the field flagged.
             return;
         };
-        let replacing = form.is_edit();
         let name = rule.name.clone();
 
         let mut rules: Vec<Rule> = self.rules.to_vec();
         match rules.iter().position(|existing| existing.name == name) {
             // In place, because a rule's position is its precedence and an edit
             // is not a request to change that.
-            Some(at) => rules[at] = rule,
-            None => rules.push(rule),
+            Some(at) => rules[at] = rule.clone(),
+            None => rules.push(rule.clone()),
         }
 
-        match Rules::new(rules, &self.user_dirs) {
-            Ok(rules) => {
-                self.dialog = None;
-                self.reload_rules(rules);
-                self.notice = Some(format!(
-                    "rule `{name}` {} for this session — not written to the config file",
-                    if replacing { "changed" } else { "added" }
-                ));
-            }
+        let compiled = match Rules::new(rules, &self.user_dirs) {
+            Ok(compiled) => compiled,
             // `Form::confirm` already compiled this rule on its own, so the only
             // way here is a clash with the rules around it.
             Err(err) => {
                 if let Some(Dialog::Editing(form)) = &mut self.dialog {
                     form.reject(err.to_string());
                 }
+                return;
             }
-        }
+        };
+
+        let saved = match config {
+            Some(path) => match write::to_file(path, &rule) {
+                Ok(wrote) => wrote,
+                Err(problem) => {
+                    // The form stays open over a file that was not written. A
+                    // dialog that closes on a failed save is a dialog that lost
+                    // the user's work as well as their rule.
+                    if let Some(Dialog::Editing(form)) = &mut self.dialog {
+                        form.reject(problem);
+                    }
+                    return;
+                }
+            },
+            // Nothing in this environment implies a path — the same case
+            // `config init` cannot serve. The rule still works for this session.
+            None => {
+                self.dialog = None;
+                self.reload_rules(compiled);
+                self.notice = Some(format!(
+                    "rule `{name}` is in effect, but this environment names no config file to save it in"
+                ));
+                return;
+            }
+        };
+
+        self.dialog = None;
+        self.reload_rules(compiled);
+        self.notice = Some(match saved {
+            write::Wrote::Changed => format!("rule `{name}` changed"),
+            write::Wrote::Added => format!("rule `{name}` added"),
+            // Worth its own sentence: the file said nothing about rules, which
+            // left the built-ins in force, and it now lists them explicitly.
+            write::Wrote::AddedWithBuiltins => format!(
+                "rule `{name}` added, and the built-in rules written out beside it so they stay in force"
+            ),
+        });
     }
 
     /// Swap in a freshly read rule set and repaint against it.
@@ -1519,7 +1550,7 @@ mod tests {
 
         app.open_rules();
         app.open_form();
-        app.confirm_form();
+        app.confirm_form(None);
 
         assert!(app.dialog().is_none(), "the form closed");
         assert_eq!(
@@ -1531,7 +1562,10 @@ mod tests {
             State::Included
         );
         let notice = app.notice().expect("a word about the file");
-        assert!(notice.contains("not written"), "{notice}");
+        assert!(
+            notice.contains("names no config file"),
+            "with nowhere to save it, the rule still works and says so: {notice}"
+        );
     }
 
     /// An edit replaces the rule where it was: a rule's position is its
@@ -1563,7 +1597,7 @@ mod tests {
         app.open_rules();
         app.choose_down();
         app.open_form();
-        app.confirm_form();
+        app.confirm_form(None);
 
         assert_eq!(app.rules.names(), ["first", "second"]);
     }
@@ -1583,11 +1617,56 @@ mod tests {
         for _ in 0.."alpha".len() {
             app.form_pop();
         }
-        app.confirm_form();
+        app.confirm_form(None);
 
         assert!(app.dialog().is_some(), "the form is still open");
         assert_eq!(form(&app).problem().expect("a reason").field, Field::Name);
         assert!(app.rules.is_empty(), "and no rule was added");
+    }
+
+    /// The file first, then the screen. A rule that recoloured the listing and
+    /// then failed to save would leave the user believing something that is not
+    /// on disk.
+    #[test]
+    fn a_confirmed_rule_reaches_the_config_file() {
+        let dir = fixture();
+        let config = dir.path().join("config.toml");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        point_at(&mut app, "alpha");
+
+        app.open_rules();
+        app.open_form();
+        app.confirm_form(Some(&config));
+
+        let text = std::fs::read_to_string(&config).expect("written");
+        assert!(text.contains(r#"name = "alpha""#), "{text}");
+        let notice = app.notice().expect("a word about it");
+        assert!(!notice.contains("not written"), "{notice}");
+    }
+
+    /// A dialog that closes on a failed save loses the user's work as well as
+    /// their rule.
+    #[test]
+    fn a_write_that_fails_leaves_the_form_open() {
+        let dir = fixture();
+        // A directory where the file should be: the write cannot succeed, and
+        // nothing else about the situation is unusual.
+        let config = dir.path().join("alpha");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        point_at(&mut app, "alpha");
+
+        app.open_rules();
+        app.open_form();
+        app.confirm_form(Some(&config));
+
+        assert!(app.dialog().is_some(), "still open");
+        assert!(form(&app).problem().is_some(), "and it says why");
+        assert!(
+            !app.any_rule_applies(),
+            "the rule did not take effect either"
+        );
     }
 
     /// The root of the filesystem has no parent, so there is no `..` and

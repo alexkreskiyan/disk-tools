@@ -19,6 +19,8 @@
 //! over one would make the tool brittle for no safety gained — so it is a
 //! warning, naming the key so the typo is findable.
 
+pub mod write;
+
 use crate::args::{parse_duration, parse_size};
 use disk_tools_core::{Rule, Tier, UserDirs, builtin_rules};
 use serde::Deserialize;
