@@ -463,7 +463,7 @@ impl App {
             },
             None => Form::for_new(&parent, &name, is_dir, &self.user_dirs),
         };
-        self.dialog = Some(Dialog::Editing(form));
+        self.dialog = Some(Dialog::Editing(Box::new(form)));
     }
 
     /// Try to close the form, putting the rule into effect if it is valid.

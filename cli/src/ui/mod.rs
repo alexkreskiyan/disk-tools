@@ -20,7 +20,7 @@ mod term;
 use crate::args::Reload;
 use app::App;
 use disk_tools_core::{Rules, State};
-use edit::{Dialog, Field};
+use edit::{Dialog, Field, Guide};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
@@ -269,18 +269,14 @@ fn draw_dialog(frame: &mut Frame<'_>, dialog: &Dialog) {
             let mut lines: Vec<Line<'static>> = Field::ALL
                 .iter()
                 .map(|field| {
-                    let focused = *field == form.focus();
-                    let wrong = form
-                        .problem()
-                        .is_some_and(|problem| problem.field == *field);
                     let mut line = marked(
-                        focused,
-                        format!("{:>16}  {}", field.label(), form.value(*field)),
+                        *field == form.focus(),
+                        format!("{:>19}  {}", field.label(), form.value(*field)),
                     );
-                    if wrong {
-                        // Flagged in its own right, not only by the message
-                        // below: on a nine-field form, a sentence at the bottom
-                        // is a long way from the field it is about.
+                    if form.is_wrong(*field) {
+                        // Flagged in its own right, not only by the line below:
+                        // on a form this long, a sentence at the bottom is a
+                        // long way from the field it is about.
                         line = line.patch_style(Style::default().fg(Color::Red));
                     }
                     line
@@ -288,15 +284,19 @@ fn draw_dialog(frame: &mut Frame<'_>, dialog: &Dialog) {
                 .collect();
 
             lines.push(Line::from(""));
-            lines.push(match form.problem() {
-                Some(problem) => Line::styled(
-                    format!("  {}", problem.message),
-                    Style::default().fg(Color::Red),
-                ),
-                // The hint for the focused field, since a field whose syntax is
-                // only in the README is a field that gets typed wrong.
-                None => Line::styled(
-                    format!("  {}", form.focus().hint()),
+            lines.push(match form.guide() {
+                Guide::Wrong(why) => {
+                    Line::styled(format!("  {why}"), Style::default().fg(Color::Red))
+                }
+                // What the value comes to, so `10M` can be seen to mean what was
+                // meant before Enter is pressed.
+                Guide::Reading(reading) => {
+                    Line::styled(format!("  = {reading}"), Style::default().fg(Color::Green))
+                }
+                // A field whose syntax is only in the README is a field that
+                // gets typed wrong.
+                Guide::Hint(hint) => Line::styled(
+                    format!("  {hint}"),
                     Style::default().add_modifier(Modifier::DIM),
                 ),
             });
@@ -320,7 +320,7 @@ fn draw_dialog(frame: &mut Frame<'_>, dialog: &Dialog) {
         }
     };
 
-    let area = centred(frame.area(), 64, lines.len() as u16 + 2);
+    let area = centred(frame.area(), 70, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(title)),
@@ -585,8 +585,15 @@ mod tests {
         point_at_first_directory(&mut app);
         app.open_rules();
         app.open_form();
+        // Something in a measured field, so the reading line has work to do.
+        for _ in 0..6 {
+            app.form_next();
+        }
+        for ch in "10M".chars() {
+            app.form_push(ch);
+        }
 
-        for line in paint(app, 76, 20) {
+        for line in paint(app, 76, 22) {
             println!("|{line}");
         }
     }

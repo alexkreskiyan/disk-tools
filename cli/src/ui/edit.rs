@@ -29,6 +29,7 @@ pub enum Field {
     Includes,
     Excludes,
     RequiresSibling,
+    RequiresCleanRepo,
     MinSize,
     OlderThan,
     Tier,
@@ -36,12 +37,13 @@ pub enum Field {
 }
 
 impl Field {
-    pub const ALL: [Field; 9] = [
+    pub const ALL: [Field; 10] = [
         Field::Name,
         Field::Root,
         Field::Includes,
         Field::Excludes,
         Field::RequiresSibling,
+        Field::RequiresCleanRepo,
         Field::MinSize,
         Field::OlderThan,
         Field::Tier,
@@ -56,6 +58,7 @@ impl Field {
             Field::Includes => "includes",
             Field::Excludes => "excludes",
             Field::RequiresSibling => "requires-sibling",
+            Field::RequiresCleanRepo => "requires-clean-repo",
             Field::MinSize => "min-size",
             Field::OlderThan => "older-than",
             Field::Tier => "tier",
@@ -71,7 +74,8 @@ impl Field {
             Field::Root => "a directory, or * for anywhere the scan goes",
             Field::Includes => "globs, comma-separated; a trailing / means directories only",
             Field::Excludes => "globs this rule declines, comma-separated",
-            Field::RequiresSibling => "file names that must sit beside a match",
+            Field::RequiresSibling => "file names that must sit beside a match, e.g. Cargo.toml",
+            Field::RequiresCleanRepo => "refuse while the git repository has uncommitted work",
             Field::MinSize => "skip anything smaller, e.g. 10M; empty for no floor",
             Field::OlderThan => "only if untouched this long, e.g. 30d; empty for any age",
             Field::Tier => "auto removes without asking; confirm does not",
@@ -81,7 +85,16 @@ impl Field {
 
     /// Whether this field is typed into, or cycled with one key.
     pub fn is_choice(self) -> bool {
-        matches!(self, Field::Tier | Field::Enabled)
+        matches!(
+            self,
+            Field::Tier | Field::Enabled | Field::RequiresCleanRepo
+        )
+    }
+
+    /// Whether this field's text is a value with a syntax, and so can be read
+    /// back as the user types.
+    fn is_measured(self) -> bool {
+        matches!(self, Field::MinSize | Field::OlderThan)
     }
 
     fn at(self) -> usize {
@@ -90,6 +103,17 @@ impl Field {
             .position(|field| *field == self)
             .expect("every field is in ALL")
     }
+}
+
+/// What the line under the form says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Guide {
+    /// A value that will not do, said as soon as it is typed.
+    Wrong(String),
+    /// What the value in the focused field comes to.
+    Reading(String),
+    /// What the focused field is for.
+    Hint(&'static str),
 }
 
 /// Why a form would not close.
@@ -106,7 +130,9 @@ pub struct Problem {
 /// widened, not a second rule beside it.
 pub enum Dialog {
     Choosing(Chooser),
-    Editing(Form),
+    /// Boxed: a `Form` is ten strings and a `Chooser` is three, and the enum is
+    /// moved every time the dialog changes step.
+    Editing(Box<Form>),
 }
 
 /// The list of rules, with "a new one" at the top.
@@ -170,7 +196,7 @@ pub struct Form {
     /// Kept so an edit can keep its own name without colliding with itself —
     /// the one case where a name already in use is not a duplicate.
     editing: Option<String>,
-    values: [String; 9],
+    values: [String; 10],
     focus: usize,
     problem: Option<Problem>,
 }
@@ -188,6 +214,7 @@ impl Form {
         values[Field::Name.at()] = name.to_owned();
         values[Field::Root.at()] = shorten(parent, dirs);
         values[Field::Includes.at()] = format!("**/{name}{}", if is_dir { "/" } else { "" });
+        values[Field::RequiresCleanRepo.at()] = yes_no(false);
         values[Field::Tier.at()] = tier_word(Tier::Confirm);
         values[Field::Enabled.at()] = yes_no(true);
 
@@ -209,6 +236,11 @@ impl Form {
         values[Field::Includes.at()] = join(&rule.includes);
         values[Field::Excludes.at()] = join(&rule.excludes);
         values[Field::RequiresSibling.at()] = join(&rule.requires_sibling);
+        // Read back, not assumed. Left out of the form entirely, editing the
+        // built-in `rust-target` silently dropped its git guard — a rule that
+        // refuses to take a build directory out of a repository with
+        // uncommitted work in it, quietly turned into one that does not.
+        values[Field::RequiresCleanRepo.at()] = yes_no(rule.requires_clean_repo);
         // An unset threshold is an empty field, not a `0` or a `0s` — those are
         // values, and would read as ones the user chose.
         values[Field::MinSize.at()] = match rule.min_size {
@@ -289,6 +321,7 @@ impl Form {
         *value = match focus {
             Field::Tier if value == "auto" => tier_word(Tier::Confirm),
             Field::Tier => tier_word(Tier::Auto),
+            // Every other choice field is a yes/no.
             _ if value == "yes" => yes_no(false),
             _ => yes_no(true),
         };
@@ -316,6 +349,58 @@ impl Form {
                 None
             }
         }
+    }
+
+    /// Whether this field's text is wrong *now*, rather than at the last
+    /// confirm.
+    ///
+    /// `min-size` and `older-than` are the two fields with a syntax to get
+    /// wrong, and waiting until Enter to say so means typing the whole form
+    /// before finding out. Everything else needs the other fields to judge —
+    /// a name is only a duplicate against the rules around it — so it is
+    /// checked where that context is.
+    pub fn is_wrong(&self, field: Field) -> bool {
+        if self.problem().is_some_and(|problem| problem.field == field) {
+            return true;
+        }
+        field.is_measured() && self.read(field).is_some_and(|read| read.is_err())
+    }
+
+    /// The line under the form: what went wrong, what the value comes to, or
+    /// what the field is for.
+    ///
+    /// In that order, because each is more specific than the next.
+    pub fn guide(&self) -> Guide {
+        if let Some(problem) = &self.problem {
+            return Guide::Wrong(problem.message.clone());
+        }
+        match self.read(self.focus()) {
+            Some(Ok(reading)) => Guide::Reading(reading),
+            Some(Err(why)) => Guide::Wrong(why),
+            None => Guide::Hint(self.focus().hint()),
+        }
+    }
+
+    /// What a measured field's text comes to, as it stands.
+    ///
+    /// `None` when there is nothing to read — a field without a syntax, or an
+    /// empty one, which is a legitimate "no threshold" rather than a mistake.
+    fn read(&self, field: Field) -> Option<Result<String, String>> {
+        if !field.is_measured() {
+            return None;
+        }
+        let text = self.value(field).trim();
+        if text.is_empty() {
+            return None;
+        }
+
+        Some(match field {
+            Field::MinSize => parse_size(text).map(|bytes| format!("{bytes} bytes")),
+            _ => parse_duration(text).map(|older| {
+                let days = older.as_secs() / 86_400;
+                format!("{days} day{}", if days == 1 { "" } else { "s" })
+            }),
+        })
     }
 
     /// Flag the form with a reason it could not have found itself.
@@ -384,7 +469,7 @@ impl Form {
             includes,
             excludes: split(self.value(Field::Excludes)),
             requires_sibling: split(self.value(Field::RequiresSibling)),
-            requires_clean_repo: false,
+            requires_clean_repo: self.value(Field::RequiresCleanRepo) == "yes",
             older_than,
             min_size,
             tier: match self.value(Field::Tier) {
@@ -405,7 +490,7 @@ impl Form {
     }
 }
 
-fn empty() -> [String; 9] {
+fn empty() -> [String; 10] {
     std::array::from_fn(|_| String::new())
 }
 
@@ -734,6 +819,119 @@ mod tests {
         set(&mut form, Field::Root, "*");
 
         assert!(form.confirm(&["junk".to_owned()], &dirs()).is_some());
+    }
+
+    /// The bug this field exists to fix: `requires-clean-repo` was not on the
+    /// form, so `build` hardcoded `false` and editing a rule that had it — the
+    /// built-in `rust-target` does — silently dropped its git guard.
+    #[test]
+    fn requires_clean_repo_survives_being_edited() {
+        let mut form = Form::for_existing(&Rule {
+            name: "rust-target".into(),
+            includes: vec!["**/target/".into()],
+            requires_clean_repo: true,
+            ..Rule::default()
+        });
+        assert_eq!(form.value(Field::RequiresCleanRepo), "yes");
+        set(&mut form, Field::Root, "*");
+
+        let unchanged = form.confirm(&[], &dirs()).expect("valid");
+
+        assert!(unchanged.requires_clean_repo, "and it is still guarded");
+    }
+
+    /// It is a yes/no, so it is cycled rather than typed — unlike
+    /// `requires-sibling`, which has to name the file.
+    #[test]
+    fn requires_clean_repo_is_a_choice_and_requires_sibling_is_not() {
+        assert!(Field::RequiresCleanRepo.is_choice());
+        assert!(!Field::RequiresSibling.is_choice());
+
+        let mut form = Form::for_new(Path::new("/home/me"), "target", true, &dirs());
+        while form.focus() != Field::RequiresCleanRepo {
+            form.next_field();
+        }
+        assert_eq!(form.value(Field::RequiresCleanRepo), "no");
+
+        form.toggle();
+
+        assert!(
+            form.confirm(&[], &dirs())
+                .expect("valid")
+                .requires_clean_repo
+        );
+    }
+
+    /// Waiting until Enter to say a size is malformed means typing the whole
+    /// form before finding out.
+    #[test]
+    fn a_measured_field_is_read_back_as_it_is_typed() {
+        let mut form = Form::for_new(Path::new("/home/me"), "target", true, &dirs());
+        set(&mut form, Field::MinSize, "10M");
+
+        assert_eq!(
+            form.guide(),
+            Guide::Reading(format!("{} bytes", 10 * 1024 * 1024))
+        );
+        assert!(!form.is_wrong(Field::MinSize));
+    }
+
+    #[test]
+    fn a_duration_reads_back_in_days() {
+        let mut form = Form::for_new(Path::new("/home/me"), "target", true, &dirs());
+
+        set(&mut form, Field::OlderThan, "2w");
+        assert_eq!(form.guide(), Guide::Reading("14 days".to_owned()));
+
+        set(&mut form, Field::OlderThan, "1d");
+        assert_eq!(
+            form.guide(),
+            Guide::Reading("1 day".to_owned()),
+            "singular, because `1 days` reads as a bug"
+        );
+    }
+
+    /// Marked before Enter, and marked on the field rather than only in a
+    /// sentence at the bottom of a ten-field form.
+    #[test]
+    fn a_malformed_value_is_flagged_before_it_is_confirmed() {
+        let mut form = Form::for_new(Path::new("/home/me"), "target", true, &dirs());
+        set(&mut form, Field::MinSize, "10 potatoes");
+
+        assert!(form.is_wrong(Field::MinSize));
+        assert!(matches!(form.guide(), Guide::Wrong(_)));
+        assert!(form.problem().is_none(), "nothing has been confirmed yet");
+    }
+
+    /// Empty is "no threshold", which is a legitimate answer rather than a
+    /// mistake.
+    #[test]
+    fn an_empty_measured_field_is_not_wrong() {
+        let form = Form::for_new(Path::new("/home/me"), "target", true, &dirs());
+
+        assert!(!form.is_wrong(Field::MinSize));
+        assert!(!form.is_wrong(Field::OlderThan));
+    }
+
+    /// A field with nothing to read shows what it is for.
+    #[test]
+    fn an_unmeasured_field_shows_its_hint() {
+        let form = Form::for_new(Path::new("/home/me"), "target", true, &dirs());
+
+        assert_eq!(form.guide(), Guide::Hint(Field::Name.hint()));
+    }
+
+    /// Every hint that describes a syntax carries an example of it.
+    #[test]
+    fn the_fields_with_a_syntax_show_one() {
+        for field in [Field::MinSize, Field::OlderThan, Field::RequiresSibling] {
+            assert!(
+                field.hint().contains("e.g."),
+                "{:?}: {}",
+                field,
+                field.hint()
+            );
+        }
     }
 
     /// Days are `parse_duration`'s finest unit, so a threshold that came from a
