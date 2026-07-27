@@ -44,6 +44,8 @@ pub fn run(root: &Path) -> io::Result<()> {
         // Read once per frame rather than held on the `App`: ages are relative,
         // so a browser left open overnight would otherwise still say "2m".
         let now = SystemTime::now();
+        // The list band: everything but the path, the header and the key line.
+        app.set_page((terminal.size()?.height as usize).saturating_sub(3));
         app.absorb_sizes();
         terminal.draw(|frame| draw(frame, &app, now))?;
 
@@ -75,13 +77,29 @@ pub fn run(root: &Path) -> io::Result<()> {
 /// Separated from the loop so the bindings are one readable table rather than
 /// something to reconstruct from a match buried in I/O.
 fn handle(app: &mut App, code: KeyCode) -> bool {
+    // While a filter is being typed, letters are letters. Anything else would
+    // mean a directory called `q` could not be searched for.
+    if app.is_filtering() {
+        filtering(app, code);
+        return true;
+    }
+
     match code {
         KeyCode::Char('q') => return false,
 
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+        KeyCode::PageDown => app.page_down(),
+        KeyCode::PageUp => app.page_up(),
+        KeyCode::Home => app.jump_to_top(),
+        KeyCode::End => app.jump_to_bottom(),
+
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.enter(),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.leave(),
+
+        KeyCode::Char('/') => app.start_filtering(),
+        // The same key whether the filter is being typed or merely in force.
+        KeyCode::Esc => app.filter_clear(),
 
         // Sizes are kept for the session, so this is the only thing that makes
         // one stale on purpose.
@@ -95,6 +113,26 @@ fn handle(app: &mut App, code: KeyCode) -> bool {
         _ => {}
     }
     true
+}
+
+/// Keys while a filter is being typed.
+///
+/// `Enter` keeps the filter and hands the keys back to navigation; `Esc` throws
+/// it away. Arrows still move, so a match can be picked without stopping typing.
+fn filtering(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char(ch) => app.filter_push(ch),
+        KeyCode::Backspace => app.filter_pop(),
+        KeyCode::Enter => app.filter_accept(),
+        KeyCode::Esc => app.filter_clear(),
+
+        KeyCode::Down => app.move_down(),
+        KeyCode::Up => app.move_up(),
+        KeyCode::PageDown => app.page_down(),
+        KeyCode::PageUp => app.page_up(),
+
+        _ => {}
+    }
 }
 
 /// Four bands: where we are, the column labels, the rows, the keys.
@@ -132,20 +170,34 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
         .filter_map(|entry| entry.size)
         .sum();
 
+    let rows_visible = bands[2].height as usize;
     let rows: Vec<ListItem<'_>> = app
         .entries()
         .iter()
         .map(|entry| ListItem::new(layout::row(entry, now, sized, &cols)))
         .collect();
-    let list = List::new(rows).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let list = List::new(rows)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        // Keep the cursor away from the edges: scrolling with it pinned to the
+        // last row shows only where you have been, never where you are going.
+        .scroll_padding(rows_visible / 2);
     let mut state = ListState::default().with_selected(Some(app.cursor()));
     frame.render_stateful_widget(list, bands[2], &mut state);
 
     frame.render_widget(
-        Paragraph::new("q quit  ↵ enter  ← up  n/s/c/m sort (again to reverse)  r re-measure")
-            .style(Style::default().add_modifier(Modifier::DIM)),
+        Paragraph::new(keys(app)).style(Style::default().add_modifier(Modifier::DIM)),
         bands[3],
     );
+}
+
+/// What the keys do — different while a filter is being typed, because most of
+/// them are then just letters.
+fn keys(app: &App) -> &'static str {
+    if app.is_filtering() {
+        "esc cancel  ↵ keep  ↑↓ move"
+    } else {
+        "q quit  ↵ enter  ← up  / filter  n/s/c/m sort  r re-measure"
+    }
 }
 
 /// The path, and anything that went wrong.
@@ -159,6 +211,14 @@ fn where_we_are(app: &App) -> String {
     }
 
     let mut line = app.cwd().display().to_string();
+    // The filter changes what the whole screen means, so it is said next to
+    // where — a list of four things in a directory of four hundred is otherwise
+    // indistinguishable from a directory of four.
+    if app.is_filtering() {
+        line.push_str(&format!("  /{}\u{2588}", app.filter()));
+    } else if !app.filter().is_empty() {
+        line.push_str(&format!("  /{}  (esc clears)", app.filter()));
+    }
     if app.applied().fell_back {
         // The arrow in the header says which order is in force. It cannot say
         // that it is not the one that was asked for.
@@ -442,6 +502,41 @@ mod tests {
         for height in [1, 2, 3] {
             painted(dir.path(), 40, height);
         }
+    }
+
+    /// A filter changes what the whole screen means: four rows in a directory
+    /// of four hundred must not look like a directory of four.
+    #[test]
+    fn the_filter_is_on_screen_while_it_is_being_typed() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+        app.start_filtering();
+        app.filter_push('s');
+
+        let lines = paint(app, 70, 10);
+
+        assert!(lines[0].contains("/s"), "{:?}", lines[0]);
+        assert!(
+            lines.last().is_some_and(|line| line.contains("esc cancel")),
+            "and the keys are the filtering ones: {:?}",
+            lines.last()
+        );
+    }
+
+    /// Filtering without typing still has to say so, or the missing rows look
+    /// like an empty directory.
+    #[test]
+    fn an_accepted_filter_says_how_to_get_rid_of_it() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+        app.start_filtering();
+        app.filter_push('s');
+        app.filter_accept();
+
+        let lines = paint(app, 70, 10);
+
+        assert!(lines[0].contains("/s"), "{:?}", lines[0]);
+        assert!(lines[0].contains("esc"), "{:?}", lines[0]);
     }
 
     #[test]

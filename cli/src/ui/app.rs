@@ -13,6 +13,11 @@
 //! **An entry that did not happen changes nothing.** Failing to open a
 //! directory leaves the path, the listing and the cursor exactly where they
 //! were, and says why. Half-moving would be worse than not moving.
+//!
+//! The listing is kept twice: [`App::listed`] is what the directory contains,
+//! and [`App::entries`] is what the filter left of it. Filtering a list in place
+//! would mean re-reading the directory to widen the filter again, and a size
+//! arriving for a hidden row would have nowhere to land.
 
 use super::listing::{self, Entry};
 use super::measure::Sizer;
@@ -26,7 +31,17 @@ pub const PARENT: &str = "..";
 
 pub struct App {
     cwd: PathBuf,
+
+    /// Everything in the directory, sorted.
+    listed: Vec<Entry>,
+    /// What the filter left of it — what is on screen, and what `cursor` indexes.
     entries: Vec<Entry>,
+
+    /// What is being matched against. Empty means everything is shown.
+    filter: String,
+    /// The filter as it is being typed, if it is. `None` is normal navigation.
+    typing: Option<String>,
+
     cursor: usize,
     order: Order,
     reverse: bool,
@@ -38,6 +53,11 @@ pub struct App {
 
     /// Directory sizes, computed in the background.
     sizer: Sizer,
+
+    /// How many rows the list band has. Set by the drawing code, which is the
+    /// only place that knows — a page is a screenful, so it cannot be a
+    /// constant.
+    page: usize,
 }
 
 impl App {
@@ -48,7 +68,10 @@ impl App {
     pub fn open(root: &Path) -> std::io::Result<Self> {
         let mut app = App {
             cwd: root.to_path_buf(),
+            listed: Vec::new(),
             entries: Vec::new(),
+            filter: String::new(),
+            typing: None,
             cursor: 0,
             order: Order::Name,
             reverse: false,
@@ -58,12 +81,14 @@ impl App {
             },
             notice: None,
             sizer: Sizer::new(),
+            page: 1,
         };
-        app.entries = app.read(root)?;
-        // Sorted, then the cursor put at the top. `resort` would instead hold
+        app.listed = app.read(root)?;
+        // Sorted, then the cursor put at the top. `refilter` would instead hold
         // onto whatever `read_dir` happened to return first and follow it to
         // wherever the sort put it — which is a cursor landing at random.
-        app.applied = sort(&mut app.entries, app.order, app.reverse);
+        app.applied = sort(&mut app.listed, app.order, app.reverse);
+        app.entries = app.filtered();
         app.size_directories();
         Ok(app)
     }
@@ -111,14 +136,52 @@ impl App {
         self.entries.get(self.cursor)
     }
 
+    /// What is being matched against, typed or not.
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// How many rows fit, from the code that draws them.
+    pub fn set_page(&mut self, rows: usize) {
+        self.page = rows.max(1);
+    }
+
     pub fn move_down(&mut self) {
-        if self.cursor + 1 < self.entries.len() {
-            self.cursor += 1;
-        }
+        self.move_by(1);
     }
 
     pub fn move_up(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.move_by(-1);
+    }
+
+    /// A screenful, less one row of overlap so the eye has something to land on.
+    pub fn page_down(&mut self) {
+        self.move_by(self.page.saturating_sub(1).max(1) as isize);
+    }
+
+    pub fn page_up(&mut self) {
+        self.move_by(-(self.page.saturating_sub(1).max(1) as isize));
+    }
+
+    pub fn jump_to_top(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn jump_to_bottom(&mut self) {
+        self.cursor = self.entries.len().saturating_sub(1);
+    }
+
+    /// Move, stopping at the ends rather than wrapping.
+    ///
+    /// Wrapping would turn "page down once more" into "back to the top", and a
+    /// list is not a carousel.
+    fn move_by(&mut self, rows: isize) {
+        if self.entries.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+        let last = self.entries.len() - 1;
+        self.cursor = (self.cursor as isize + rows).clamp(0, last as isize) as usize;
     }
 
     /// Sort by `order`, or reverse it if that is already the order in force.
@@ -139,49 +202,117 @@ impl App {
     ///
     /// Only for a change of order. Opening a directory starts at the top.
     fn resort(&mut self) {
+        self.applied = sort(&mut self.listed, self.order, self.reverse);
+        self.refilter();
+    }
+
+    /// Rebuild what is on screen, keeping the cursor on whatever it was on.
+    ///
+    /// When the held entry has been filtered away the cursor goes to the top
+    /// rather than to whatever happens to be at its old index — the same rule as
+    /// re-sorting, for the same reason.
+    fn refilter(&mut self) {
         let held = self.selected().map(|entry| entry.name.clone());
-        self.applied = sort(&mut self.entries, self.order, self.reverse);
+        self.entries = self.filtered();
 
         self.cursor = held
             .and_then(|name| self.entries.iter().position(|entry| entry.name == name))
             .unwrap_or(0);
     }
 
-    /// Fill in the subdirectory sizes here, walking only what is not already
-    /// known.
+    /// The rows the filter admits.
     ///
-    /// Run on arrival. Navigation is not a reason to recompute: a total costs a
-    /// walk of the whole subtree, and stepping into a directory and back out
-    /// would otherwise pay for the parent twice. The disk does change — but the
-    /// user is the one changing it, and [`Self::remeasure`] is how they say so.
-    pub fn size_directories(&mut self) {
-        let mut names = Vec::new();
-
-        for entry in &mut self.entries {
-            // The parent is not part of this listing; measuring it would walk
-            // everything on screen a second time, through itself.
-            if !entry.is_dir || entry.name == PARENT {
-                entry.measuring = false;
-                continue;
-            }
-
-            match self.sizer.known(&self.cwd.join(&entry.name)) {
-                Some(allocated) => {
-                    entry.size = Some(allocated);
-                    entry.measuring = false;
-                }
-                None => {
-                    entry.size = None;
-                    entry.measuring = true;
-                    names.push(entry.name.clone());
-                }
-            }
+    /// **The parent is always admitted.** Filtering is for finding something
+    /// here; it is not a reason to take away the way out, and a filter that
+    /// matches nothing would otherwise leave a screen with no key that does
+    /// anything.
+    ///
+    /// Matching is a case-insensitive substring: a user typing `proj` to find
+    /// `Projects` is not composing a query.
+    fn filtered(&self) -> Vec<Entry> {
+        if self.filter.is_empty() {
+            return self.listed.clone();
         }
+        let wanted = self.filter.to_lowercase();
 
-        // Even with nothing to walk: the generation has to move, or a reply
-        // still in flight from the directory just left would be taken as this
-        // one's.
-        self.sizer.start(self.cwd.clone(), names);
+        self.listed
+            .iter()
+            .filter(|entry| {
+                entry.name == PARENT
+                    || entry
+                        .name
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&wanted)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Start typing a filter, from whatever is already in force.
+    pub fn start_filtering(&mut self) {
+        self.typing = Some(self.filter.clone());
+    }
+
+    /// Whether a key belongs to the filter rather than to navigation.
+    pub fn is_filtering(&self) -> bool {
+        self.typing.is_some()
+    }
+
+    /// Add a character to the filter being typed.
+    pub fn filter_push(&mut self, ch: char) {
+        if let Some(typed) = self.typing.as_mut() {
+            typed.push(ch);
+            self.filter = typed.clone();
+            self.refilter();
+        }
+    }
+
+    /// Take the last character back.
+    pub fn filter_pop(&mut self) {
+        if let Some(typed) = self.typing.as_mut() {
+            typed.pop();
+            self.filter = typed.clone();
+            self.refilter();
+        }
+    }
+
+    /// Keep the filter, stop typing it.
+    pub fn filter_accept(&mut self) {
+        self.typing = None;
+    }
+
+    /// Stop filtering altogether.
+    ///
+    /// One key for both halves: whether you are typing a filter or living with
+    /// one, `Esc` is how you get the whole listing back.
+    pub fn filter_clear(&mut self) {
+        self.typing = None;
+        if !self.filter.is_empty() {
+            self.filter.clear();
+            self.refilter();
+        }
+    }
+
+    /// The subdirectories here, by absolute path. The parent is not one of them:
+    /// measuring it would walk everything on screen a second time, through
+    /// itself.
+    fn subdirectories(&self) -> Vec<PathBuf> {
+        self.listed
+            .iter()
+            .filter(|entry| entry.is_dir && entry.name != PARENT)
+            .map(|entry| self.cwd.join(&entry.name))
+            .collect()
+    }
+
+    /// Ask for the subdirectory sizes here, and show whatever is already known.
+    ///
+    /// Run on arrival. Navigation is not a reason to recompute anything, nor to
+    /// stop anything: a walk already under way finishes, and its answer is
+    /// waiting the next time this directory is opened.
+    pub fn size_directories(&mut self) {
+        self.sizer.request(self.subdirectories());
+        self.show_sizes();
     }
 
     /// Forget the sizes here and walk them again.
@@ -189,30 +320,16 @@ impl App {
     /// The one thing that invalidates a total, because deleting is the one way
     /// it goes stale that the browser cannot see.
     pub fn remeasure(&mut self) {
-        let paths: Vec<PathBuf> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.is_dir && entry.name != PARENT)
-            .map(|entry| self.cwd.join(&entry.name))
-            .collect();
-
-        for path in paths {
+        for path in self.subdirectories() {
             self.sizer.forget(&path);
         }
         self.size_directories();
     }
 
     /// Take in whatever the background walks have posted since the last frame.
-    ///
-    /// Results from an abandoned request are dropped: without that, a size for
-    /// the directory just left would land on a same-named row in the one just
-    /// entered.
     pub fn absorb_sizes(&mut self) {
-        let mut completed = false;
-
-        for update in self.sizer.drain() {
-            completed |= self.apply(update);
-        }
+        let completed = self.sizer.absorb();
+        self.show_sizes();
 
         // Only on completion, and only when size is the order in force. Sorting
         // on every climbing figure would have rows swap places continuously;
@@ -223,35 +340,20 @@ impl App {
         }
     }
 
-    /// Take one update in, if it is still wanted. Returns whether it was final.
+    /// Copy what the sizer knows onto the rows.
     ///
-    /// Separate from [`Self::absorb_sizes`] so the generation check can be
-    /// tested without racing a real background walk to be late.
-    fn apply(&mut self, update: super::measure::Update) -> bool {
-        if update.generation != self.sizer.generation() {
-            return false;
+    /// Read from the cache rather than pushed into the rows as answers arrive:
+    /// a result posted while another directory was on screen has to be here when
+    /// the user comes back, and a row is not the place to keep it.
+    fn show_sizes(&mut self) {
+        for entry in self.listed.iter_mut().chain(self.entries.iter_mut()) {
+            if !entry.is_dir || entry.name == PARENT {
+                continue;
+            }
+            let path = self.cwd.join(&entry.name);
+            entry.size = self.sizer.size_of(&path);
+            entry.measuring = self.sizer.is_measuring(&path);
         }
-        let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == update.name)
-        else {
-            return false;
-        };
-
-        entry.size = Some(update.allocated);
-        if !update.complete {
-            return false;
-        }
-        entry.measuring = false;
-
-        // Everything the walk saw, not just what was asked for. The subtree
-        // beneath this directory has already been measured; recomputing it when
-        // the user steps inside would be the same work a second time.
-        for (path, allocated) in update.directories {
-            self.sizer.remember(path, allocated);
-        }
-        true
     }
 
     /// Stop the background walk and wait for it.
@@ -293,10 +395,14 @@ impl App {
         match self.read(&target) {
             Ok(entries) => {
                 self.cwd = target;
-                self.entries = entries;
+                self.listed = entries;
+                // A filter is about the directory it was typed in.
+                self.filter.clear();
+                self.typing = None;
                 self.cursor = 0;
                 self.notice = None;
-                self.applied = sort(&mut self.entries, self.order, self.reverse);
+                self.applied = sort(&mut self.listed, self.order, self.reverse);
+                self.entries = self.filtered();
                 if let Some(name) = land_on
                     && let Some(at) = self.entries.iter().position(|entry| entry.name == name)
                 {
@@ -582,26 +688,6 @@ mod tests {
         assert_eq!(parent.size, None);
     }
 
-    /// Without the generation check, a size for the directory just left lands on
-    /// a same-named row in the one just entered.
-    #[test]
-    fn a_result_from_an_abandoned_walk_is_dropped() {
-        let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
-
-        // A reply that was in flight when the request was replaced.
-        let stale = crate::ui::measure::Update {
-            generation: 0,
-            name: OsString::from("alpha"),
-            allocated: 999_999,
-            complete: true,
-            directories: Vec::new(),
-        };
-        app.apply(stale);
-
-        assert_eq!(size_of(&app, "alpha"), None, "not from a previous request");
-    }
-
     /// `r` is the one thing that makes a total stale on purpose, because
     /// deleting is the one way it goes stale that the browser cannot see.
     #[test]
@@ -647,27 +733,6 @@ mod tests {
         );
     }
 
-    /// Sizes survive the trip; the generation still has to move, or a reply
-    /// still in flight from the directory just left is taken as this one's.
-    #[test]
-    fn arriving_somewhere_fully_known_still_invalidates_what_was_in_flight() {
-        let dir = fixture();
-        let mut app = App::open(dir.path()).expect("open");
-        await_sizes(&mut app);
-
-        point_at(&mut app, "alpha");
-        app.enter();
-
-        let stale = crate::ui::measure::Update {
-            generation: 1,
-            name: OsString::from("anything"),
-            allocated: 999_999,
-            complete: true,
-            directories: Vec::new(),
-        };
-        assert!(!app.apply(stale), "a reply from before the move is dropped");
-    }
-
     /// "By size" that stops re-ordering as the sizes arrive is showing an order
     /// that is no longer true.
     #[test]
@@ -688,6 +753,206 @@ mod tests {
             .filter(|name| name == "small" || name == "large")
             .collect();
         assert_eq!(directories, ["small", "large"], "ascending, as asked");
+    }
+
+    /// Stepping into a directory used to throw away the walk of its
+    /// neighbours, so coming back out started from nothing.
+    #[test]
+    fn a_walk_survives_stepping_into_a_directory_and_back_out() {
+        let dir = fixture();
+        for n in 0..300 {
+            let sub = dir.path().join(format!("alpha/sub{n}"));
+            std::fs::create_dir_all(&sub).expect("mkdir");
+            std::fs::write(sub.join("f.bin"), vec![b'x'; 4096]).expect("write");
+        }
+
+        let mut app = App::open(dir.path()).expect("open");
+        point_at(&mut app, "zulu");
+        app.enter();
+        app.leave();
+        await_sizes(&mut app);
+
+        assert!(
+            size_of(&app, "alpha").is_some_and(|size| size >= 300 * 4096),
+            "the walk that was running finished anyway"
+        );
+    }
+
+    /// Typing a few letters is how you find one directory among four hundred.
+    #[test]
+    fn a_filter_narrows_the_listing_as_it_is_typed() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+
+        app.start_filtering();
+        assert!(app.is_filtering());
+        for ch in "zul".chars() {
+            app.filter_push(ch);
+        }
+
+        assert_eq!(names(&app), ["..", "zulu"], "and the way out stays");
+    }
+
+    /// Case is not something a user typing `proj` is thinking about.
+    #[test]
+    fn matching_ignores_case() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("Projects")).expect("mkdir");
+        let mut app = App::open(dir.path()).expect("open");
+
+        app.start_filtering();
+        for ch in "proj".chars() {
+            app.filter_push(ch);
+        }
+
+        assert!(
+            names(&app).contains(&"Projects".to_owned()),
+            "{:?}",
+            names(&app)
+        );
+    }
+
+    /// A filter that matches nothing must still leave a key that does something.
+    #[test]
+    fn a_filter_matching_nothing_still_offers_the_way_out() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+
+        app.start_filtering();
+        for ch in "qqqq".chars() {
+            app.filter_push(ch);
+        }
+
+        assert_eq!(names(&app), [".."]);
+        app.enter();
+        assert_eq!(app.cwd(), dir.path().parent().expect("a parent"));
+    }
+
+    #[test]
+    fn backspace_widens_the_filter_again() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+
+        app.start_filtering();
+        for ch in "zulu".chars() {
+            app.filter_push(ch);
+        }
+        assert_eq!(names(&app).len(), 2);
+
+        for _ in 0..4 {
+            app.filter_pop();
+        }
+
+        assert_eq!(names(&app).len(), 5, "the whole listing is back");
+    }
+
+    /// `Enter` keeps the filter and hands the keys back; `Esc` throws it away.
+    #[test]
+    fn accepting_keeps_the_filter_and_clearing_drops_it() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+        app.start_filtering();
+        app.filter_push('z');
+
+        app.filter_accept();
+        assert!(!app.is_filtering(), "keys are navigation again");
+        assert_eq!(app.filter(), "z", "but the listing is still narrowed");
+        assert_eq!(names(&app), ["..", "zulu"]);
+
+        app.filter_clear();
+        assert_eq!(app.filter(), "");
+        assert_eq!(names(&app).len(), 5);
+    }
+
+    /// A filter is about the directory it was typed in.
+    #[test]
+    fn moving_directory_drops_the_filter() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+        app.start_filtering();
+        app.filter_push('a');
+        app.filter_accept();
+
+        point_at(&mut app, "alpha");
+        app.enter();
+
+        assert_eq!(app.filter(), "");
+        assert!(!app.is_filtering());
+    }
+
+    /// A size arriving for a row the filter is hiding still has to land, or
+    /// widening the filter shows a directory that has forgotten its total.
+    #[test]
+    fn a_hidden_row_keeps_the_size_it_was_given() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("alpha/f.bin"), vec![b'x'; 8192]).expect("write");
+        let mut app = App::open(dir.path()).expect("open");
+
+        app.start_filtering();
+        for ch in "zulu".chars() {
+            app.filter_push(ch);
+        }
+        await_sizes(&mut app);
+        app.filter_clear();
+
+        assert!(size_of(&app, "alpha").is_some_and(|size| size >= 8192));
+    }
+
+    #[test]
+    fn a_page_moves_a_screenful_and_stops_at_the_ends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for n in 0..30 {
+            std::fs::write(dir.path().join(format!("f{n:02}.bin")), b"x").expect("write");
+        }
+        let mut app = App::open(dir.path()).expect("open");
+        app.set_page(10);
+
+        app.page_down();
+        assert_eq!(app.cursor(), 9, "a screenful, less a row of overlap");
+
+        for _ in 0..10 {
+            app.page_down();
+        }
+        assert_eq!(
+            app.cursor(),
+            app.entries().len() - 1,
+            "and stops at the end"
+        );
+
+        for _ in 0..10 {
+            app.page_up();
+        }
+        assert_eq!(app.cursor(), 0, "and at the start");
+    }
+
+    #[test]
+    fn home_and_end_go_the_whole_way() {
+        let dir = fixture();
+        let mut app = App::open(dir.path()).expect("open");
+
+        app.jump_to_bottom();
+        assert_eq!(app.cursor(), app.entries().len() - 1);
+
+        app.jump_to_top();
+        assert_eq!(app.cursor(), 0);
+    }
+
+    /// A page in an empty listing is a no-op, not a panic.
+    #[test]
+    fn paging_an_empty_listing_does_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::open(dir.path()).expect("open");
+        app.start_filtering();
+        for ch in "nothing".chars() {
+            app.filter_push(ch);
+        }
+        // Only the parent row is left; filter it out too by going to the root.
+        app.filter_clear();
+
+        app.page_down();
+        app.page_up();
+        app.jump_to_bottom();
+        app.jump_to_top();
     }
 
     /// The root of the filesystem has no parent, so there is no `..` and
