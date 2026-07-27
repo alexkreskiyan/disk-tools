@@ -8,20 +8,19 @@
 //! check would be untested. What is left here is drawing and key dispatch.
 
 mod app;
+mod layout;
 mod listing;
 mod sort;
 mod term;
 
-use crate::render::tree::format_size;
 use app::App;
-use listing::Entry;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use sort::Order;
 use std::io::{self, IsTerminal};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use term::{Crossterm, Screen};
 
 /// Run the browser at `root` until the user asks to leave.
@@ -39,7 +38,10 @@ pub fn run(root: &Path) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     loop {
-        terminal.draw(|frame| draw(frame, &app))?;
+        // Read once per frame rather than held on the `App`: ages are relative,
+        // so a browser left open overnight would otherwise still say "2m".
+        let now = SystemTime::now();
+        terminal.draw(|frame| draw(frame, &app, now))?;
 
         // A timeout rather than a blocking read: without one, a resize or a
         // future background message could not reach the loop while it waits.
@@ -82,67 +84,64 @@ fn handle(app: &mut App, code: KeyCode) -> bool {
     true
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App) {
-    let layout = Layout::vertical([
+/// Four bands: where we are, the column labels, the rows, the keys.
+///
+/// The labels are their own line — the first version of this screen carried the
+/// sort order as `[name↑]` on the path line, and it was not findable. Columns
+/// are borderless so the labels sit directly over their cells; a box would inset
+/// the rows by one and nothing would line up.
+fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
+    let bands = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(frame.area());
 
-    frame.render_widget(Paragraph::new(header(app)), layout[0]);
+    frame.render_widget(Paragraph::new(where_we_are(app)), bands[0]);
+
+    let applied = app.applied();
+    let cols = layout::columns(bands[2].width as usize);
+    frame.render_widget(
+        Paragraph::new(layout::header(&cols, applied.order, app.reverse()))
+            .style(Style::default().add_modifier(Modifier::REVERSED)),
+        bands[1],
+    );
 
     let rows: Vec<ListItem<'_>> = app
         .entries()
         .iter()
-        .map(|entry| ListItem::new(row(entry)))
+        .map(|entry| ListItem::new(layout::row(entry, now, &cols)))
         .collect();
-    let list = List::new(rows)
-        .block(Block::default().borders(Borders::ALL))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let list = List::new(rows).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected(Some(app.cursor()));
-    frame.render_stateful_widget(list, layout[1], &mut state);
+    frame.render_stateful_widget(list, bands[2], &mut state);
 
     frame.render_widget(
         Paragraph::new("q quit  ↵ enter  ← up  n/s/c/m sort (again to reverse)")
             .style(Style::default().add_modifier(Modifier::DIM)),
-        layout[2],
+        bands[3],
     );
 }
 
-/// Path, order, and anything that went wrong.
+/// The path, and anything that went wrong.
 ///
 /// The notice takes the line when there is one: a message about a directory that
-/// would not open matters more than a reminder of the sort order.
-fn header(app: &App) -> String {
+/// would not open matters more than knowing where you are, which the previous
+/// frame already said.
+fn where_we_are(app: &App) -> String {
     if let Some(notice) = app.notice() {
         return format!("{}  —  {notice}", app.cwd().display());
     }
 
-    let applied = app.applied();
-    let arrow = if app.reverse() { "↓" } else { "↑" };
-    let mut header = format!(
-        "{}  [{}{arrow}]",
-        app.cwd().display(),
-        applied.order.label()
-    );
-    if applied.fell_back {
-        // Saying which order is in force is not enough when it is not the one
-        // that was asked for.
-        header.push_str("  (no creation times here)");
+    let mut line = app.cwd().display().to_string();
+    if app.applied().fell_back {
+        // The arrow in the header says which order is in force. It cannot say
+        // that it is not the one that was asked for.
+        line.push_str("  (no creation times here)");
     }
-    header
-}
-
-/// One row: size, then name. Directories carry no size until they are measured.
-fn row(entry: &Entry) -> String {
-    let size = match entry.size {
-        Some(bytes) => format_size(bytes),
-        None => String::new(),
-    };
-    let name = entry.name.to_string_lossy();
-    let mark = if entry.is_dir { "/" } else { "" };
-    format!("{size:>8}  {name}{mark}")
+    line
 }
 
 /// Why `ui` will not start.
@@ -205,7 +204,9 @@ mod tests {
     fn painted(root: &Path, width: u16, height: u16) -> Vec<String> {
         let app = App::open(root).expect("open");
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| draw(frame, &app, SystemTime::now()))
+            .expect("draw");
 
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -245,14 +246,18 @@ mod tests {
     }
 
     #[test]
-    fn the_screen_shows_a_header_a_list_and_the_keys() {
+    fn the_screen_shows_a_path_a_header_a_list_and_the_keys() {
         let dir = fixture();
 
         let lines = painted(dir.path(), 70, 10);
 
         assert!(
-            lines[0].contains("[name↑]"),
-            "header names the order: {lines:?}"
+            lines[0].contains(&dir.path().display().to_string()),
+            "the first line says where we are: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("size") && lines[1].contains("name↑") && lines[1].contains("total"),
+            "the second labels the columns and marks the sorted one: {lines:?}"
         );
         assert!(
             lines.iter().any(|line| line.contains("sub/")),
@@ -286,6 +291,30 @@ mod tests {
             !row.contains('B') && !row.contains('K'),
             "no size on a directory row: {row:?}"
         );
+    }
+
+    /// A label that does not sit over its own cells is a legend, not a header —
+    /// and the reason this screen was rebuilt.
+    #[test]
+    fn the_labels_sit_over_the_cells_they_name() {
+        let dir = fixture();
+
+        let lines = painted(dir.path(), 70, 10);
+        // By character: `↑` is three bytes, so byte offsets would differ between
+        // the header and a row that lines up perfectly on screen.
+        let bars = |line: &str| {
+            line.chars()
+                .enumerate()
+                .filter(|(_, ch)| *ch == '│')
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>()
+        };
+
+        let header = bars(&lines[1]);
+        assert!(!header.is_empty(), "{lines:?}");
+        for row in lines.iter().skip(2).take_while(|line| !line.is_empty()) {
+            assert_eq!(bars(row), header, "{row:?} against {:?}", lines[1]);
+        }
     }
 
     /// The parent is a row like any other, so it is visibly there to be entered.

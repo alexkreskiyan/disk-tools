@@ -138,7 +138,7 @@ fn name_columns(width: usize) -> Option<usize> {
 /// each and combining marks take none, so a char count would misplace the
 /// bar/percent block against the right edge. Truncation keeps whole characters,
 /// so a name is never split mid-codepoint.
-fn fit(text: &str, cols: usize) -> String {
+pub(crate) fn fit(text: &str, cols: usize) -> String {
     let width = UnicodeWidthStr::width(text);
     if width <= cols {
         return format!("{text}{}", " ".repeat(cols - width));
