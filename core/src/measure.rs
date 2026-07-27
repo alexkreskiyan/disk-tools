@@ -439,6 +439,38 @@ mod tests {
         assert_eq!(total("a"), measured.allocated, "and the root is the whole");
     }
 
+    /// The order is the whole point: a caller watching `a/b` learns its total
+    /// while the walk of `a` is still going, and so never starts a walk of its
+    /// own. Guaranteed by construction — a directory reports after its children
+    /// — rather than by being quick, so this is not a race.
+    #[test]
+    fn a_directory_is_reported_before_the_one_above_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("a/b/c")).expect("mkdir");
+        std::fs::write(dir.path().join("a/b/c/f.bin"), vec![b'x'; 4096]).expect("write");
+
+        let reported = Reported::default();
+        measure(dir.path(), &never(), &reported.record());
+
+        let order = reported.directories.lock().expect("no panics");
+        let at = |suffix: &str| {
+            order
+                .iter()
+                .position(|(path, _)| path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("{suffix} missing from {order:?}"))
+        };
+
+        assert!(at("a/b/c") < at("a/b"));
+        assert!(at("a/b") < at("a"));
+        // By path, not by `ends_with("")` — that is true of every path, and an
+        // assertion written with it passes without checking anything.
+        assert_eq!(
+            order.iter().position(|(path, _)| path == dir.path()),
+            Some(order.len() - 1),
+            "and the root is last of all"
+        );
+    }
+
     /// A directory that cannot be read is a zero rather than a hole: the answer
     /// is complete, it just does not include what could not be seen.
     #[cfg(unix)]

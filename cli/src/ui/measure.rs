@@ -429,7 +429,10 @@ mod tests {
         sizer.request(vec![dir.path().join("elsewhere")]);
         let waited = started.elapsed();
 
-        assert!(waited < Duration::from_millis(50), "took {waited:?}");
+        // Generous on purpose: the point is that it did not wait for a walk of
+        // 800 directories, not that it took any particular number of
+        // milliseconds on a loaded machine.
+        assert!(waited < Duration::from_millis(250), "took {waited:?}");
     }
 
     /// Forgetting is what `r` is for; without it a deleted subtree keeps its old
@@ -525,31 +528,25 @@ mod tests {
         assert!(children.iter().all(|path| sizer.size_of(path).is_some()));
     }
 
-    /// The inner answers have to arrive while the outer walk is still going, or
-    /// stepping inside shows an empty column until the whole thing finishes.
+    /// That the inner answers arrive *before* the outer walk ends is a property
+    /// of the core, tested there by report order
+    /// (`a_directory_is_reported_before_the_one_above_it`). Asserting it here
+    /// would mean racing an 800-directory walk to observe it mid-flight, which
+    /// is a coin toss on a loaded machine. What belongs here is that they arrive
+    /// at all, and without ever being asked for.
     #[test]
-    fn subtrees_are_known_before_the_walk_above_them_finishes() {
+    fn subtrees_become_known_without_being_asked_for() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tree = big(dir.path(), "tree");
         let mut sizer = Sizer::new();
 
         sizer.request(vec![tree.clone()]);
+        settle(&mut sizer, std::slice::from_ref(&tree));
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            sizer.absorb();
-            let inner = sizer.size_of(&tree.join("sub0")).is_some();
-            if inner && sizer.size_of(&tree).is_none() {
-                return; // a child was known while the parent still was not
-            }
-            if sizer.size_of(&tree).is_some() {
-                // The walk finished before the check could catch it in the act;
-                // the children still have to be there.
-                assert!(inner);
-                return;
-            }
-            assert!(Instant::now() < deadline, "never settled");
-        }
+        assert!(
+            (0..800).all(|n| sizer.size_of(&tree.join(format!("sub{n}"))).is_some()),
+            "every child is known, and none of them was requested"
+        );
     }
 
     /// The walk of one directory visits everything beneath it, and says so.

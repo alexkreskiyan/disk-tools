@@ -18,8 +18,9 @@ its Roadmap for what lands when; the
 [v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) and
 [v0.3](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md) specs are
 the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
-(the TUI) has Tasks 1-2 of 7 done — `disk-tools ui` opens a directory, navigates
-and sorts, and always gives the terminal back. User-facing usage, flags, the safety model and
+(the TUI) has Tasks 1-3 of 7 done — `disk-tools ui` browses a directory as a
+table, sizes its subdirectories in the background, filters with `/`, and always
+gives the terminal back. User-facing usage, flags, the safety model and
 the documented limitations live in the [README](README.md).
 
 ## Important: Documentation Requirements
@@ -86,6 +87,7 @@ disc-tools/
 │       ├── detect.rs   # the one pass that applies them
 │       ├── git.rs      # is there uncommitted work here?
 │       ├── clean.rs    # denylist, tiers, totals → CleanPlan. Writes nothing
+│       ├── measure.rs  # one subtree's bytes; reports each directory as it finishes
 │       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
 ├── cli/                # disk-tools (bin) — CLI frontend
 │   ├── Cargo.toml      # clap, toml, serde, serde_ignored, indicatif, unicode-width
@@ -93,7 +95,13 @@ disc-tools/
 │   │   ├── main.rs     # verb dispatch (scan | clean); spinner to stderr
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
 │   │   ├── config.rs   # locate/parse/validate the TOML file; `config init`
-│   │   ├── ui/         # the TUI — term.rs restores the terminal on every path
+│   │   ├── ui/         # the TUI
+│   │   │   ├── term.rs     # restores the terminal on every path
+│   │   │   ├── app.rs      # cwd, cursor, order, filter — every key as a function
+│   │   │   ├── listing.rs  # one directory, one metadata call per entry
+│   │   │   ├── sort.rs     # four orders; reports the one it could apply
+│   │   │   ├── layout.rs   # the table: which columns fit, and what is in them
+│   │   │   └── measure.rs  # the sizing worker, its queue and its session cache
 │   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
 │   │   └── render/
 │   │       ├── mod.rs
@@ -120,6 +128,7 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs` | Walk → dedup → aggregate, in that order |
 | `plan(&ScanTree, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | Decides what may go and what that frees. **Writes nothing** |
 | `CleanPlan::merge(Vec<CleanPlan>)` | `core/src/clean.rs` | One plan from several roots. Additive **only because** `Rules::scan_roots` drops nested roots |
+| `measure(root, cancel, finished) -> Measured` | `core/src/measure.rs` | One subtree's bytes. Reports **every directory as that directory finishes**, so an outer walk subsumes the inner ones instead of racing them |
 | `apply(&CleanPlan, Removal, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. `Removal::Trash` batches; `Removal::Purge` deletes outright |
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
@@ -166,6 +175,12 @@ Invariants worth keeping in mind:
   standing in for a home.
 - **No candidate nests inside another** (`detect` never descends into a match),
   which is what lets totals be summed and removals not repeat.
+- **A measured total is keyed on its absolute path**, never on the row it came
+  from. That is what lets a walk outlive the screen moving on, and it is why the
+  browser has no generation counter: a stale answer is not wrong, it is just
+  about somewhere else.
+- **The TUI cancels only what the user asks it to** (`r`) and what exit
+  requires. Cancelling on navigation destroyed work that was about to be wanted.
 - **Anything that really deletes is `#[ignore]`d** and run by `just smoke-trash`.
 
 ## Configuration
@@ -218,7 +233,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07/2026.07.25` |
 | `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
-| `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07/2026.07.26` |
+| `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07/2026.07.27` |
 
 Files are always written under a `<YYYY.MM>/` folder — never directly under `kb/<folder>/`. Filenames begin with `<YYYY.MM.DD>-` and never include the folder name.
 
