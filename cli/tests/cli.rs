@@ -1210,28 +1210,29 @@ fn mixed_tiers_dir() -> tempfile::TempDir {
     // 2001-01-01, comfortably past any threshold a test will use.
     let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(978_307_200);
     filetime_set(&stale, long_ago);
+    assert_eq!(
+        std::fs::metadata(&stale).expect("stat").modified().ok(),
+        Some(long_ago),
+        "every confirm-tier test below rests on this file being old"
+    );
     dir
 }
 
+/// Backdate a file, so an `--older-than` threshold has something to find.
+///
+/// `File::set_times` rather than shelling out to `touch`. The subprocess version
+/// tried the GNU spelling, printed its failure to the suite's stderr on every
+/// BSD run, and fell back to a **hardcoded** date that merely happened to equal
+/// the one caller's argument. Worse, it ignored both exit statuses: on a
+/// platform where neither form worked, the file would keep its current mtime and
+/// the age tests would pass without testing anything.
 fn filetime_set(path: &Path, when: std::time::SystemTime) {
-    let secs = when
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    // No dev-dependency for this: `touch -t` is on every platform CI runs, and
-    // the alternative is a crate pulled in for one line of a test.
-    let stamp = std::process::Command::new("touch")
-        .arg("-d")
-        .arg(format!("@{secs}"))
-        .arg(path)
-        .status();
-    if !matches!(stamp, Ok(status) if status.success()) {
-        // BSD `touch` spells it differently.
-        let _ = std::process::Command::new("touch")
-            .args(["-t", "200101010000"])
-            .arg(path)
-            .status();
-    }
+    let file = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for its timestamps");
+    file.set_times(std::fs::FileTimes::new().set_modified(when))
+        .expect("set mtime");
 }
 
 /// The headline property: `--apply` alone does not take what cannot be
@@ -1426,4 +1427,72 @@ fn one_refused_candidate_reads_singular() {
         stderr.contains("1 candidate is not regenerable"),
         "the verb agrees with the noun, not only the noun with the count:\n{stderr}"
     );
+}
+
+// ---- the browser ---------------------------------------------------------
+//
+// Every test here runs with stdout piped, which is itself the point: `ui`
+// refuses rather than writing escape sequences somewhere no one can read them.
+// Anything needing a real terminal cannot be tested on CI and is checked by hand.
+
+#[test]
+fn ui_refuses_a_pipe_rather_than_filling_it_with_escapes() {
+    let dir = isolated();
+
+    let output = run(&["ui", dir.path().to_str().expect("utf8")]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(
+        output.stdout.is_empty(),
+        "not one byte may reach the pipe: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("needs a terminal"), "{stderr}");
+    assert!(
+        !stderr.contains('\x1b'),
+        "and the refusal itself emits no escapes: {stderr:?}"
+    );
+}
+
+/// A path the user named and that is not there is a typo, and it must be said
+/// before the screen opens — afterwards, leaving the screen erases it.
+#[test]
+fn ui_reports_a_missing_path_ahead_of_the_terminal_check() {
+    let dir = isolated();
+
+    let output = run(&["ui", dir.path().join("nope").to_str().expect("utf8")]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nope"), "{stderr}");
+    assert!(
+        !stderr.contains("needs a terminal"),
+        "the path is the more useful thing to hear about: {stderr}"
+    );
+}
+
+/// Unlike `scan`, `ui` opens the working directory when given none — the ban on
+/// defaulting to it exists against accidentally *walking* something huge, and a
+/// browser lists one directory.
+#[test]
+fn ui_without_a_path_is_not_a_usage_error() {
+    let output = run(&["ui"]);
+
+    // Still refused here, because these tests pipe stdout — but refused for the
+    // terminal, not for a missing argument.
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("needs a terminal"),
+        "a missing path must not be what stops it: {stderr}"
+    );
+}
+
+#[test]
+fn help_lists_the_ui_verb() {
+    let output = run(&["--help"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ui"), "{stdout}");
 }

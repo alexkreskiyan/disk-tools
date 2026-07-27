@@ -17,7 +17,10 @@ its Roadmap for what lands when; the
 [v0.1](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md),
 [v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) and
 [v0.3](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md) specs are
-the authoritative task breakdowns. User-facing usage, flags, the safety model and
+the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
+(the TUI) has Tasks 1-4 of 7 done — `disk-tools ui` browses a directory as a
+table, sizes its subdirectories in the background, colours them by what the
+rules say, filters with `/`, and always gives the terminal back. User-facing usage, flags, the safety model and
 the documented limitations live in the [README](README.md).
 
 ## Important: Documentation Requirements
@@ -43,20 +46,21 @@ rather than as ad-hoc commands.
 | `just build` | Build the workspace (`cargo build --workspace`) |
 | `just test` | Run all tests (`cargo test --workspace`) |
 | `just lint` | Clippy, warnings as errors |
+| `just lint-windows` | The same, cross-checked against `x86_64-pc-windows-msvc` — clippy only sees what the host compiles, so `#[cfg(windows)]` code is otherwise linted by CI alone |
 | `just fmt` / `just fmt-check` | Format / check formatting |
-| `just verify` | Pre-commit gate: `fmt-check` + `lint` + `doc` + `check-minimal` + `test` |
+| `just verify` | Pre-commit gate: `fmt-check` + `lint` + `lint-windows` + `doc` + `check-minimal` + `test` |
 | `just doc` | Build docs with warnings as errors — catches a public item linking to a private one, which clippy cannot see |
 | `just check-minimal` | Core without default features: proves a scan-only consumer still compiles without the trash backend |
 | `just smoke-trash` | The `#[ignore]`d tests that move real files to the OS trash, in both crates |
 | `just coverage-branch` | Nightly-only branch coverage; advisory, mirrored by a non-blocking CI job |
-| `just check` | `cargo check --workspace --all-targets` — CI runs it pinned to MSRV 1.85 |
+| `just check` | `cargo check --workspace --all-targets` — CI runs it pinned to MSRV 1.88 |
 | `just run <ARGS>` | Run the CLI, e.g. `just run scan ~/Downloads --json` |
 | `just release` | Optimized host build → `target/release/disk-tools` |
 | `just install-cli` | `cargo install --path cli`, then check that the installed copy is the one first on PATH |
 | `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` / `just bench-phases <path>` / `just bench-stat <dir>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
 CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` + `just smoke-trash`
-on Linux, macOS and Windows, plus a Linux job pinned to MSRV 1.85 running
+on Linux, macOS and Windows, plus a Linux job pinned to MSRV 1.88 running
 `just check` and a non-blocking nightly branch-coverage job. It calls the justfile
 recipes rather than duplicating cargo commands, so a new local check added there
 is automatically enforced in CI.
@@ -65,7 +69,7 @@ is automatically enforced in CI.
 
 ```
 disc-tools/
-├── Cargo.toml          # workspace: members core, cli; edition 2024, MSRV 1.85
+├── Cargo.toml          # workspace: members core, cli; edition 2024, MSRV 1.88
 ├── justfile            # single entry point for local tooling
 ├── .github/workflows/
 │   └── ci.yml          # verify matrix on ×3 OS + an MSRV-pinned check job
@@ -84,6 +88,7 @@ disc-tools/
 │       ├── detect.rs   # the one pass that applies them
 │       ├── git.rs      # is there uncommitted work here?
 │       ├── clean.rs    # denylist, tiers, totals → CleanPlan. Writes nothing
+│       ├── measure.rs  # one subtree's bytes; reports each directory as it finishes
 │       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
 ├── cli/                # disk-tools (bin) — CLI frontend
 │   ├── Cargo.toml      # clap, toml, serde, serde_ignored, indicatif, unicode-width
@@ -91,6 +96,13 @@ disc-tools/
 │   │   ├── main.rs     # verb dispatch (scan | clean); spinner to stderr
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
 │   │   ├── config.rs   # locate/parse/validate the TOML file; `config init`
+│   │   ├── ui/         # the TUI
+│   │   │   ├── term.rs     # restores the terminal on every path
+│   │   │   ├── app.rs      # cwd, cursor, order, filter — every key as a function
+│   │   │   ├── listing.rs  # one directory, one metadata call per entry
+│   │   │   ├── sort.rs     # four orders; reports the one it could apply
+│   │   │   ├── layout.rs   # the table: which columns fit, and what is in them
+│   │   │   └── measure.rs  # the sizing worker, its queue and its session cache
 │   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
 │   │   └── render/
 │   │       ├── mod.rs
@@ -117,10 +129,13 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs` | Walk → dedup → aggregate, in that order |
 | `plan(&ScanTree, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | Decides what may go and what that frees. **Writes nothing** |
 | `CleanPlan::merge(Vec<CleanPlan>)` | `core/src/clean.rs` | One plan from several roots. Additive **only because** `Rules::scan_roots` drops nested roots |
+| `measure(root, cancel, finished) -> Measured` | `core/src/measure.rs` | One subtree's bytes. Reports **every directory as that directory finishes**, so an outer walk subsumes the inner ones instead of racing them |
 | `apply(&CleanPlan, Removal, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. `Removal::Trash` batches; `Removal::Purge` deletes outright |
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
 | `Rule` / `Rules` | `core/src/rules.rs` | Detection as data. **List order is precedence**; a rule that cannot be expressed matches nothing |
+| `Rules::state -> State` | `core/src/rules.rs` | Why a row is that colour: `untracked` / `in scope` / `included` / `excluded`. Shares `matching`, `excluded` **and `predicates_hold`** with `detect`, so `included` means exactly "detect would claim this" |
+| `Facts` | `core/src/rules.rs` | What the caller already knows — siblings, mtime, `now` — so the non-glob predicates need no filesystem and no clock |
 | `DetectOptions` / `Detection` | `core/src/detect.rs` | The pass's input and output. `now` is mandatory, so a rule's `older_than` can never be half-armed |
 | `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason; `filtered_out` / `too_small` count the user's own narrowings |
 | `CleanOutcome` | `core/src/trash.rs` | `removed` / `failed` / `reclaimed` — never a `Result` |
@@ -163,6 +178,19 @@ Invariants worth keeping in mind:
   standing in for a home.
 - **No candidate nests inside another** (`detect` never descends into a match),
   which is what lets totals be summed and removals not repeat.
+- **A measured total is keyed on its absolute path**, never on the row it came
+  from. That is what lets a walk outlive the screen moving on, and it is why the
+  browser has no generation counter: a stale answer is not wrong, it is just
+  about somewhere else.
+- **The TUI cancels only what the user asks it to** (`r`) and what exit
+  requires. Cancelling on navigation destroyed work that was about to be wanted.
+- **A colour and a candidate are decided by the same code.** `detect::claim` and
+  `Rules::state` both run `matching` → `excluded` → `predicates_hold`, in that
+  order. A `target/` with no `Cargo.toml` beside it is `in scope`, not
+  `included`, because that is what `clean` would do with it.
+- **`in scope` is a state of its own.** "My rule does not cover this" and "my
+  rule is not running" are different problems, and folding them together leaves
+  the user unable to tell which they have.
 - **Anything that really deletes is `#[ignore]`d** and run by `just smoke-trash`.
 
 ## Configuration
@@ -188,7 +216,7 @@ What configuration exists beyond that is build-time:
 
 | File | Holds |
 |------|-------|
-| `Cargo.toml` (workspace) | `version`, `edition = "2024"`, `rust-version = "1.85"`, inherited by both crates |
+| `Cargo.toml` (workspace) | `version`, `edition = "2024"`, `rust-version = "1.88"`, inherited by both crates |
 | `core/Cargo.toml` | The optional `serde` feature; `windows-sys` under `[target.'cfg(windows)'.dependencies]` |
 | `cli/Cargo.toml` | Enables the core's `serde` feature for `--json` |
 | `.gitattributes` | `* text=auto eol=lf` — a CRLF checkout would fail `cargo fmt --check` on Windows |
@@ -215,7 +243,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07/2026.07.25` |
 | `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
-| `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07/2026.07.26` |
+| `kb/handoffs/` | Task handoffs (`/implement-task`) | `2026.07/2026.07.27` |
 
 Files are always written under a `<YYYY.MM>/` folder — never directly under `kb/<folder>/`. Filenames begin with `<YYYY.MM.DD>-` and never include the folder name.
 

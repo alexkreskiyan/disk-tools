@@ -49,11 +49,26 @@ pub enum Command {
     /// Find removable junk. Dry-run by default — nothing is deleted without --apply.
     Clean(CleanArgs),
 
+    /// Browse a directory, with each entry coloured by what the rules say.
+    Ui(UiArgs),
+
     /// Inspect and create the configuration file.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
+}
+
+#[derive(clap::Args, Debug)]
+pub struct UiArgs {
+    /// Directory to open. Defaults to the working directory.
+    ///
+    /// The only place in this tool where the working directory is implied. The
+    /// rule against it exists so that nothing huge is *scanned* by accident;
+    /// opening a browser costs one directory listing, so the reason does not
+    /// carry. `scan` still demands a path and `clean` asks the rules.
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -201,6 +216,19 @@ pub enum Mode {
     },
     /// Write the default configuration to `target`.
     ConfigInit { target: PathBuf, force: bool },
+
+    /// Open the browser at this directory.
+    Ui {
+        root: PathBuf,
+        /// The same rules `clean` would apply, so the two verbs cannot disagree
+        /// about what is junk.
+        rules: Box<Rules>,
+        /// Everything needed to build those rules again, for the reload key.
+        /// The browser outlives the file it was started from — editing the
+        /// config and restarting to see the effect is the loop this removes.
+        reload: Box<Reload>,
+        now: SystemTime,
+    },
 }
 
 /// What the frontend resolved before the arguments could be turned into work.
@@ -218,6 +246,20 @@ pub struct Environment {
     /// environment implies a path, which is also the one case `config init`
     /// cannot serve.
     pub config_path: Option<PathBuf>,
+}
+
+/// What it takes to read the rules again from scratch.
+///
+/// A copy of the inputs rather than a closure: `resolve` is a pure function of
+/// its `Environment`, and handing the browser a closure over it would make the
+/// mode inspectable only by running it.
+#[derive(Debug, Clone)]
+pub struct Reload {
+    /// The file the rules came from, already located. Passed back as the
+    /// explicit path so a reload cannot resolve to a *different* file than the
+    /// one the browser started with.
+    pub path: Option<PathBuf>,
+    pub user_dirs: UserDirs,
 }
 
 impl Args {
@@ -258,6 +300,21 @@ impl Args {
                 // scan has always printed without `-n`.
                 number: scan.number.or(config.report.number),
                 json: scan.json,
+            }),
+
+            Command::Ui(ui) => Ok(Mode::Ui {
+                // `.` rather than an absolute path: what the user typed is what
+                // the title bar should say, and `validate_root` is about to
+                // check it either way.
+                root: ui.path.unwrap_or_else(|| PathBuf::from(".")),
+                // No age rule: `--older-than` is a `clean` flag, and a browser
+                // that coloured every old file as junk would say nothing.
+                rules: Box::new(Rules::new(config.rules, &user_dirs).map_err(ResolveError::Rule)?),
+                reload: Box::new(Reload {
+                    path: config_path,
+                    user_dirs,
+                }),
+                now,
             }),
 
             Command::Config {

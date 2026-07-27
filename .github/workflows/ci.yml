@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # MSRV is pinned in Cargo.toml (rust-version = "1.85"); stable satisfies it.
+      # MSRV is pinned in Cargo.toml (rust-version = "1.88"); stable satisfies it.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -51,14 +51,18 @@ jobs:
         run: just smoke-trash
 
   # `verify` runs on stable, which happily accepts APIs stabilized after our
-  # MSRV — the manifest's `rust-version = "1.85"` would silently become a lie.
+  # MSRV — the manifest's `rust-version = "1.88"` would silently become a lie.
   # One Linux job pinned to that exact toolchain keeps it honest.
+  #
+  # It was 1.85 (the edition-2024 floor) until v0.4: `ratatui` 0.30 needs 1.86
+  # and 0.30.2 needs 1.88. Staying would have meant `ratatui` 0.29, a major
+  # version behind.
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - uses: extractions/setup-just@v4
       - name: just check

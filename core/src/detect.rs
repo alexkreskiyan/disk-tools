@@ -17,11 +17,12 @@
 //! Nothing here removes, ranks or excludes anything. It reports what matched;
 //! the denylist, the tiers and the totals belong to the cleanup engine.
 
+use crate::rules::Facts;
 use crate::rules::{Rules, UserDirs};
 use crate::tree::{ScanNode, ScanTree};
 use globset::Candidate;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 /// Everything the rules need, all of it explicit.
 #[derive(Debug, Clone)]
@@ -128,52 +129,28 @@ fn visit(
 /// requirement would silently shadow every rule beneath it.
 fn claim(node: &ScanNode, siblings: &[ScanNode], options: &DetectOptions) -> Option<String> {
     let candidate = Candidate::new(node.path.as_path());
+    // The predicates live on `Rules` so that `Rules::state` — the colour the TUI
+    // paints — is decided by the same code. A directory shown as junk and a
+    // directory offered for removal must not be different sets.
+    let facts = Facts {
+        is_dir: node.is_dir,
+        modified: node.modified,
+        now: options.now,
+        has_sibling: &|name| has_sibling(siblings, name),
+    };
 
     for index in options.rules.matching(&candidate, node.is_dir) {
-        let rule = options.rules.rule_at(index);
-
         if options.rules.excluded(index, &candidate) {
             continue;
         }
-        if !rule
-            .requires_sibling
-            .iter()
-            .all(|name| has_sibling(siblings, name))
-        {
-            continue;
-        }
-        // Not a `let` chain: those stabilised in 1.88 and this crate's MSRV is
-        // 1.85. A rule with no threshold imposes none.
-        if rule
-            .older_than
-            .is_some_and(|older_than| !is_older(node.modified, older_than, options.now))
-        {
+        if !options.rules.predicates_hold(index, &facts) {
             continue;
         }
 
-        return Some(rule.name.clone());
+        return Some(options.rules.rule_at(index).name.clone());
     }
 
     None
-}
-
-/// Has this been untouched for at least `older_than`?
-///
-/// A directory is judged on its **own** mtime, which is what the model carries —
-/// a directory's timestamp moves when its entries change, and that is precisely
-/// the "still in use" evidence wanted.
-fn is_older(modified: Option<SystemTime>, older_than: Duration, now: SystemTime) -> bool {
-    // Absence of evidence is not evidence of age. Every entry on a filesystem
-    // that reports no timestamp would otherwise become a deletion candidate.
-    let Some(modified) = modified else {
-        return false;
-    };
-    let Some(threshold) = now.checked_sub(older_than) else {
-        return false;
-    };
-
-    // "Older or exactly equal" — the boundary is inclusive.
-    modified <= threshold
 }
 
 fn has_sibling(siblings: &[ScanNode], name: &str) -> bool {
@@ -187,6 +164,7 @@ mod tests {
     use super::*;
     use crate::rules::{Rule, Tier, age_rule, builtin_rules};
     use std::path::Path;
+    use std::time::Duration;
 
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
