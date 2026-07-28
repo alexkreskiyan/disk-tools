@@ -135,13 +135,45 @@ directory you are in.
 
 ```
 ~/Projects                                    ← where you are, and any notice
-    size │ name↑          │ created │ modified │ total
-   1.2G  │ old-app/       │      2y │      11m │ ████    38%
-       ⠹ │ current/       │     30d │      2h  │
-    4.0K │ README.md      │     30d │      2h  │
+    size │    clean │ name↑        │  created │  modified │ total
+    3.1G │   890.0M │ Projects/    │       2y │       11m │ ███████ 100%   ← here
+         │          │ ../          │          │           │
+    1.2G │   890.0M │ old-app/     │       2y │       11m │ ███     38%
+       ⠹ │          │ current/     │      30d │        2h │
+    4.0K │          │ README.md    │      30d │        2h │
 rules: included  excluded  in scope  untracked
 q quit  ↵ enter  ← up  / filter  a rules  n/s/c/m sort  r sizes  R config
 ```
+
+The row under the labels is **the directory you are in**, in the same columns as
+everything below it. `..` is the way out of here, not a description of here, and
+without a row of its own the one directory the screen is about was the one thing
+it never said anything about. Its figures are the sum of the listing rather than
+a walk of their own — measuring `cwd` would walk every row a second time,
+through itself.
+
+### `clean` — what a rule would take
+
+The `clean` column is the point of the browser: how much of this row `clean`
+would remove under the rules in force. It is worked out by the same walk that
+counts the bytes, so it costs no second pass, and by the same code that decides
+a candidate — a figure here and a line in `clean`'s report cannot disagree.
+
+- A **file** a rule claims is claimed whole.
+- A **directory** carries what the walk found inside it: `Projects/` above is
+  3.1G of which 890M is junk, all of it in `old-app/`.
+- A directory a rule claims **outright** is reclaimable in full, including the
+  parts of it no pattern would match on their own. Nothing inside a
+  `node_modules` matches `**/node_modules/`, and it all goes anyway.
+
+An **empty cell means nothing to take *or* nothing known yet.** The two are told
+apart one column to the left: a row still being walked is spinning. A `0` there
+would read as a verdict on a directory nobody has been into.
+
+Editing a rule (`a`) or re-reading the config (`R`) **measures again**. Every
+figure in the column was worked out against rules that no longer exist, and a
+screen still answering the previous question is the one thing changing a rule is
+meant to stop.
 
 ### Keys
 
@@ -180,6 +212,11 @@ Three things follow from that, and all three are deliberate:
   not recompute it, and a walk of one directory records everything beneath it —
   so entering a directory that has been measured is free, at any depth. `r` is
   how you say the disk has changed.
+
+A chosen order survives that. Sizes are copied onto the rows **before** they are
+sorted, so walking into a directory whose totals are already known comes out in
+the order you asked for rather than in name order — the case where nothing
+finishes, because nothing has to run.
 
 Ages are relative (`2h`, `30d`, `2y`) rather than dates. A date needs a timezone
 and nothing here can supply one; `SystemTime` is UTC, and printing UTC to

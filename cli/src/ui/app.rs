@@ -27,6 +27,7 @@ use crate::config::write;
 use disk_tools_core::{Facts, Rule, Rules, State, UserDirs};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// The parent row. A real entry rather than a special key, so `Enter` on it
@@ -35,6 +36,13 @@ pub const PARENT: &str = "..";
 
 pub struct App {
     cwd: PathBuf,
+
+    /// The current directory as a row in its own right.
+    ///
+    /// `..` is the way out, not this. Its figures are the sum of the listing
+    /// rather than a walk of their own: measuring the directory being looked at
+    /// would walk everything on screen a second time, through itself.
+    here: Entry,
 
     /// Everything in the directory, sorted.
     listed: Vec<Entry>,
@@ -60,7 +68,11 @@ pub struct App {
 
     /// What `clean` would say about each row. The same rules that verb uses, so
     /// the two cannot disagree about what is junk.
-    rules: Rules,
+    ///
+    /// Shared with the sizing worker, which needs them to work out what a
+    /// subtree would give back — behind an `Arc` rather than cloned per walk,
+    /// since a `GlobSet` is not a cheap thing to copy.
+    rules: Arc<Rules>,
 
     /// For `older_than`. Read once: the core reads no clock, and a rule whose
     /// threshold is measured in days does not care about the minutes a browser
@@ -92,8 +104,10 @@ impl App {
         now: SystemTime,
         user_dirs: UserDirs,
     ) -> std::io::Result<Self> {
+        let rules = Arc::new(rules);
         let mut app = App {
             cwd: root.to_path_buf(),
+            here: blank(root),
             listed: Vec::new(),
             entries: Vec::new(),
             filter: String::new(),
@@ -106,21 +120,15 @@ impl App {
                 fell_back: false,
             },
             notice: None,
-            sizer: Sizer::new(),
+            sizer: Sizer::new(Arc::clone(&rules), now),
             rules,
             now,
             user_dirs,
             dialog: None,
             page: 1,
         };
-        app.listed = app.read(root)?;
-        app.classify();
-        // Sorted, then the cursor put at the top. `refilter` would instead hold
-        // onto whatever `read_dir` happened to return first and follow it to
-        // wherever the sort put it — which is a cursor landing at random.
-        app.applied = sort(&mut app.listed, app.order, app.reverse);
-        app.entries = app.filtered();
-        app.size_directories();
+        let listed = app.read(root)?;
+        app.arrive(root.to_path_buf(), listed, None);
         Ok(app)
     }
 
@@ -134,6 +142,7 @@ impl App {
                 modified: None,
                 created: None,
                 state: State::Untracked,
+                reclaimable: None,
                 measuring: false,
             });
         }
@@ -142,6 +151,11 @@ impl App {
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// The current directory, as a row.
+    pub fn here(&self) -> &Entry {
+        &self.here
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -369,7 +383,36 @@ impl App {
 
         for (entry, state) in self.listed.iter_mut().zip(states) {
             entry.state = state;
+            // A file's claim needs no walk: it is the file, or it is nothing.
+            // Directories are filled in by `apply_sizes`, once something has
+            // been down there to look.
+            if !entry.is_dir {
+                entry.reclaimable = (state == State::Included).then_some(entry.size).flatten();
+            }
         }
+    }
+
+    /// What the rules make of the directory being looked at.
+    ///
+    /// Its siblings are read from the parent by name rather than from a listing,
+    /// because the browser has not read the parent and reading it to colour one
+    /// row would cost a whole directory for a question about a handful of names.
+    fn state_of_cwd(&self) -> State {
+        let parent = self.cwd.parent().map(Path::to_path_buf);
+        let has_sibling = |name: &str| match &parent {
+            Some(parent) => parent.join(name).exists(),
+            None => false,
+        };
+
+        self.rules.state(
+            &self.cwd,
+            &Facts {
+                is_dir: true,
+                modified: self.here.modified,
+                now: self.now,
+                has_sibling: &has_sibling,
+            },
+        )
     }
 
     pub fn dialog(&self) -> Option<&Dialog> {
@@ -546,9 +589,18 @@ impl App {
     ///
     /// The listing is not re-read: rules are about what the files mean, not
     /// about what is there, and rereading would move the cursor for no reason.
+    ///
+    /// The **sizes** are, though. Every reclaimable figure was worked out
+    /// against the rules that have just been replaced, so keeping them would
+    /// leave the screen answering the previous question — which is precisely the
+    /// question the user changed the rule to stop asking.
     pub fn reload_rules(&mut self, rules: Rules) {
-        self.rules = rules;
+        self.rules = Arc::new(rules);
+        self.sizer.retarget(Arc::clone(&self.rules));
+
+        self.here.state = self.state_of_cwd();
         self.classify();
+        self.size_directories();
         self.entries = self.filtered();
     }
 
@@ -562,14 +614,20 @@ impl App {
             .any(|entry| entry.state != State::Untracked)
     }
 
-    /// The subdirectories here, by absolute path. The parent is not one of them:
-    /// measuring it would walk everything on screen a second time, through
-    /// itself.
-    fn subdirectories(&self) -> Vec<PathBuf> {
+    /// The subdirectories here, by absolute path, each with whether a rule
+    /// already claims it.
+    ///
+    /// The parent is not one of them: measuring it would walk everything on
+    /// screen a second time, through itself.
+    ///
+    /// The claim has to travel with the request. Nothing *inside* a
+    /// `node_modules` matches `**/node_modules/`, so a walk that was not told
+    /// would come back saying there is nothing to clean in it.
+    fn subdirectories(&self) -> Vec<(PathBuf, bool)> {
         self.listed
             .iter()
             .filter(|entry| entry.is_dir && entry.name != PARENT)
-            .map(|entry| self.cwd.join(&entry.name))
+            .map(|entry| (self.cwd.join(&entry.name), entry.state == State::Included))
             .collect()
     }
 
@@ -588,7 +646,7 @@ impl App {
     /// The one thing that invalidates a total, because deleting is the one way
     /// it goes stale that the browser cannot see.
     pub fn remeasure(&mut self) {
-        for path in self.subdirectories() {
+        for (path, _) in self.subdirectories() {
             self.sizer.forget(&path);
         }
         self.size_directories();
@@ -608,20 +666,40 @@ impl App {
         }
     }
 
-    /// Copy what the sizer knows onto the rows.
+    /// Copy what the sizer knows onto the rows, and add them up for `here`.
     ///
     /// Read from the cache rather than pushed into the rows as answers arrive:
     /// a result posted while another directory was on screen has to be here when
     /// the user comes back, and a row is not the place to keep it.
     fn show_sizes(&mut self) {
-        for entry in self.listed.iter_mut().chain(self.entries.iter_mut()) {
-            if !entry.is_dir || entry.name == PARENT {
+        apply_sizes(&self.cwd, &self.sizer, &mut self.listed);
+        apply_sizes(&self.cwd, &self.sizer, &mut self.entries);
+        self.total_here();
+    }
+
+    /// The current directory's own figures: the sum of the listing.
+    ///
+    /// Not a walk of `cwd` — that would cover exactly the rows already being
+    /// walked, through them, and pay for the whole thing twice.
+    fn total_here(&mut self) {
+        let mut allocated = 0u64;
+        let mut reclaimable = 0u64;
+        let mut settled = true;
+
+        for entry in &self.listed {
+            if entry.name == PARENT {
                 continue;
             }
-            let path = self.cwd.join(&entry.name);
-            entry.size = self.sizer.size_of(&path);
-            entry.measuring = self.sizer.is_measuring(&path);
+            allocated += entry.size.unwrap_or(0);
+            reclaimable += entry.reclaimable.unwrap_or(0);
+            // A row still being walked, or one whose claim is not in yet, makes
+            // both sums a lower bound rather than a total.
+            settled &= !entry.measuring && (!entry.is_dir || entry.reclaimable.is_some());
         }
+
+        self.here.size = Some(allocated);
+        self.here.reclaimable = Some(reclaimable);
+        self.here.measuring = !settled;
     }
 
     /// Stop the background walk and wait for it.
@@ -661,32 +739,100 @@ impl App {
 
     fn go(&mut self, target: PathBuf, land_on: Option<OsString>) {
         match self.read(&target) {
-            Ok(entries) => {
-                self.cwd = target;
-                self.listed = entries;
-                // A filter is about the directory it was typed in.
-                self.filter.clear();
-                self.typing = None;
-                self.cursor = 0;
-                self.notice = None;
-                self.classify();
-                self.applied = sort(&mut self.listed, self.order, self.reverse);
-                self.entries = self.filtered();
-                if let Some(name) = land_on
-                    && let Some(at) = self.entries.iter().position(|entry| entry.name == name)
-                {
-                    self.cursor = at;
-                }
-                // After the move, not before: a walk of the directory being left
-                // would go on competing for the pool with the one being entered.
-                self.size_directories();
-            }
+            Ok(listed) => self.arrive(target, listed, land_on),
             Err(err) => {
                 // Nothing moves. A refused entry that shifted the cursor would
                 // read as though it had half worked.
                 self.notice = Some(format!("{}: {err}", target.display()));
             }
         }
+    }
+
+    /// Land in a directory that has just been read.
+    ///
+    /// The order of the last four steps is the whole of it, and getting it wrong
+    /// is what made a chosen sort look as though it had been forgotten:
+    ///
+    /// 1. classify, because the sizing request needs to know what is claimed;
+    /// 2. ask for the sizes, and **copy in whatever is already known**;
+    /// 3. *then* sort.
+    ///
+    /// Sorting before the sizes are in means sorting by size with every
+    /// directory reading `None` — which is name order — and nothing afterwards
+    /// puts it right, because `absorb_sizes` re-sorts only when a walk finishes
+    /// and in a directory measured earlier no walk has to.
+    fn arrive(&mut self, target: PathBuf, listed: Vec<Entry>, land_on: Option<OsString>) {
+        self.cwd = target;
+        self.listed = listed;
+        // A filter is about the directory it was typed in.
+        self.filter.clear();
+        self.typing = None;
+        self.cursor = 0;
+        self.notice = None;
+
+        self.here = blank(&self.cwd);
+        self.here.state = self.state_of_cwd();
+
+        self.classify();
+        // After the move, not before: a walk of the directory being left would
+        // go on competing for the pool with the one being entered.
+        self.sizer.request(self.subdirectories());
+        apply_sizes(&self.cwd, &self.sizer, &mut self.listed);
+
+        self.applied = sort(&mut self.listed, self.order, self.reverse);
+        self.entries = self.filtered();
+        self.total_here();
+
+        if let Some(name) = land_on
+            && let Some(at) = self.entries.iter().position(|entry| entry.name == name)
+        {
+            self.cursor = at;
+        }
+    }
+}
+
+/// Copy the sizer's answers onto the directory rows of one listing.
+///
+/// A free function so that it can be handed the listing on its own, before the
+/// filtered view of it exists.
+fn apply_sizes(cwd: &Path, sizer: &Sizer, rows: &mut [Entry]) {
+    for entry in rows {
+        if !entry.is_dir || entry.name == PARENT {
+            continue;
+        }
+        let path = cwd.join(&entry.name);
+        entry.size = sizer.size_of(&path);
+        entry.measuring = sizer.is_measuring(&path);
+        entry.reclaimable = if entry.state == State::Included {
+            // A rule claims the whole thing, so whatever it comes to is what
+            // goes. No walk has to say so, and the figure is right from the
+            // first frame rather than at the end of one.
+            entry.size
+        } else {
+            sizer.reclaimable_of(&path)
+        };
+    }
+}
+
+/// The current directory as a row, before anything is known about its contents.
+///
+/// The name is the directory's own, or the whole path at a filesystem root,
+/// where there is no last component to show.
+fn blank(cwd: &Path) -> Entry {
+    let metadata = std::fs::metadata(cwd).ok();
+
+    Entry {
+        name: cwd
+            .file_name()
+            .map(OsString::from)
+            .unwrap_or_else(|| OsString::from(cwd.as_os_str())),
+        is_dir: true,
+        size: None,
+        modified: metadata.as_ref().and_then(|m| m.modified().ok()),
+        created: metadata.as_ref().and_then(|m| m.created().ok()),
+        state: State::Untracked,
+        reclaimable: None,
+        measuring: false,
     }
 }
 
@@ -1423,6 +1569,204 @@ mod tests {
         assert!(app.any_rule_applies(), "the new rules are in force");
         assert_eq!(names(&app), before, "and nothing moved");
         assert_eq!(cursor_name(&app), "zulu");
+    }
+
+    /// The bug the user found: a sort chosen in one directory came out as name
+    /// order in the next, because the rows were sorted while every directory
+    /// still read `None` and nothing afterwards put it right.
+    #[test]
+    fn a_chosen_order_survives_walking_into_a_directory_measured_already() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("sub");
+        for (name, bytes) in [("small", 4096usize), ("large", 200_000)] {
+            let inner = sub.join(name);
+            std::fs::create_dir_all(&inner).expect("mkdir");
+            std::fs::write(inner.join("f.bin"), vec![b'x'; bytes]).expect("write");
+        }
+
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        // Sizing `sub` reports everything beneath it on the way, so by now both
+        // of its children are known and entering it starts no walk at all.
+        await_sizes(&mut app);
+        app.sort_by(Order::Size);
+        app.sort_by(Order::Size); // biggest first
+
+        point_at(&mut app, "sub");
+        app.enter();
+
+        // No `absorb_sizes` between: there is nothing to absorb, which is
+        // exactly the case that used to come out unsorted.
+        let directories: Vec<String> = names(&app)
+            .into_iter()
+            .filter(|name| name == "small" || name == "large")
+            .collect();
+        assert_eq!(directories, ["large", "small"]);
+        assert_eq!(app.applied().order, Order::Size, "and the header agrees");
+    }
+
+    /// Everything on this screen was about the directory's contents and nothing
+    /// was about the directory.
+    #[test]
+    fn the_current_directory_is_a_row_of_its_own() {
+        let dir = fixture();
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        await_sizes(&mut app);
+
+        let here = app.here();
+        assert_eq!(here.name, dir.path().file_name().expect("a name"));
+        assert!(here.is_dir);
+        assert!(here.modified.is_some(), "the directory's own timestamp");
+        assert!(
+            !app.entries().iter().any(|entry| entry.name == here.name),
+            "and it is not in the listing: `..` is the way out, not this"
+        );
+    }
+
+    /// Its figures are the sum of what is on screen — measuring `cwd` itself
+    /// would walk every row a second time, through itself.
+    #[test]
+    fn the_current_directory_adds_up_its_listing() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        await_sizes(&mut app);
+
+        let listed: u64 = app
+            .entries()
+            .iter()
+            .filter(|entry| entry.name != PARENT)
+            .filter_map(|entry| entry.size)
+            .sum();
+
+        assert_eq!(app.here().size, Some(listed));
+        assert!(!app.here().measuring, "everything under it has settled");
+        assert!(listed >= 40_960 + 8192);
+    }
+
+    /// While anything below is still being walked, the figure is a lower bound
+    /// and says so.
+    #[test]
+    fn the_current_directory_is_measuring_while_anything_under_it_is() {
+        let dir = fixture();
+
+        let app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+
+        assert!(app.here().measuring, "{:?}", names(&app));
+    }
+
+    /// A rule set that claims something here.
+    fn claiming(root: &Path) -> Rules {
+        Rules::new(
+            vec![Rule {
+                name: "junk".into(),
+                root: Some(root.to_string_lossy().into_owned()),
+                includes: vec!["**/node_modules/".into(), "**/*.pyc".into()],
+                ..Rule::default()
+            }],
+            &UserDirs::default(),
+        )
+        .expect("compiles")
+    }
+
+    /// The question the browser exists to answer: how much of this goes.
+    #[test]
+    fn every_row_says_what_clean_would_take_from_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modules = dir.path().join("app/node_modules");
+        std::fs::create_dir_all(&modules).expect("mkdir");
+        std::fs::write(modules.join("dep.bin"), vec![b'x'; 16_384]).expect("write");
+        std::fs::write(dir.path().join("app/main.rs"), vec![b'x'; 4096]).expect("write");
+        std::fs::write(dir.path().join("stale.pyc"), vec![b'x'; 4096]).expect("write");
+        std::fs::write(dir.path().join("live.py"), vec![b'x'; 4096]).expect("write");
+
+        let mut app =
+            App::open(dir.path(), claiming(dir.path()), now(), UserDirs::default()).expect("open");
+        await_sizes(&mut app);
+        let row = |name: &str| {
+            app.entries()
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from {:?}", names(&app)))
+        };
+
+        // A file the rules claim is claimed whole; one they do not is not.
+        assert_eq!(row("stale.pyc").reclaimable, row("stale.pyc").size);
+        assert_eq!(row("live.py").reclaimable, None);
+
+        // A directory carries what the walk found inside it, which is the junk
+        // and not the source beside it.
+        let app_dir = row("app");
+        assert!(app_dir.reclaimable.is_some_and(|bytes| bytes >= 16_384));
+        assert!(
+            app_dir.reclaimable < app_dir.size,
+            "{:?} of {:?}",
+            app_dir.reclaimable,
+            app_dir.size
+        );
+
+        // And the directory being looked at is the sum of them.
+        assert_eq!(
+            app.here().reclaimable,
+            Some(
+                app_dir.reclaimable.expect("measured")
+                    + row("stale.pyc").reclaimable.expect("claimed")
+            )
+        );
+    }
+
+    /// A directory a rule claims outright goes in full — including the parts of
+    /// it that no pattern would match on their own.
+    #[test]
+    fn a_claimed_directory_is_reclaimable_in_full() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modules = dir.path().join("node_modules");
+        std::fs::create_dir_all(modules.join("dep")).expect("mkdir");
+        std::fs::write(modules.join("dep/f.bin"), vec![b'x'; 16_384]).expect("write");
+
+        let mut app =
+            App::open(dir.path(), claiming(dir.path()), now(), UserDirs::default()).expect("open");
+        await_sizes(&mut app);
+        let row = app
+            .entries()
+            .iter()
+            .find(|entry| entry.name == "node_modules")
+            .expect("listed");
+
+        assert_eq!(row.state, State::Included);
+        assert_eq!(row.reclaimable, row.size);
+        assert!(row.size.is_some_and(|bytes| bytes >= 16_384));
+    }
+
+    /// Every reclaimable figure was worked out against the rules that have just
+    /// been replaced, so keeping them would leave the screen answering the
+    /// question the user changed the rule to stop asking.
+    #[test]
+    fn changing_the_rules_measures_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modules = dir.path().join("node_modules");
+        std::fs::create_dir(&modules).expect("mkdir");
+        std::fs::write(modules.join("dep.bin"), vec![b'x'; 16_384]).expect("write");
+
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        await_sizes(&mut app);
+        let claimed = |app: &App| {
+            app.entries()
+                .iter()
+                .find(|entry| entry.name == "node_modules")
+                .expect("listed")
+                .reclaimable
+        };
+        assert_eq!(claimed(&app), Some(0), "nothing was watching it");
+
+        app.reload_rules(claiming(dir.path()));
+        await_sizes(&mut app);
+
+        assert!(claimed(&app).is_some_and(|bytes| bytes >= 16_384));
     }
 
     /// A rule to compile against, for the dialog tests.

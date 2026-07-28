@@ -87,7 +87,7 @@ disc-tools/
 │       ├── detect.rs   # the one pass that applies them
 │       ├── git.rs      # is there uncommitted work here?
 │       ├── clean.rs    # denylist, tiers, totals → CleanPlan. Writes nothing
-│       ├── measure.rs  # one subtree's bytes; reports each directory as it finishes
+│       ├── measure.rs  # one subtree's bytes and its claim; reports each directory as it finishes
 │       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
 ├── cli/                # disk-tools (bin) — CLI frontend
 │   ├── Cargo.toml      # clap, toml, serde, serde_ignored, indicatif, unicode-width
@@ -130,7 +130,8 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs` | Walk → dedup → aggregate, in that order |
 | `plan(&ScanTree, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | Decides what may go and what that frees. **Writes nothing** |
 | `CleanPlan::merge(Vec<CleanPlan>)` | `core/src/clean.rs` | One plan from several roots. Additive **only because** `Rules::scan_roots` drops nested roots |
-| `measure(root, cancel, finished) -> Measured` | `core/src/measure.rs` | One subtree's bytes. Reports **every directory as that directory finishes**, so an outer walk subsumes the inner ones instead of racing them |
+| `measure(root, claim, cancel, finished) -> Measured` | `core/src/measure.rs` | One subtree's bytes **and what the rules claim of them**, from one walk. Reports **every directory as that directory finishes**, so an outer walk subsumes the inner ones instead of racing them |
+| `Claim` | `core/src/measure.rs` | The rules, `now`, and whether `root` is *already* claimed — without the last, a walk of a `node_modules` reports nothing reclaimable, since nothing inside one matches `**/node_modules/` |
 | `apply(&CleanPlan, Removal, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. `Removal::Trash` batches; `Removal::Purge` deletes outright |
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
@@ -182,7 +183,20 @@ Invariants worth keeping in mind:
 - **A measured total is keyed on its absolute path**, never on the row it came
   from. That is what lets a walk outlive the screen moving on, and it is why the
   browser has no generation counter: a stale answer is not wrong, it is just
-  about somewhere else.
+  about somewhere else. **A rule change is the exception** — `Sizer`'s `epoch`
+  drops answers measured against rules no longer in force, which is a different
+  question rather than a different place.
+- **Sizes are copied onto the rows before they are sorted.** Sorting first and
+  filling the column in after leaves "by size" showing name order in any
+  directory measured earlier, because `absorb_sizes` re-sorts only when a walk
+  finishes and there no walk has to run. `App::arrive` is the one place that
+  orders classify → request → apply → sort.
+- **The current directory is a row, not the `..` row.** `..` is the way out;
+  `App::here` is what the screen is about. Its figures are the sum of the
+  listing — walking `cwd` would cover every row a second time, through them.
+- **A fixed column is as wide as its label plus a sort arrow.** `created↑` in a
+  seven-wide column shifted every separator after it, in the header only, and
+  only while that column sorted.
 - **The TUI cancels only what the user asks it to** (`r`) and what exit
   requires. Cancelling on navigation destroyed work that was about to be wanted.
 - **The config file is edited, never regenerated.** `toml_edit` keeps comments,

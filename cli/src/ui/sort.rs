@@ -129,6 +129,7 @@ mod tests {
             modified: Some(at(1_000)),
             created: Some(at(1_000)),
             state: disk_tools_core::State::Untracked,
+            reclaimable: None,
             measuring: false,
         }
     }
@@ -141,6 +142,7 @@ mod tests {
             modified: Some(at(1_000)),
             created: Some(at(1_000)),
             state: disk_tools_core::State::Untracked,
+            reclaimable: None,
             measuring: false,
         }
     }
