@@ -2,25 +2,24 @@
 
 Cross-platform disk-utilities CLI in Rust, distributed as `disk-tools`. It finds
 what eats disk space — a fast parallel scan printing a dust-style size-sorted
-tree — and, as of v0.2, offers to clean it up: `disk-tools clean` detects
-regenerable junk and stale files and removes them **to the OS trash**, dry-run by
-default.
+tree — offers to clean it up (`disk-tools clean` detects regenerable junk and
+stale files and removes them **to the OS trash**, dry-run by default), and browses
+it interactively (`disk-tools ui`).
 
-**v0.1 (scan + tree report) and v0.2 (detectors + cleanup engine) are complete;
-v0.3 (config + declarative rules) is complete.** Detection is declarative and
+**v0.1 (scan + tree report), v0.2 (detectors + cleanup engine), v0.3 (config +
+declarative rules) and v0.4 (the TUI) are complete.** Detection is declarative and
 reads a TOML config; flags beat the file; `clean` walks the rule roots when given
-no path; `--apply` refuses while anything not regenerable is in the plan. A TUI
-follows on the same core. A TUI follows on
-the same core. See the
+no path; `--apply` refuses while anything not regenerable is in the plan. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
 [v0.1](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md),
 [v0.2](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md) and
 [v0.3](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md) specs are
 the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
-(the TUI) has Tasks 1-4 of 7 done — `disk-tools ui` browses a directory as a
-table, sizes its subdirectories in the background, colours them by what the
-rules say, filters with `/`, and always gives the terminal back. User-facing usage, flags, the safety model and
+(the TUI) **is complete** — `disk-tools ui` browses a directory as a table, sizes
+its subdirectories in the background, colours them by what the rules say, filters
+with `/`, writes rules back to `config.toml` with every comment intact, and
+always gives the terminal back. v0.5 is duplicates. User-facing usage, flags, the safety model and
 the documented limitations live in the [README](README.md).
 
 ## Important: Documentation Requirements
@@ -95,13 +94,15 @@ disc-tools/
 │   ├── src/
 │   │   ├── main.rs     # verb dispatch (scan | clean); spinner to stderr
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
-│   │   ├── config.rs   # locate/parse/validate the TOML file; `config init`
+│   │   ├── config/     # locate/parse/validate the TOML file; `config init`
+│   │   │   └── write.rs    # putting a rule back, comments and all
 │   │   ├── ui/         # the TUI
 │   │   │   ├── term.rs     # restores the terminal on every path
 │   │   │   ├── app.rs      # cwd, cursor, order, filter — every key as a function
 │   │   │   ├── listing.rs  # one directory, one metadata call per entry
 │   │   │   ├── sort.rs     # four orders; reports the one it could apply
 │   │   │   ├── layout.rs   # the table: which columns fit, and what is in them
+│   │   │   ├── edit.rs     # the rule form and its chooser, as values
 │   │   │   └── measure.rs  # the sizing worker, its queue and its session cache
 │   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
 │   │   └── render/
@@ -184,6 +185,11 @@ Invariants worth keeping in mind:
   about somewhere else.
 - **The TUI cancels only what the user asks it to** (`r`) and what exit
   requires. Cancelling on navigation destroyed work that was about to be wanted.
+- **The config file is edited, never regenerated.** `toml_edit` keeps comments,
+  spacing and key order; serialising the parsed form would throw away the
+  explanations that make the file worth having. An **absent `[[rules]]` means
+  "leave the built-ins alone"**, so adding the first rule writes them out too
+  rather than silently turning five rules into one.
 - **A colour and a candidate are decided by the same code.** `detect::claim` and
   `Rules::state` both run `matching` → `excluded` → `predicates_hold`, in that
   order. A `target/` with no `Cargo.toml` beside it is `in scope`, not
@@ -218,7 +224,7 @@ What configuration exists beyond that is build-time:
 |------|-------|
 | `Cargo.toml` (workspace) | `version`, `edition = "2024"`, `rust-version = "1.88"`, inherited by both crates |
 | `core/Cargo.toml` | The optional `serde` feature; `windows-sys` under `[target.'cfg(windows)'.dependencies]` |
-| `cli/Cargo.toml` | Enables the core's `serde` feature for `--json` |
+| `cli/Cargo.toml` | Enables the core's `serde` feature for `--json`; `toml_edit` for writing rules back |
 | `.gitattributes` | `* text=auto eol=lf` — a CRLF checkout would fail `cargo fmt --check` on Windows |
 
 `.gitignore` also lists `.env`, `.direnv/`, `chat/` and `logs/`; none of these
@@ -235,7 +241,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 
 | Folder | Purpose | Latest snapshot |
 |--------|---------|-----------------|
-| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.26` |
+| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.27` |
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
 | `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.26` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
@@ -250,6 +256,7 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 ## Documentation
 
 **Architecture** (snapshots from `kb/architecture/2026.07/`)
+- [After v0.4: the browser, and why it does not scan](kb/architecture/2026.07/2026.07.27-tui-lazy-model.md) — the lazy model, what replaced the generation counter, what four rounds of real use found
 - [After v0.3: detection as data](kb/architecture/2026.07/2026.07.26-overview.md) — the rule engine, the config path, multi-root `clean`, which invariants moved
 - [Overview](kb/architecture/2026.07/2026.07.25-overview.md) — the three-phase pipeline, data model, invariants, platform splits
 - [Rust crate structure](kb/architecture/2026.07/2026.07.25-rust-crates.md) — workspace, feature flags, unsafe policy

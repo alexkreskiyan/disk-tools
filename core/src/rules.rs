@@ -285,6 +285,21 @@ impl Rules {
     }
 
     /// Is this rule list empty of anything that could ever match?
+    /// Every rule's name, in list order — which is precedence order, and so the
+    /// order worth showing.
+    pub fn names(&self) -> Vec<String> {
+        self.rules.iter().map(|rule| rule.name.clone()).collect()
+    }
+
+    /// The rules themselves, to be edited and recompiled.
+    ///
+    /// Only the ones that survived compilation: a rule dropped for an
+    /// unresolvable root is not here, and handing it back would let a browser
+    /// silently rewrite the file without it.
+    pub fn to_vec(&self) -> Vec<Rule> {
+        self.rules.clone()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }

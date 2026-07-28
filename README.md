@@ -4,19 +4,23 @@ Find what's eating your disk. `disk-tools` walks a directory tree in parallel,
 measures **real on-disk (allocated) size**, and prints a size-sorted tree of the
 biggest consumers — or JSON.
 
-**v0.3 — scan, a cleanup engine, and a config file.** `disk-tools clean` finds
-regenerable junk and stale files and offers to remove them **to the OS trash**.
-It is a dry run by default: nothing is deleted without `--apply`.
+**v0.4 — scan, a cleanup engine, a config file, and a browser.**
+`disk-tools clean` finds regenerable junk and stale files and offers to remove
+them **to the OS trash**. It is a dry run by default: nothing is deleted without
+`--apply`.
 
-What counts as junk is no longer fixed. Detection is a list of rules you can
-read and edit — `disk-tools config init` writes the defaults out with their
-comments — and a rule can be narrowed to a directory, given a size floor, or
-written from scratch. A TUI comes next, on the same core. See the
-[concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
-the specs for the
+What counts as junk is not fixed. Detection is a list of rules you can read and
+edit — `disk-tools config init` writes the defaults out with their comments —
+and a rule can be narrowed to a directory, given a size floor, or written from
+scratch. `disk-tools ui` walks the same rules interactively: it colours every
+row by what they say about it, sizes directories in the background, and can
+**write a rule back to the config file** without disturbing what is already
+there. See the [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the
+full vision and the specs for the
 [scanner](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md),
-the [cleanup engine](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md)
-and [configuration](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md).
+the [cleanup engine](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md),
+[configuration](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md)
+and the [browser](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md).
 
 Cross-platform: macOS, Linux, Windows.
 
@@ -43,7 +47,8 @@ There are no published binaries yet — see the concept's *Distribution — defe
 for what packaging will involve.
 
 Requires Rust **1.88** or newer (edition 2024, pinned as `rust-version` in the
-workspace manifest).
+workspace manifest and enforced by a CI job). 1.88 rather than something older
+because `ratatui` 0.30.2 needs it; before the browser the floor was 1.85.
 
 ## Usage
 
@@ -57,7 +62,7 @@ Three verbs, and a bare `disk-tools` prints help rather than guessing:
 |---|---|
 | `disk-tools scan <PATH>` | measure and report |
 | `disk-tools clean <PATH>` | find removable junk |
-| `disk-tools ui <PATH>` | interactive browser — *planned, v0.4* |
+| `disk-tools ui [PATH]` | interactive browser; defaults to the current directory |
 
 The path is **always explicit** — `disk-tools` never scans the current directory by
 accident.
@@ -122,6 +127,138 @@ $ disk-tools scan project --depth 1
 1 entry skipped:
   project/locked (permission denied)
 ```
+
+## Browsing
+
+`disk-tools ui [PATH]` opens a browser over the same core. No path means the
+directory you are in.
+
+```
+~/Projects                                    ← where you are, and any notice
+    size │ name↑          │ created │ modified │ total
+   1.2G  │ old-app/       │      2y │      11m │ ████    38%
+       ⠹ │ current/       │     30d │      2h  │
+    4.0K │ README.md      │     30d │      2h  │
+rules: included  excluded  in scope  untracked
+q quit  ↵ enter  ← up  / filter  a rules  n/s/c/m sort  r sizes  R config
+```
+
+### Keys
+
+| Key | Does |
+|-----|------|
+| `↑` `↓`, `j` `k` | Move |
+| `PgUp` `PgDn`, `Home` `End` | A screenful, or the whole way |
+| `↵`, `l`, `→` | Enter the directory. On a file, nothing |
+| `←`, `h`, `Backspace` | Up one level, landing on the directory you left |
+| `n` `s` `c` `m` | Sort by name, size, created, modified — one press from anywhere. The same key again reverses |
+| `/` | Filter this listing. Letters narrow it as you type, `↵` keeps it, `Esc` drops it |
+| `a` | The rules for the row under the cursor: add one, or edit one that exists |
+| `r` | Measure this directory's subdirectories again |
+| `R` | Read `config.toml` again |
+| `q` | Leave |
+
+The parent row (`..`) is an ordinary entry, so `↵` on it goes up. It is never
+filtered away — a screen where no key does anything would be worse than a
+listing that shows one row you did not ask for.
+
+### Sizes arrive while you watch
+
+A directory's size costs a walk of everything beneath it, so it is computed in
+the background. A spinner sits beside the figure while it climbs, and the `total`
+column fills in when it settles.
+
+Three things follow from that, and all three are deliberate:
+
+- **Percentages are against the sum of what is known**, not against a parent
+  total. That total would cost a second walk of the level above and nobody asked
+  for it. A directory still being measured is left out of both sides, so the
+  denominator does not drift under the rows that have settled.
+- **Navigating away does not cancel anything.** A walk in flight is a walk that
+  will be wanted; it finishes, and its answer is there when you come back.
+- **Totals are kept for the session.** Stepping in and out of a directory does
+  not recompute it, and a walk of one directory records everything beneath it —
+  so entering a directory that has been measured is free, at any depth. `r` is
+  how you say the disk has changed.
+
+Ages are relative (`2h`, `30d`, `2y`) rather than dates. A date needs a timezone
+and nothing here can supply one; `SystemTime` is UTC, and printing UTC to
+someone browsing their own disk is wrong by up to half a day without saying so.
+
+### The four states
+
+Every row is coloured by what the configured rules say about it.
+
+| State | Colour | Means |
+|-------|--------|-------|
+| `included` | yellow | A rule claims it — this is what `clean` would offer to remove |
+| `excluded` | green | A rule names it to be left alone |
+| `in scope` | blue | Inside some rule's territory, matched by none of its patterns |
+| `untracked` | plain | No rule's root contains it. Nothing is watching this |
+
+`in scope` is a state of its own rather than a shade of `untracked`, because "my
+rule does not cover this" and "my rule is not running" are different problems
+with different fixes. A rule that could not be compiled — disabled, an
+unresolvable `~` — is not in force, so its territory reads as `untracked`.
+
+The legend appears only when something in the current directory is under a rule.
+Every state carries its word as well as its colour: a row of swatches is no
+legend to a reader who cannot tell them apart.
+
+`included` means exactly *`clean` would claim this*. The browser runs the same
+`includes` → `excludes` → predicates sequence `clean` does, so a `target/` with
+no `Cargo.toml` beside it shows as `in scope`, not as junk. One predicate is
+deliberately not consulted: `requires-clean-repo` costs a `git status` per
+repository, and it is a question about whether `clean` will *act*, not about
+whether a rule claims the path.
+
+### Editing rules
+
+`a` on a row lists the rules with *new* at the top, and opens a form on whichever
+you pick. A new rule arrives rooted where you are and matching what you marked,
+with `~` used where it applies — a rule rooted at `/Users/you/Projects` stops
+working the moment the config is used anywhere else.
+
+Every field of a rule is editable. `min-size` and `older-than` are read back as
+you type (`10M` → `= 10485760 bytes`); the rest is checked on `↵`, because a
+name is only a duplicate against the rules around it. A rejected form **stays
+open with the field marked and everything you typed intact**.
+
+`Esc` closes without writing. `↵` writes.
+
+### The browser writes your config file
+
+This is the part to know before you hand-edit `config.toml`.
+
+- **Comments survive.** The file is edited in place with `toml_edit`, not
+  regenerated: comments, spacing and key order are kept, including the trailing
+  comment on the line being changed. Editing one rule does not touch its
+  neighbours.
+- **Keys that fall back to a default are removed.** A rule that no longer needs
+  `requires-sibling` loses the key rather than keeping a stale one. `tier` is
+  the exception and is always written out — it decides whether `--apply` takes
+  something without asking, and a setting that consequential should not be
+  invisible.
+- **Adding the first rule to a file with no `[[rules]]` writes the built-ins out
+  too.** An absent `[[rules]]` means "leave the built-ins alone", so appending
+  one table would silently turn five rules into one. The browser says when it
+  has done this. (`rules = []` is the opposite statement and is left alone.)
+- **The write is atomic** — a neighbouring file and a rename — so an interrupted
+  save cannot leave a truncated config that the next run refuses to start on.
+- **The file is written before the screen recolours.** A save that fails leaves
+  the form open with the reason in it, rather than showing you a rule that is
+  not on disk.
+
+`R` re-reads the file, so an edit made in `$EDITOR` shows up without restarting.
+A file that has become invalid leaves the rules already in force alone and says
+why — dropping them would make a typo look exactly like "my rules stopped
+matching", which is the thing you would be there to diagnose.
+
+### What it will not do
+
+`ui` needs a terminal and refuses a pipe with a sentence rather than escape
+sequences; use `scan` or `clean` for something you can redirect. It never
+deletes: removal is `clean`'s, with its dry run, its tiers and its denylist.
 
 ## Cleaning up
 
@@ -430,6 +567,13 @@ the space went.
 `--json` always emits the **full** tree with raw byte counts; the display filters
 apply to the tree report only.
 
+`disk-tools ui [PATH]`:
+
+| Flag | Effect |
+|------|--------|
+| `[PATH]` | Directory to open. Optional — defaults to the current directory, which is the one case where guessing is what you meant |
+| `--config <PATH>` | The config file to read the rules from, and to write them back to |
+
 ## How sizes are measured
 
 - **Allocated (default)** — what the file actually occupies on disk: `blocks × 512`
@@ -505,6 +649,8 @@ Cleanup, first — these are the ones worth reading before `--apply`:
 | **Removing to the trash costs ~230 ms per batch on macOS** | Every trash operation is an `osascript` round-trip to Finder. Removals are batched into one call, so the cost is per *run* rather than per candidate — 60 small directories take 1.4 s, against 0.02 s for `--purge`. |
 | **A dry run costs ~23 ms per repository** | The git guard spawns `git status --porcelain` once per repository. Over 50 dirty Rust projects a `clean` is 1.2 s against 15 ms for a plain scan — 80×. `--allow-dirty` skips it entirely and is free. [Measured.](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) |
 | **`--apply` refuses rather than prompting** | For the `confirm` tier it stops and asks you to add `--safe` or `--yes`, rather than asking about each path. A real prompt needs stdin, TTY detection and a story for piped input, which belongs with the interactive browser. See [Removing](#removing). |
+| **The browser writes your config file** | `a` then `↵` edits `config.toml` in place. Comments survive and neighbouring rules are untouched, but it is a program editing a file you may also be editing — `R` re-reads, and there is no merge. See [The browser writes your config file](#the-browser-writes-your-config-file). |
+| **Row colours do not consult `requires-clean-repo`** | `included` means the rule's patterns and its cheap predicates match. Whether `clean` will actually act also depends on the git guard, which costs a `git status` per repository and is not run per row. A yellow row inside a dirty repository is still refused by `clean`, with a reason. |
 | **`auto` on a rule you wrote is unverified** | The tool takes your word that the content regenerates, and removes it without asking. For the five built-in rules `auto` is this project's claim; for yours it is yours. See [Two tiers](#four-things-stand-between-a-match-and-a-deletion). |
 
 And the scanner's, unchanged from v0.1:
@@ -514,7 +660,7 @@ And the scanner's, unchanged from v0.1:
 | **APFS copy-on-write clones are overcounted** | On macOS, a cloned file (`cp -c`, Finder duplicate, many build tools) shares its blocks with the original, but each copy reports its *full* allocated size. A tree of clones therefore sums well above what deleting it would actually reclaim. Detecting shared extents needs per-file `fcntl` probing and is out of scope for v0.1. |
 | `--one-file-system` does nothing on Windows | Mount-boundary detection needs a device id per *candidate directory*; the walk has the volume serial of the directory it is listing, not of the subdirectory it is about to enter. The flag is accepted and silently has no effect off Unix. |
 | Long UNC paths may be skipped on Windows | Affects only the per-file fallback used when the directory listing does not cover an entry: there, only `C:\`-style drive paths get the `\\?\` prefix that lifts the `MAX_PATH` limit, so a longer `\\server\share\…` path can end up skipped. |
-| The whole tree is held in memory | An accepted trade-off — directory totals and the planned interactive TUI both need the full tree. Costs **≈ 630 bytes per entry**: 1.4 GB for a 2.2M-entry scan (measured, see [Benchmarks](#benchmarks)). |
+| `scan` holds the whole tree in memory | An accepted trade-off: directory totals need it. Costs **≈ 630 bytes per entry** — 1.4 GB for a 2.2M-entry scan (measured, see [Benchmarks](#benchmarks)). The browser does **not** work this way; it lists one directory at a time and keeps only the totals it has computed, which is a path and a `u64` per directory visited. |
 
 ## Development
 
@@ -530,7 +676,9 @@ rather than as ad-hoc commands.
 | `just test` | `cargo test --workspace` |
 | `just fmt` / `just fmt-check` | `cargo fmt --all` / `--check` |
 | `just lint` | Clippy, warnings as errors |
-| `just verify` | Pre-commit gate: `fmt-check` + `lint` + `test` |
+| `just lint-windows` | The same against `x86_64-pc-windows-msvc`. Clippy only sees what the host compiles, so `#[cfg(windows)]` code is otherwise linted by CI alone — which is how one lint reached `main` |
+| `just verify` | Pre-commit gate: `fmt-check` + `lint` + `lint-windows` + `doc` + `check-minimal` + `test` |
+| `just smoke-trash` | The `#[ignore]`d tests that move real files to the OS trash |
 | `just check` | `cargo check --workspace --all-targets` (CI runs it pinned to the MSRV) |
 | `just bench-fixtures <dir>` | Generate the benchmark fixtures (~28 GB) |
 | `just bench <dir>` | Benchmark against `du -sh` and `diskus` (needs `hyperfine`, `diskus`) |
