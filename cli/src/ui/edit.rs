@@ -74,7 +74,7 @@ impl Field {
             Field::Root => "a directory, or * for anywhere the scan goes",
             Field::Includes => "globs, comma-separated; a trailing / means directories only",
             Field::Excludes => "globs this rule declines, comma-separated",
-            Field::RequiresSibling => "file names that must sit beside a match, e.g. Cargo.toml",
+            Field::RequiresSibling => "globs that must each match a file beside it, e.g. *.csproj",
             Field::RequiresCleanRepo => "refuse while the git repository has uncommitted work",
             Field::MinSize => "skip anything smaller, e.g. 10M; empty for no floor",
             Field::OlderThan => "only if untouched this long, e.g. 30d; empty for any age",

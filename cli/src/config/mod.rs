@@ -78,6 +78,15 @@ safe                 = false    # as if --safe were always passed
 # A trailing `/` in `includes` means directory only, as in gitignore — which is
 # why `**/*.pyc` matches files and `**/node_modules/` does not match a file of
 # that name.
+#
+# `requires-sibling` is a glob matched against the file names *beside* a match,
+# and each pattern given has to find something of its own. It is a glob because
+# most build systems name their marker after the project — the file that proves
+# a `bin/` is .NET output is `Whatever.csproj`. A pattern with no metacharacters
+# matches itself, so "Cargo.toml" still means exactly that.
+#
+#   requires-sibling = "*.csproj"                   # a .NET project lives here
+#   requires-sibling = ["*.csproj", "*.sln"]        # and a solution beside it
 
 [[rules]]
 name                = "rust-target"

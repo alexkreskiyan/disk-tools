@@ -137,7 +137,7 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
 | `Rule` / `Rules` | `core/src/rules.rs` | Detection as data. **List order is precedence**; a rule that cannot be expressed matches nothing |
 | `Rules::state -> State` | `core/src/rules.rs` | Why a row is that colour: `untracked` / `in scope` / `included` / `excluded`. Shares `matching`, `excluded` **and `predicates_hold`** with `detect`, so `included` means exactly "detect would claim this" |
-| `Facts` | `core/src/rules.rs` | What the caller already knows — siblings, mtime, `now` — so the non-glob predicates need no filesystem and no clock |
+| `Facts` | `core/src/rules.rs` | What the caller already knows — siblings, mtime, `now` — so the other predicates need no filesystem and no clock. `any_sibling` is a *predicate over names*, not a name: `requires_sibling` is a glob and only `Rules` has it compiled |
 | `DetectOptions` / `Detection` | `core/src/detect.rs` | The pass's input and output. `now` is mandatory, so a rule's `older_than` can never be half-armed |
 | `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason; `filtered_out` / `too_small` count the user's own narrowings |
 | `CleanOutcome` | `core/src/trash.rs` | `removed` / `failed` / `reclaimed` — never a `Result` |
@@ -163,6 +163,11 @@ Invariants worth keeping in mind:
   one thing no rule, flag or config can reach.**
 - **A rule that cannot be expressed matches nothing** — disabled, an unresolvable
   `~`, a non-UTF-8 root. Unknown reads as *no*, never as *any*.
+- **`requires_sibling` is a glob over file names, matched `all`.** Outside Cargo
+  no build system offers a fixed marker name — a `bin/` is proven by
+  `Whatever.csproj` — and an exact comparison made the field silently claim
+  nothing. Separate matchers rather than one `GlobSet`, because two required
+  siblings are two questions and a set could only say *something* matched.
 - **`deny(unsafe_code)` is exempted per function, never per module** — four
   `#[cfg(windows)]` functions, each listed in `core/src/lib.rs`.
 - **`--apply` refuses while a confirm-tier candidate remains,** unless `--safe`

@@ -25,7 +25,7 @@ use super::measure::Sizer;
 use super::sort::{Applied, Order, sort};
 use crate::config::write;
 use disk_tools_core::{Facts, Rule, Rules, State, UserDirs};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -357,7 +357,8 @@ impl App {
         // actually there — the same question `detect` asks, answered the same
         // way.
         let siblings: Vec<OsString> = self.listed.iter().map(|e| e.name.clone()).collect();
-        let has_sibling = |name: &str| siblings.iter().any(|beside| beside == name);
+        let any_sibling =
+            |wanted: &dyn Fn(&OsStr) -> bool| siblings.iter().any(|beside| wanted(beside));
 
         let states: Vec<State> = self
             .listed
@@ -375,7 +376,7 @@ impl App {
                         is_dir: entry.is_dir,
                         modified: entry.modified,
                         now: self.now,
-                        has_sibling: &has_sibling,
+                        any_sibling: &any_sibling,
                     },
                 )
             })
@@ -394,15 +395,16 @@ impl App {
 
     /// What the rules make of the directory being looked at.
     ///
-    /// Its siblings are read from the parent by name rather than from a listing,
-    /// because the browser has not read the parent and reading it to colour one
-    /// row would cost a whole directory for a question about a handful of names.
+    /// Answering `requires_sibling` here means reading the parent, which the
+    /// browser has not read. That is one listing per arrival, and only when some
+    /// rule in force actually asks — most rule sets never do, and a directory
+    /// read to answer a question nobody posed is a directory read for nothing.
     fn state_of_cwd(&self) -> State {
-        let parent = self.cwd.parent().map(Path::to_path_buf);
-        let has_sibling = |name: &str| match &parent {
-            Some(parent) => parent.join(name).exists(),
-            None => false,
+        let beside: Vec<OsString> = match self.cwd.parent() {
+            Some(parent) if self.rules.wants_siblings() => names_in(parent),
+            _ => Vec::new(),
         };
+        let any_sibling = |wanted: &dyn Fn(&OsStr) -> bool| beside.iter().any(|name| wanted(name));
 
         self.rules.state(
             &self.cwd,
@@ -410,7 +412,7 @@ impl App {
                 is_dir: true,
                 modified: self.here.modified,
                 now: self.now,
-                has_sibling: &has_sibling,
+                any_sibling: &any_sibling,
             },
         )
     }
@@ -812,6 +814,16 @@ fn apply_sizes(cwd: &Path, sizer: &Sizer, rows: &mut [Entry]) {
             sizer.reclaimable_of(&path)
         };
     }
+}
+
+/// The entry names in a directory, or none if it cannot be read.
+///
+/// Names only — no `metadata` call — because the only question being asked of
+/// them is what they are called.
+fn names_in(dir: &Path) -> Vec<OsString> {
+    std::fs::read_dir(dir)
+        .map(|listing| listing.flatten().map(|entry| entry.file_name()).collect())
+        .unwrap_or_default()
 }
 
 /// The current directory as a row, before anything is known about its contents.

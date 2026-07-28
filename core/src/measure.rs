@@ -32,7 +32,7 @@
 use crate::rules::{Facts, Rules, State};
 use crate::size::allocated_size;
 use rayon::prelude::*;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -306,7 +306,8 @@ fn level(dir: &Path, claim: Option<&Claim<'_>>, cancel: &AtomicBool) -> Option<L
         });
     };
 
-    let has_sibling = |name: &str| names.iter().any(|beside| beside == name);
+    let any_sibling =
+        |wanted: &dyn Fn(&OsStr) -> bool| names.iter().any(|beside| wanted(beside.as_os_str()));
     let mut reclaimable = 0u64;
     let mut subdirs = Vec::new();
     for row in rows {
@@ -318,7 +319,7 @@ fn level(dir: &Path, claim: Option<&Claim<'_>>, cancel: &AtomicBool) -> Option<L
                 is_dir: row.is_dir,
                 modified: row.modified,
                 now: claim.now,
-                has_sibling: &has_sibling,
+                any_sibling: &any_sibling,
             },
         ) == State::Included;
 

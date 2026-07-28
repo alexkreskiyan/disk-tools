@@ -508,7 +508,7 @@ name                = "github-node-modules"
 root                = "~/Projects/github"   # "*" means wherever the scan goes
 includes            = ["**/node_modules/"]  # trailing / is directory-only
 excludes            = ["**/vendor/**"]
-requires-sibling    = "Cargo.toml"          # a file that must be beside a match
+requires-sibling    = "*.csproj"            # a glob that must match a file beside it
 requires-clean-repo = true                  # skip if the repo has uncommitted work
 older-than          = "90d"
 min-size            = "10M"
@@ -523,6 +523,22 @@ five built-ins say.
 A trailing `/` in `includes` means **directory only**, as in gitignore. That is
 why `**/*.pyc` matches files and `**/node_modules/` does not match a file of that
 name.
+
+`requires-sibling` is matched against the **file names beside** a match, and is
+a **glob** rather than a name: outside Cargo, build systems name their marker
+after the project, so the file that proves a `bin/` is .NET output is
+`Whatever.csproj`. Give a list and each pattern has to find something of its own
+— `["*.csproj", "*.sln"]` wants both. A pattern with no metacharacters matches
+itself, so `Cargo.toml` still means exactly that, and `NotCargo.toml` is not it.
+
+```toml
+[[rules]]
+name             = "csharp-bin"
+root             = "~/Projects"
+includes         = ["**/bin/", "**/obj/"]
+requires-sibling = "*.csproj"
+tier             = "auto"
+```
 
 `~`, `%LOCALAPPDATA%` and `%APPDATA%` are expanded from your environment. **A
 token that cannot be resolved disables its rule** rather than widening it — an
