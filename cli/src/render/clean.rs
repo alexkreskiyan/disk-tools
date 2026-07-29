@@ -16,8 +16,11 @@
 
 use super::tree::format_size;
 use crate::args::{Intent, Report, Sort};
-use disk_tools_core::{Candidate, CleanOutcome, CleanPlan, ExcludeReason, Excluded, Tier};
+use disk_tools_core::{
+    Candidate, CleanOutcome, CleanPlan, ExcludeReason, Excluded, ScanNode, ScanTree, Tier,
+};
 use std::fmt::Write;
+use std::path::Path;
 
 /// Render the plan for a human.
 ///
@@ -30,6 +33,7 @@ pub fn render_clean(
     hidden_by_safe: Option<usize>,
     intent: Intent,
     report: Report,
+    inside: &[ScanTree],
 ) -> String {
     let mut out = String::new();
 
@@ -41,7 +45,13 @@ pub fn render_clean(
         if report.depth == 0 {
             write_rules(&plan.candidates, report.sort, &mut out);
         } else {
-            write_candidates(&plan.candidates, report.sort, &mut out);
+            write_candidates(
+                &plan.candidates,
+                report.sort,
+                report.depth,
+                inside,
+                &mut out,
+            );
         }
         let _ = writeln!(out);
         write_total(plan, &mut out);
@@ -277,7 +287,13 @@ struct Group<'a> {
     allocated: u64,
 }
 
-fn write_candidates(candidates: &[Candidate], sort: Sort, out: &mut String) {
+fn write_candidates(
+    candidates: &[Candidate],
+    sort: Sort,
+    depth: usize,
+    inside: &[ScanTree],
+    out: &mut String,
+) {
     // Borrowed and sorted here rather than in the plan. `CleanPlan.candidates`
     // is ordered by path so that two runs over one tree produce identical
     // plans, and that is worth more than saving this sort.
@@ -316,7 +332,72 @@ fn write_candidates(candidates: &[Candidate], sort: Sort, out: &mut String) {
             rw = rule_width,
             tw = tier_width,
         );
+
+        // Level 1 is the candidate; everything past it is inside one. A
+        // candidate is removed **whole**, so this changes no decision — it
+        // answers "why is this four gigabytes", which is worth one flag value
+        // and no more.
+        if depth > 1
+            && let Some(node) = find(inside, &candidate.path)
+        {
+            write_inside(node, depth - 1, 1, sort, out);
+        }
     }
+}
+
+/// One candidate's contents, `levels` deep.
+fn write_inside(node: &ScanNode, levels: usize, indent: usize, sort: Sort, out: &mut String) {
+    if levels == 0 {
+        return;
+    }
+
+    let mut children: Vec<&ScanNode> = node.children.iter().collect();
+    match sort {
+        Sort::Name => children.sort_by(|a, b| a.path.cmp(&b.path)),
+        Sort::Size => {
+            children.sort_by(|a, b| b.allocated.cmp(&a.allocated).then(a.path.cmp(&b.path)));
+        }
+    }
+
+    for child in children {
+        let name = child
+            .path
+            .file_name()
+            .unwrap_or(child.path.as_os_str())
+            .to_string_lossy();
+        let _ = writeln!(
+            out,
+            "{size:>8}  {blank:indent$}{name}{mark}",
+            size = format_size(child.allocated),
+            blank = "",
+            indent = indent * 2,
+            mark = if child.is_dir { "/" } else { "" },
+        );
+        write_inside(child, levels - 1, indent + 1, sort, out);
+    }
+}
+
+/// The node a candidate stands for, in whichever tree it came from.
+///
+/// The trees are handed in beside the plan rather than folded into it: a
+/// `CleanPlan` that owned subtrees would be a plan carrying the whole scan
+/// result — 1.4 GB on a real home — and `--json` would then have to decide
+/// whether to serialise it. `None` when the caller did not keep them, which is
+/// every run below `-d 2`.
+fn find<'a>(trees: &'a [ScanTree], path: &Path) -> Option<&'a ScanNode> {
+    trees.iter().find_map(|tree| descend(&tree.root, path))
+}
+
+fn descend<'a>(node: &'a ScanNode, path: &Path) -> Option<&'a ScanNode> {
+    if node.path == path {
+        return Some(node);
+    }
+    // Component-wise, so `/p/app-old` is not mistaken for something under
+    // `/p/app` — the same comparison the denylist is careful about.
+    if !path.starts_with(&node.path) {
+        return None;
+    }
+    node.children.iter().find_map(|child| descend(child, path))
 }
 
 /// The total, labelled honestly.
@@ -406,6 +487,22 @@ fn listed() -> Report {
     }
 }
 
+/// The renderer with nothing to unfold, which is every level up to and
+/// including the listing.
+///
+/// The trees are only consulted past depth 1, so a test about the listing, the
+/// totals or the footers has nothing to hand over — and passing an empty slice
+/// at twenty call sites would say the same thing twenty times.
+#[cfg(test)]
+fn rendered(
+    plan: &CleanPlan,
+    hidden_by_safe: Option<usize>,
+    intent: Intent,
+    report: Report,
+) -> String {
+    render_clean(plan, hidden_by_safe, intent, report, &[])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,7 +552,7 @@ mod tests {
     /// is asked of any one path.
     #[test]
     fn depth_zero_is_one_line_per_rule() {
-        let report = render_clean(&spread(), None, Intent::Preview, at(0, Sort::Name));
+        let report = rendered(&spread(), None, Intent::Preview, at(0, Sort::Name));
 
         let rows: Vec<&str> = report.lines().take_while(|line| !line.is_empty()).collect();
         assert_eq!(rows.len(), 2, "one per rule, not per candidate: {report}");
@@ -486,7 +583,7 @@ mod tests {
         ]
         .into_iter()
         .map(|report| {
-            render_clean(&spread(), None, Intent::Preview, report)
+            rendered(&spread(), None, Intent::Preview, report)
                 .lines()
                 .find(|line| line.starts_with("Reclaimable:"))
                 .expect("a total")
@@ -502,7 +599,7 @@ mod tests {
     /// reader does in their head between the two levels.
     #[test]
     fn the_groups_sum_to_what_the_candidates_come_to() {
-        let grouped = render_clean(&spread(), None, Intent::Preview, at(0, Sort::Name));
+        let grouped = rendered(&spread(), None, Intent::Preview, at(0, Sort::Name));
         let sizes = |report: &str| -> Vec<String> {
             report
                 .lines()
@@ -516,8 +613,8 @@ mod tests {
 
     #[test]
     fn sorting_by_size_puts_the_biggest_first_at_both_levels() {
-        let grouped = render_clean(&spread(), None, Intent::Preview, at(0, Sort::Size));
-        let listing = render_clean(&spread(), None, Intent::Preview, at(1, Sort::Size));
+        let grouped = rendered(&spread(), None, Intent::Preview, at(0, Sort::Size));
+        let listing = rendered(&spread(), None, Intent::Preview, at(1, Sort::Size));
         let first = |report: &str| report.lines().next().expect("a row").to_owned();
 
         assert!(first(&grouped).contains("rust-target"), "{grouped}");
@@ -535,7 +632,7 @@ mod tests {
             candidate("/p/mike", "r", Tier::Trash, 4096),
         ]);
 
-        let report = render_clean(&tied, None, Intent::Preview, at(1, Sort::Size));
+        let report = rendered(&tied, None, Intent::Preview, at(1, Sort::Size));
 
         let paths: Vec<&str> = report
             .lines()
@@ -550,7 +647,7 @@ mod tests {
     #[test]
     fn a_depth_beyond_the_plan_still_lists() {
         for depth in [1, 2, 9] {
-            let report = render_clean(&spread(), None, Intent::Preview, at(depth, Sort::Name));
+            let report = rendered(&spread(), None, Intent::Preview, at(depth, Sort::Name));
             assert!(report.contains("/p/target"), "depth {depth}: {report}");
         }
     }
@@ -559,7 +656,7 @@ mod tests {
     #[test]
     fn nothing_to_clean_reads_the_same_at_every_level() {
         for depth in [0, 1, 2] {
-            let report = render_clean(
+            let report = rendered(
                 &plan(Vec::new()),
                 None,
                 Intent::Preview,
@@ -569,9 +666,152 @@ mod tests {
         }
     }
 
+    // ---- inside a candidate ----------------------------------------------
+
+    fn branch(path: &str, allocated: u64, children: Vec<ScanNode>) -> ScanNode {
+        ScanNode {
+            path: PathBuf::from(path),
+            allocated,
+            apparent: allocated,
+            is_dir: true,
+            modified: None,
+            links: None,
+            children,
+        }
+    }
+
+    fn leaf(path: &str, allocated: u64) -> ScanNode {
+        ScanNode {
+            is_dir: false,
+            ..branch(path, allocated, Vec::new())
+        }
+    }
+
+    /// One candidate, `/p/target`, with two levels under it.
+    fn with_contents() -> (CleanPlan, Vec<ScanTree>) {
+        let tree = ScanTree {
+            root: branch(
+                "/p",
+                4_194_304,
+                vec![branch(
+                    "/p/target",
+                    4_194_304,
+                    vec![
+                        branch(
+                            "/p/target/debug",
+                            3_145_728,
+                            vec![branch("/p/target/debug/deps", 2_097_152, Vec::new())],
+                        ),
+                        branch("/p/target/release", 1_044_480, Vec::new()),
+                        leaf("/p/target/.rustc_info.json", 4096),
+                    ],
+                )],
+            ),
+            skipped: Vec::new(),
+            link_groups: Vec::new(),
+        };
+        let plan = plan(vec![candidate(
+            "/p/target",
+            "rust-target",
+            Tier::Trash,
+            4_194_304,
+        )]);
+        (plan, vec![tree])
+    }
+
+    #[test]
+    fn depth_two_lists_a_candidates_own_children() {
+        let (plan, trees) = with_contents();
+
+        let report = render_clean(&plan, None, Intent::Preview, at(2, Sort::Name), &trees);
+
+        assert!(
+            report.contains("/p/target"),
+            "the candidate itself: {report}"
+        );
+        for child in ["debug/", "release/", ".rustc_info.json"] {
+            assert!(report.contains(child), "{child} missing from {report}");
+        }
+        assert!(
+            !report.contains("deps/"),
+            "but not the level below that: {report}"
+        );
+    }
+
+    #[test]
+    fn each_further_level_goes_one_deeper() {
+        let (plan, trees) = with_contents();
+
+        let report = render_clean(&plan, None, Intent::Preview, at(3, Sort::Name), &trees);
+
+        assert!(report.contains("deps/"), "{report}");
+    }
+
+    /// A depth past the leaves is not an error — it is simply where the tree
+    /// runs out.
+    #[test]
+    fn a_depth_past_the_leaves_stops_there() {
+        let (plan, trees) = with_contents();
+
+        let deep = render_clean(&plan, None, Intent::Preview, at(9, Sort::Name), &trees);
+        let exact = render_clean(&plan, None, Intent::Preview, at(4, Sort::Name), &trees);
+
+        assert_eq!(deep, exact, "there was nothing further to show");
+    }
+
+    /// Depth is display only, and a candidate is removed whole — so no level
+    /// may change what the run would free.
+    #[test]
+    fn unfolding_a_candidate_changes_no_total() {
+        let (plan, trees) = with_contents();
+
+        let totals: Vec<String> = (0..5)
+            .map(|depth| {
+                render_clean(&plan, None, Intent::Preview, at(depth, Sort::Name), &trees)
+                    .lines()
+                    .find(|line| line.starts_with("Reclaimable:"))
+                    .expect("a total")
+                    .to_owned()
+            })
+            .collect();
+
+        assert_eq!(totals[0], "Reclaimable: 4.0M");
+        assert!(totals.iter().all(|total| *total == totals[0]), "{totals:?}");
+    }
+
+    #[test]
+    fn children_follow_the_same_order_as_their_parents() {
+        let (plan, trees) = with_contents();
+
+        let report = render_clean(&plan, None, Intent::Preview, at(2, Sort::Size), &trees);
+
+        let children: Vec<&str> = report
+            .lines()
+            .filter(|line| !line.contains("/p/target "))
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .filter(|name| {
+                name.starts_with("debug") || name.starts_with("release") || name.starts_with('.')
+            })
+            .collect();
+        assert_eq!(children, ["debug/", "release/", ".rustc_info.json"]);
+    }
+
+    /// Below `-d 2` the caller keeps no trees, because a tree costs ~630 bytes
+    /// per entry and the flag was not passed. The renderer must be content with
+    /// that rather than treat it as a failure.
+    #[test]
+    fn with_no_trees_the_candidate_line_stands_alone() {
+        let (plan, _) = with_contents();
+
+        let report = render_clean(&plan, None, Intent::Preview, at(2, Sort::Name), &[]);
+
+        assert!(report.contains("/p/target"), "{report}");
+        assert!(!report.contains("debug/"), "{report}");
+    }
+
     #[test]
     fn dry_run_lists_candidates_with_a_total() {
-        let report = render_clean(
+        let report = rendered(
             &plan(vec![
                 candidate("/p/node_modules", "node-modules", Tier::Trash, 1_048_576),
                 candidate("/p/old.bin", "old", Tier::Confirm, 1_048_576),
@@ -602,7 +842,7 @@ mod tests {
         let mut shared = candidate("/p/node_modules", "node-modules", Tier::Trash, 2048);
         shared.shared = true;
 
-        let report = render_clean(&plan(vec![shared]), None, Intent::Preview, listed());
+        let report = rendered(&plan(vec![shared]), None, Intent::Preview, listed());
 
         assert!(
             report.contains("(shared)"),
@@ -620,7 +860,7 @@ mod tests {
 
     #[test]
     fn an_unshared_plan_states_the_total_plainly() {
-        let report = render_clean(
+        let report = rendered(
             &plan(vec![candidate(
                 "/p/node_modules",
                 "node-modules",
@@ -641,7 +881,7 @@ mod tests {
 
     #[test]
     fn empty_plan_renders_a_plain_message() {
-        let report = render_clean(&plan(Vec::new()), None, Intent::Preview, listed());
+        let report = rendered(&plan(Vec::new()), None, Intent::Preview, listed());
 
         assert_eq!(report, "Nothing to clean.\n");
     }
@@ -656,7 +896,7 @@ mod tests {
             reason: ExcludeReason::Denylisted,
         }];
 
-        let report = render_clean(&empty, None, Intent::Preview, listed());
+        let report = rendered(&empty, None, Intent::Preview, listed());
 
         assert!(report.contains("Nothing to clean."), "{report}");
         assert!(report.contains("/Windows/target"), "{report}");
@@ -677,7 +917,7 @@ mod tests {
             },
         ];
 
-        let report = render_clean(&with_both, None, Intent::Preview, listed());
+        let report = rendered(&with_both, None, Intent::Preview, listed());
         let denied = report
             .lines()
             .find(|line| line.contains("/Windows/target"))
@@ -706,7 +946,7 @@ mod tests {
     /// plan. The report is where the user learns there was something there.
     #[test]
     fn the_safe_filter_reports_how_many_it_hid() {
-        let report = render_clean(
+        let report = rendered(
             &plan(vec![candidate(
                 "/p/node_modules",
                 "node-modules",
@@ -727,7 +967,7 @@ mod tests {
 
     #[test]
     fn nothing_hidden_says_nothing() {
-        let report = render_clean(
+        let report = rendered(
             &plan(vec![candidate("/p/nm", "node-modules", Tier::Trash, 1)]),
             Some(0),
             Intent::Preview,
@@ -746,7 +986,7 @@ mod tests {
     fn counts_are_singular_where_they_should_be() {
         let mut shared = candidate("/p/nm", "node-modules", Tier::Trash, 2048);
         shared.shared = true;
-        let report = render_clean(&plan(vec![shared]), Some(1), Intent::Preview, listed());
+        let report = rendered(&plan(vec![shared]), Some(1), Intent::Preview, listed());
 
         assert!(report.contains("1 candidate shares"), "{report}");
         assert!(
@@ -783,7 +1023,7 @@ mod tests {
             candidate("/p/b", "a-very-long-user-rule-name", Tier::Trash, 1024),
         ]);
 
-        let report = render_clean(&plan, None, Intent::Preview, listed());
+        let report = rendered(&plan, None, Intent::Preview, listed());
 
         assert!(
             report.contains("nm                          trash"),
@@ -954,7 +1194,7 @@ mod intent_tests {
     /// directly and none knew about the `--apply` path.
     #[test]
     fn a_preview_does_not_claim_nothing_was_removed() {
-        let report = render_clean(&one_candidate(), None, Intent::Removing, listed());
+        let report = rendered(&one_candidate(), None, Intent::Removing, listed());
 
         assert!(
             report.contains("/p/node_modules"),
@@ -973,7 +1213,7 @@ mod intent_tests {
     /// And the preview still says so — the guard must not have silenced both.
     #[test]
     fn a_preview_still_says_it_removed_nothing() {
-        let report = render_clean(&one_candidate(), None, Intent::Preview, listed());
+        let report = rendered(&one_candidate(), None, Intent::Preview, listed());
 
         assert!(
             report
@@ -1063,7 +1303,7 @@ mod min_size_tests {
             below_rule_minimum: 0,
         };
 
-        let report = render_clean(&plan, None, Intent::Preview, listed());
+        let report = rendered(&plan, None, Intent::Preview, listed());
 
         assert!(
             report.contains("150 more candidates are below --min-size"),
@@ -1077,7 +1317,7 @@ mod min_size_tests {
         // And with all three narrowings in effect, all three are stated.
         plan.filtered_out = 3;
         plan.below_rule_minimum = 7;
-        let all = render_clean(&plan, Some(3), Intent::Preview, listed());
+        let all = rendered(&plan, Some(3), Intent::Preview, listed());
         assert!(all.contains("3 more candidates need confirmation"), "{all}");
         assert!(
             all.contains("150 more candidates are below --min-size"),
@@ -1104,7 +1344,7 @@ mod min_size_tests {
             below_rule_minimum: 2,
         };
 
-        let report = render_clean(&plan, None, Intent::Preview, listed());
+        let report = rendered(&plan, None, Intent::Preview, listed());
 
         assert!(
             report.contains("2 more candidates are below their rule's own min-size"),
@@ -1131,7 +1371,7 @@ mod min_size_tests {
             below_rule_minimum: 1,
         };
 
-        let report = render_clean(&plan, None, Intent::Preview, listed());
+        let report = rendered(&plan, None, Intent::Preview, listed());
 
         assert!(
             report.contains("1 more candidate is below their rule's own min-size"),
@@ -1154,7 +1394,7 @@ mod min_size_tests {
             below_rule_minimum: 0,
         };
 
-        assert!(!render_clean(&plan, None, Intent::Preview, listed(),).contains("--min-size"));
+        assert!(!rendered(&plan, None, Intent::Preview, listed(),).contains("--min-size"));
     }
 
     #[test]
@@ -1169,8 +1409,7 @@ mod min_size_tests {
         };
 
         assert!(
-            render_clean(&plan, None, Intent::Preview, listed(),)
-                .contains("1 more candidate is below"),
+            rendered(&plan, None, Intent::Preview, listed(),).contains("1 more candidate is below"),
             "not `1 more candidates are`"
         );
     }

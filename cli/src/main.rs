@@ -220,6 +220,13 @@ fn run_clean(
     // projects spends real time after the walk finishes.
     let mut plans = Vec::with_capacity(roots.len());
     let mut skipped = Vec::new();
+    // Kept **only** when the report will unfold inside a candidate. A tree costs
+    // ~630 bytes per entry — 1.4 GB for a home directory — and holding every
+    // root's through the removal to satisfy a display flag nobody passed would
+    // be exactly the cost the lazy browser was built to avoid. Below `-d 2` the
+    // trees are dropped as they are planned, as before.
+    let unfolding = report.depth >= 2;
+    let mut trees = Vec::new();
     for root in roots {
         let options = ScanOptions {
             root: root.clone(),
@@ -229,15 +236,25 @@ fn run_clean(
         // this function is reached; a root that came from a rule is a
         // description that may have gone stale, and one missing directory is no
         // reason to leave the others uncleaned. `scan` reports it as a skip.
-        let tree = scan_with_spinner(&options, "Scanning…");
+        let mut tree = scan_with_spinner(&options, "Scanning…");
         plans.push(plan(&tree, &clean));
-        skipped.extend(tree.skipped);
+        skipped.extend(std::mem::take(&mut tree.skipped));
+        if unfolding {
+            trees.push(tree);
+        }
     }
 
     let planned = CleanPlan::merge(plans);
 
     if intent == Intent::Removing {
-        return remove(&planned, confirm_tier_allowed, report, &skipped, verbose);
+        return remove(
+            &planned,
+            confirm_tier_allowed,
+            report,
+            &trees,
+            &skipped,
+            verbose,
+        );
     }
 
     // The count of what `--safe` hid comes back with the plan. It used to come
@@ -256,18 +273,23 @@ fn run_clean(
         };
     }
     emit(
-        &render_clean(&planned, hidden, Intent::Preview, report),
+        &render_clean(&planned, hidden, Intent::Preview, report, &trees),
         &skipped,
         verbose,
     )
 }
 
 /// The plan, in whichever shape was asked for.
-fn render(planned: &CleanPlan, report: Report, intent: Intent) -> serde_json::Result<String> {
+fn render(
+    planned: &CleanPlan,
+    report: Report,
+    intent: Intent,
+    inside: &[ScanTree],
+) -> serde_json::Result<String> {
     if report.json {
         return render_plan(planned).map(|payload| payload + "\n");
     }
-    Ok(render_clean(planned, None, intent, report))
+    Ok(render_clean(planned, None, intent, report, inside))
 }
 
 /// A path that is not UTF-8 cannot be a JSON string.
@@ -289,15 +311,18 @@ fn remove(
     planned: &CleanPlan,
     confirm_tier_allowed: bool,
     report: Report,
+    inside: &[ScanTree],
     skipped: &[SkippedEntry],
     verbose: bool,
 ) -> ExitCode {
     if planned.candidates.is_empty() {
-        return emit(
-            &render_clean(planned, None, Intent::Preview, report),
-            skipped,
-            verbose,
-        );
+        // Nothing to remove, so this is the same "Nothing to clean." a preview
+        // prints — and it goes through `render` so that `--json` gets a
+        // document rather than a sentence.
+        return match render(planned, report, Intent::Preview, inside) {
+            Ok(shown) => emit(&shown, skipped, verbose),
+            Err(err) => json_failed(err),
+        };
     }
 
     let confirm = planned
@@ -318,7 +343,7 @@ fn remove(
         // Nothing happened, so what there is to report is the plan — the same
         // document `preview` would have produced. A consumer tells the two
         // apart by the exit code, which is the thing it has to read anyway.
-        let code = match render(planned, report, Intent::Preview) {
+        let code = match render(planned, report, Intent::Preview, inside) {
             Ok(shown) => emit(&shown, skipped, verbose),
             Err(err) => return json_failed(err),
         };
@@ -343,7 +368,10 @@ fn remove(
     // To stderr: this is context for the operation, not the report, and it stays
     // text even under `--json` — stdout is reserved for the one document, and a
     // second JSON value on the way to it would make the stream unparseable.
-    eprint!("{}", render_clean(planned, None, Intent::Removing, report));
+    eprint!(
+        "{}",
+        render_clean(planned, None, Intent::Removing, report, inside)
+    );
     if confirm > 0 {
         // Reached only with `--yes`, or with `require-confirmation` turned off.
         // Saying the number out loud is what keeps either from being a blind yes.
