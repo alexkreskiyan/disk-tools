@@ -19,7 +19,10 @@ the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools
 (the TUI) **is complete** — `disk-tools ui` browses a directory as a table, sizes
 its subdirectories in the background, colours them by what the rules say, filters
 with `/`, writes rules back to `config.toml` with every comment intact, and
-always gives the terminal back. v0.5 is duplicates. User-facing usage, flags, the safety model and
+always gives the terminal back. **[v0.5](kb/specs/2026.07/2026.07.29-disk-tools-v0.5-preview-clean.md)
+(preview + clean) is specced, not started**; it splits `clean` into two verbs,
+drops `--apply` and `--allow-dirty`, and makes where a candidate goes a third
+tier. Duplicates move to v0.6. User-facing usage, flags, the safety model and
 the documented limitations live in the [README](README.md).
 
 ## Important: Documentation Requirements
@@ -264,7 +267,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
 | `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.26` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
-| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.26` |
+| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.29` |
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07/2026.07.25` |
 | `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
