@@ -107,7 +107,7 @@ pub struct ScanArgs {
     /// Print at most this many levels deep (display only; traversal is always full).
     ///
     /// 0 shows the root alone. Default: unlimited.
-    #[arg(long)]
+    #[arg(short = 'd', long)]
     pub depth: Option<usize>,
 
     /// Rank and report apparent size rather than allocated size.
@@ -173,6 +173,34 @@ pub struct CleanArgs {
     /// Also offer anything untouched for this long: 90d, 6m, 1y.
     #[arg(long = "older-than", value_parser = parse_duration, value_name = "DURATION")]
     pub older_than: Option<Duration>,
+
+    // Neither carries a clap `default_value`, for the reason the whole file
+    // gives: a value stated explicitly and a flag left off must stay
+    // distinguishable, so that a `[report]` key can be added later without
+    // changing what an absent flag means. Their defaults are applied in
+    // `cleanup` and written down here.
+    /// How far the report unfolds: 0 groups by rule, 1 lists every candidate. Default: 0.
+    ///
+    /// Display only. It never changes the plan, so a candidate a shallow report
+    /// does not name is one that will still be removed.
+    #[arg(short = 'd', long, value_name = "N")]
+    pub depth: Option<usize>,
+
+    /// Order the report by `name` or by `size`. Default: name.
+    #[arg(long, value_enum, value_name = "KEY")]
+    pub sort: Option<Sort>,
+}
+
+/// What the report is ordered by.
+///
+/// A value rather than a `--by-size` flag, so that ordering by a timestamp can
+/// be added without a second flag meaning the same kind of thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Sort {
+    /// By name — the rule's at depth 0, the path's below it.
+    Name,
+    /// Largest first.
+    Size,
 }
 
 /// Whether this invocation removes anything.
@@ -188,6 +216,19 @@ pub enum Intent {
     Preview,
     /// `clean`: the removal follows immediately.
     Removing,
+}
+
+/// How the plan is shown, as opposed to how it is chosen.
+///
+/// Every field here is display-only, and that separation is the point: a
+/// candidate this hides is still one `clean` removes. The narrowing flags —
+/// `--safe`, `--min-size`, `--older-than` — live in [`CleanOptions`] instead,
+/// because they change the plan itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Report {
+    /// 0 groups by rule, 1 lists candidates, 2+ unfolds inside them.
+    pub depth: usize,
+    pub sort: Sort,
 }
 
 /// What the parsed arguments actually asked for.
@@ -230,6 +271,10 @@ pub enum Mode {
         /// Which verb this was. The only thing that differs between them.
         intent: Intent,
         removal: Removal,
+
+        /// How to show the plan. Never how to choose it: nothing in here can
+        /// keep a candidate out of the removal, only out of the printout.
+        report: Report,
     },
     /// Write the default configuration to `target`.
     ConfigInit { target: PathBuf, force: bool },
@@ -406,6 +451,13 @@ impl Args {
                 Removal::Purge
             } else {
                 Removal::Trash
+            },
+            report: Report {
+                // Grouped by rule unless asked for more. The overview is what
+                // the question "what would this take" wants first; the list is
+                // one keystroke away.
+                depth: clean.depth.unwrap_or(0),
+                sort: clean.sort.unwrap_or(Sort::Name),
             },
         })
     }
@@ -1043,6 +1095,7 @@ mod tests {
                     clean,
                     removal,
                     intent,
+                    report: _,
                 } => (
                     intent,
                     (

@@ -15,7 +15,7 @@
 //! that is a lie. That is what [`crate::args::Intent`] is for.
 
 use super::tree::format_size;
-use crate::args::Intent;
+use crate::args::{Intent, Report, Sort};
 use disk_tools_core::{Candidate, CleanOutcome, CleanPlan, ExcludeReason, Excluded, Tier};
 use std::fmt::Write;
 
@@ -25,7 +25,12 @@ use std::fmt::Write;
 /// flag was not used. The core does not record them — that is deliberate, since
 /// `--safe` is the user's own narrowing rather than a refusal — so the count is
 /// passed in by the caller, which plans a second time to obtain it.
-pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Intent) -> String {
+pub fn render_clean(
+    plan: &CleanPlan,
+    hidden_by_safe: Option<usize>,
+    intent: Intent,
+    report: Report,
+) -> String {
     let mut out = String::new();
 
     if plan.candidates.is_empty() {
@@ -33,7 +38,11 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
         // should not make it read like one.
         let _ = writeln!(out, "Nothing to clean.");
     } else {
-        write_candidates(&plan.candidates, &mut out);
+        if report.depth == 0 {
+            write_rules(&plan.candidates, report.sort, &mut out);
+        } else {
+            write_candidates(&plan.candidates, report.sort, &mut out);
+        }
         let _ = writeln!(out);
         write_total(plan, &mut out);
     }
@@ -183,7 +192,90 @@ fn are(count: usize) -> &'static str {
     }
 }
 
-fn write_candidates(candidates: &[Candidate], out: &mut String) {
+/// One line per rule: which of them is doing this, and to how much.
+///
+/// The default, because "what would this take" is asked of the whole run before
+/// it is asked of any one path — and because a rule set that has grown a
+/// mistake shows it here in three lines rather than in nine hundred.
+///
+/// Every candidate of a rule carries that rule's tier, so a group has exactly
+/// one and can state it.
+fn write_rules(candidates: &[Candidate], sort: Sort, out: &mut String) {
+    let mut groups: Vec<Group> = Vec::new();
+    for candidate in candidates {
+        match groups.iter_mut().find(|g| g.rule == candidate.rule) {
+            Some(group) => {
+                group.count += 1;
+                group.allocated += candidate.allocated;
+            }
+            None => groups.push(Group {
+                rule: &candidate.rule,
+                tier: candidate.tier,
+                count: 1,
+                allocated: candidate.allocated,
+            }),
+        }
+    }
+
+    match sort {
+        Sort::Name => groups.sort_by(|a, b| a.rule.cmp(b.rule)),
+        // By path where the sizes tie, as everywhere: a report whose order
+        // changes between two runs over one unchanged disk cannot be diffed.
+        Sort::Size => groups.sort_by(|a, b| b.allocated.cmp(&a.allocated).then(a.rule.cmp(b.rule))),
+    }
+
+    let rule_width = groups
+        .iter()
+        .map(|g| g.rule.chars().count())
+        .max()
+        .unwrap_or(0);
+    let count_width = groups
+        .iter()
+        .map(|g| g.count.to_string().len())
+        .max()
+        .unwrap_or(0);
+
+    for group in groups {
+        let _ = writeln!(
+            out,
+            "{size:>8}  {rule:<rw$}  {count:>cw$} {noun:<10}  {tier}",
+            size = format_size(group.allocated),
+            rule = group.rule,
+            count = group.count,
+            // Singular where it is one, because "1 candidates" is the kind of
+            // thing that makes a reader doubt the number beside it.
+            noun = if group.count == 1 {
+                "candidate"
+            } else {
+                "candidates"
+            },
+            tier = tier(group.tier),
+            rw = rule_width,
+            cw = count_width,
+        );
+    }
+}
+
+/// One rule's share of the plan.
+struct Group<'a> {
+    rule: &'a str,
+    tier: Tier,
+    count: usize,
+    allocated: u64,
+}
+
+fn write_candidates(candidates: &[Candidate], sort: Sort, out: &mut String) {
+    // Borrowed and sorted here rather than in the plan. `CleanPlan.candidates`
+    // is ordered by path so that two runs over one tree produce identical
+    // plans, and that is worth more than saving this sort.
+    let mut candidates: Vec<&Candidate> = candidates.iter().collect();
+    match sort {
+        Sort::Name => candidates.sort_by(|a, b| a.path.cmp(&b.path)),
+        Sort::Size => {
+            candidates.sort_by(|a, b| b.allocated.cmp(&a.allocated).then(a.path.cmp(&b.path)));
+        }
+    }
+
     // Widths from the data rather than fixed, so the columns stay tight when
     // only one rule is present. Rule names are user-supplied in v0.3, so this
     // is no longer a bounded set of five known strings.
@@ -244,9 +336,9 @@ fn write_total(plan: &CleanPlan, out: &mut String) {
 /// What was refused, and whether anything can be done about it.
 ///
 /// The two reasons are **not** interchangeable and must not read as if they
-/// were: nothing overrides the denylist, while `--allow-dirty` exists precisely
-/// for the other. Rendering them alike would send someone reaching for a flag
-/// that cannot help.
+/// were: nothing overrides the denylist, while the git guard is a setting the
+/// user chose and can unchoose. Rendering them alike would send someone
+/// reaching for something that cannot help.
 fn write_excluded(excluded: &[Excluded], out: &mut String) {
     let _ = writeln!(out, "Not touched:");
     for entry in excluded {
@@ -262,7 +354,12 @@ fn write_excluded(excluded: &[Excluded], out: &mut String) {
 fn excuse(reason: &ExcludeReason) -> &'static str {
     match reason {
         ExcludeReason::Denylisted => "protected; no flag removes this",
-        ExcludeReason::DirtyRepo => "uncommitted changes; --allow-dirty to include",
+        // Names the rule key, not a flag: `--allow-dirty` was removed in v0.5
+        // because the guard belongs to the rule that wants it. A message
+        // offering a flag that no longer parses is worse than none.
+        ExcludeReason::DirtyRepo => {
+            "uncommitted changes; set requires-clean-repo = false on the rule to include"
+        }
     }
 }
 
@@ -270,6 +367,16 @@ fn tier(tier: Tier) -> &'static str {
     match tier {
         Tier::Auto => "auto",
         Tier::Confirm => "confirm",
+    }
+}
+
+/// The candidate listing — depth 1 — which is what most of the tests below are
+/// about. Depth 0 groups by rule and has tests of its own.
+#[cfg(test)]
+fn listed() -> Report {
+    Report {
+        depth: 1,
+        sort: Sort::Name,
     }
 }
 
@@ -300,6 +407,137 @@ mod tests {
         }
     }
 
+    /// Two rules, three candidates, sizes that make every ordering visible.
+    fn spread() -> CleanPlan {
+        plan(vec![
+            candidate("/p/a/node_modules", "node-modules", Tier::Auto, 1_048_576),
+            candidate("/p/b/node_modules", "node-modules", Tier::Auto, 2_097_152),
+            candidate("/p/target", "rust-target", Tier::Auto, 4_194_304),
+        ])
+    }
+
+    fn at(depth: usize, sort: Sort) -> Report {
+        Report { depth, sort }
+    }
+
+    /// The default. "What would this take" is asked of the whole run before it
+    /// is asked of any one path.
+    #[test]
+    fn depth_zero_is_one_line_per_rule() {
+        let report = render_clean(&spread(), None, Intent::Preview, at(0, Sort::Name));
+
+        let rows: Vec<&str> = report.lines().take_while(|line| !line.is_empty()).collect();
+        assert_eq!(rows.len(), 2, "one per rule, not per candidate: {report}");
+        assert!(rows[0].contains("node-modules"), "{report}");
+        assert!(
+            rows[0].contains("3.0M") && rows[0].contains("2 candidates"),
+            "the group carries its total and its count: {report}"
+        );
+        assert!(
+            rows[1].contains("rust-target") && rows[1].contains("1 candidate  "),
+            "and one candidate is singular: {report}"
+        );
+        assert!(
+            !report.contains("/p/a/node_modules"),
+            "no paths at this level: {report}"
+        );
+    }
+
+    /// The level and the order are display only, so the figure they add up to
+    /// cannot move with them.
+    #[test]
+    fn the_total_is_the_same_at_every_level_and_order() {
+        let totals: Vec<String> = [
+            at(0, Sort::Name),
+            at(0, Sort::Size),
+            at(1, Sort::Name),
+            at(1, Sort::Size),
+        ]
+        .into_iter()
+        .map(|report| {
+            render_clean(&spread(), None, Intent::Preview, report)
+                .lines()
+                .find(|line| line.starts_with("Reclaimable:"))
+                .expect("a total")
+                .to_owned()
+        })
+        .collect();
+
+        assert_eq!(totals[0], "Reclaimable: 7.0M");
+        assert!(totals.iter().all(|total| *total == totals[0]), "{totals:?}");
+    }
+
+    /// And the groups add up to the candidates, which is the arithmetic a
+    /// reader does in their head between the two levels.
+    #[test]
+    fn the_groups_sum_to_what_the_candidates_come_to() {
+        let grouped = render_clean(&spread(), None, Intent::Preview, at(0, Sort::Name));
+        let sizes = |report: &str| -> Vec<String> {
+            report
+                .lines()
+                .take_while(|line| !line.is_empty())
+                .map(|line| line.split_whitespace().next().expect("a size").to_owned())
+                .collect()
+        };
+
+        assert_eq!(sizes(&grouped), ["3.0M", "4.0M"]);
+    }
+
+    #[test]
+    fn sorting_by_size_puts_the_biggest_first_at_both_levels() {
+        let grouped = render_clean(&spread(), None, Intent::Preview, at(0, Sort::Size));
+        let listing = render_clean(&spread(), None, Intent::Preview, at(1, Sort::Size));
+        let first = |report: &str| report.lines().next().expect("a row").to_owned();
+
+        assert!(first(&grouped).contains("rust-target"), "{grouped}");
+        assert!(first(&listing).contains("/p/target"), "{listing}");
+    }
+
+    /// Size is not a unique key — a rule over a large tree yields hundreds of
+    /// identical ones — so without a tiebreak the same disk state prints in a
+    /// different order each run and two reports cannot be diffed.
+    #[test]
+    fn equal_sizes_are_ordered_by_path() {
+        let tied = plan(vec![
+            candidate("/p/zulu", "r", Tier::Auto, 4096),
+            candidate("/p/alpha", "r", Tier::Auto, 4096),
+            candidate("/p/mike", "r", Tier::Auto, 4096),
+        ]);
+
+        let report = render_clean(&tied, None, Intent::Preview, at(1, Sort::Size));
+
+        let paths: Vec<&str> = report
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_whitespace().last())
+            .collect();
+        assert_eq!(paths, ["/p/alpha", "/p/mike", "/p/zulu"]);
+    }
+
+    /// A depth past the candidates is not an error. Levels beyond 1 unfold
+    /// inside a candidate, which is a later task; until then they list.
+    #[test]
+    fn a_depth_beyond_the_plan_still_lists() {
+        for depth in [1, 2, 9] {
+            let report = render_clean(&spread(), None, Intent::Preview, at(depth, Sort::Name));
+            assert!(report.contains("/p/target"), "depth {depth}: {report}");
+        }
+    }
+
+    /// An empty plan says so once, at any level — never as an empty grouping.
+    #[test]
+    fn nothing_to_clean_reads_the_same_at_every_level() {
+        for depth in [0, 1, 2] {
+            let report = render_clean(
+                &plan(Vec::new()),
+                None,
+                Intent::Preview,
+                at(depth, Sort::Name),
+            );
+            assert_eq!(report, "Nothing to clean.\n", "depth {depth}");
+        }
+    }
+
     #[test]
     fn dry_run_lists_candidates_with_a_total() {
         let report = render_clean(
@@ -309,6 +547,7 @@ mod tests {
             ]),
             None,
             Intent::Preview,
+            listed(),
         );
 
         // Path, rule and tier for each, then the total.
@@ -332,7 +571,7 @@ mod tests {
         let mut shared = candidate("/p/node_modules", "node-modules", Tier::Auto, 2048);
         shared.shared = true;
 
-        let report = render_clean(&plan(vec![shared]), None, Intent::Preview);
+        let report = render_clean(&plan(vec![shared]), None, Intent::Preview, listed());
 
         assert!(
             report.contains("(shared)"),
@@ -359,6 +598,7 @@ mod tests {
             )]),
             None,
             Intent::Preview,
+            listed(),
         );
 
         assert!(report.contains("Reclaimable: 2.0K"), "{report}");
@@ -370,7 +610,7 @@ mod tests {
 
     #[test]
     fn empty_plan_renders_a_plain_message() {
-        let report = render_clean(&plan(Vec::new()), None, Intent::Preview);
+        let report = render_clean(&plan(Vec::new()), None, Intent::Preview, listed());
 
         assert_eq!(report, "Nothing to clean.\n");
     }
@@ -385,7 +625,7 @@ mod tests {
             reason: ExcludeReason::Denylisted,
         }];
 
-        let report = render_clean(&empty, None, Intent::Preview);
+        let report = render_clean(&empty, None, Intent::Preview, listed());
 
         assert!(report.contains("Nothing to clean."), "{report}");
         assert!(report.contains("/Windows/target"), "{report}");
@@ -393,7 +633,7 @@ mod tests {
 
     /// The distinction that decides whether the user reaches for a flag.
     #[test]
-    fn a_denylisted_exclusion_does_not_suggest_allow_dirty() {
+    fn a_denylisted_exclusion_offers_no_remedy_and_a_dirty_one_does() {
         let mut with_both = plan(Vec::new());
         with_both.excluded = vec![
             Excluded {
@@ -406,7 +646,7 @@ mod tests {
             },
         ];
 
-        let report = render_clean(&with_both, None, Intent::Preview);
+        let report = render_clean(&with_both, None, Intent::Preview, listed());
         let denied = report
             .lines()
             .find(|line| line.contains("/Windows/target"))
@@ -417,16 +657,17 @@ mod tests {
             .expect("the dirty-repo line is present");
 
         assert!(
-            !denied.contains("--allow-dirty"),
-            "nothing overrides the denylist, so the line must not offer a flag: {denied}"
+            !denied.contains("requires-clean-repo"),
+            "nothing overrides the denylist, so the line must offer nothing: {denied}"
         );
         assert!(
             denied.contains("no flag removes this"),
             "and it should say so: {denied}"
         );
         assert!(
-            dirty.contains("--allow-dirty"),
-            "the guard is exactly what that flag is for: {dirty}"
+            dirty.contains("requires-clean-repo"),
+            "the guard is a rule setting, and the line has to name it — `--allow-dirty` \
+             went in v0.5 and a message offering it would not even parse: {dirty}"
         );
     }
 
@@ -443,6 +684,7 @@ mod tests {
             )]),
             Some(3),
             Intent::Preview,
+            listed(),
         );
 
         assert!(
@@ -458,6 +700,7 @@ mod tests {
             &plan(vec![candidate("/p/nm", "node-modules", Tier::Auto, 1)]),
             Some(0),
             Intent::Preview,
+            listed(),
         );
 
         assert!(
@@ -472,7 +715,7 @@ mod tests {
     fn counts_are_singular_where_they_should_be() {
         let mut shared = candidate("/p/nm", "node-modules", Tier::Auto, 2048);
         shared.shared = true;
-        let report = render_clean(&plan(vec![shared]), Some(1), Intent::Preview);
+        let report = render_clean(&plan(vec![shared]), Some(1), Intent::Preview, listed());
 
         assert!(report.contains("1 candidate shares"), "{report}");
         assert!(
@@ -499,7 +742,7 @@ mod tests {
             candidate("/p/b", "a-very-long-user-rule-name", Tier::Auto, 1024),
         ]);
 
-        let report = render_clean(&plan, None, Intent::Preview);
+        let report = render_clean(&plan, None, Intent::Preview, listed());
 
         assert!(
             report.contains("nm                          auto"),
@@ -653,7 +896,7 @@ mod intent_tests {
     /// directly and none knew about the `--apply` path.
     #[test]
     fn a_preview_does_not_claim_nothing_was_removed() {
-        let report = render_clean(&one_candidate(), None, Intent::Removing);
+        let report = render_clean(&one_candidate(), None, Intent::Removing, listed());
 
         assert!(
             report.contains("/p/node_modules"),
@@ -672,7 +915,7 @@ mod intent_tests {
     /// And the preview still says so — the guard must not have silenced both.
     #[test]
     fn a_preview_still_says_it_removed_nothing() {
-        let report = render_clean(&one_candidate(), None, Intent::Preview);
+        let report = render_clean(&one_candidate(), None, Intent::Preview, listed());
 
         assert!(
             report
@@ -751,7 +994,7 @@ mod min_size_tests {
             below_rule_minimum: 0,
         };
 
-        let report = render_clean(&plan, None, Intent::Preview);
+        let report = render_clean(&plan, None, Intent::Preview, listed());
 
         assert!(
             report.contains("150 more candidates are below --min-size"),
@@ -765,7 +1008,7 @@ mod min_size_tests {
         // And with all three narrowings in effect, all three are stated.
         plan.filtered_out = 3;
         plan.below_rule_minimum = 7;
-        let all = render_clean(&plan, Some(3), Intent::Preview);
+        let all = render_clean(&plan, Some(3), Intent::Preview, listed());
         assert!(all.contains("3 more candidates need confirmation"), "{all}");
         assert!(
             all.contains("150 more candidates are below --min-size"),
@@ -792,7 +1035,7 @@ mod min_size_tests {
             below_rule_minimum: 2,
         };
 
-        let report = render_clean(&plan, None, Intent::Preview);
+        let report = render_clean(&plan, None, Intent::Preview, listed());
 
         assert!(
             report.contains("2 more candidates are below their rule's own min-size"),
@@ -819,7 +1062,7 @@ mod min_size_tests {
             below_rule_minimum: 1,
         };
 
-        let report = render_clean(&plan, None, Intent::Preview);
+        let report = render_clean(&plan, None, Intent::Preview, listed());
 
         assert!(
             report.contains("1 more candidate is below their rule's own min-size"),
@@ -842,7 +1085,7 @@ mod min_size_tests {
             below_rule_minimum: 0,
         };
 
-        assert!(!render_clean(&plan, None, Intent::Preview).contains("--min-size"));
+        assert!(!render_clean(&plan, None, Intent::Preview, listed(),).contains("--min-size"));
     }
 
     #[test]
@@ -857,7 +1100,8 @@ mod min_size_tests {
         };
 
         assert!(
-            render_clean(&plan, None, Intent::Preview).contains("1 more candidate is below"),
+            render_clean(&plan, None, Intent::Preview, listed(),)
+                .contains("1 more candidate is below"),
             "not `1 more candidates are`"
         );
     }

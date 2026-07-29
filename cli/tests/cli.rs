@@ -580,7 +580,7 @@ fn a_relative_path_finds_what_the_absolute_one_does() {
     let config = config.to_str().expect("utf8");
 
     let from = |dir: &Path, path: &str| {
-        let output = spawn(&["--config", config, "preview", path], home_dir)
+        let output = spawn(&["--config", config, "preview", path, "-d", "1"], home_dir)
             .current_dir(dir)
             .output()
             .expect("spawn disk-tools");
@@ -695,7 +695,12 @@ fn a_preview_writes_nothing() {
     let dir = cleanable_dir();
     let before = snapshot(dir.path());
 
-    let output = run(&["preview", dir.path().to_str().expect("utf8 path")]);
+    let output = run(&[
+        "preview",
+        dir.path().to_str().expect("utf8 path"),
+        "-d",
+        "1",
+    ]);
 
     assert!(output.status.success(), "{:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -839,14 +844,14 @@ fn safe_reports_how_many_candidates_it_hid() {
     }
     let path = dir.path().to_str().expect("utf8 path");
 
-    let everything = run(&["preview", path, "--older-than", "90d"]);
+    let everything = run(&["preview", path, "--older-than", "90d", "-d", "1"]);
     let stdout = String::from_utf8_lossy(&everything.stdout);
     assert!(
         stdout.contains("ancient-one.bin") && stdout.contains("node_modules"),
         "the fixture must offer both tiers, or this proves nothing:\n{stdout}"
     );
 
-    let safe = run(&["preview", path, "--older-than", "90d", "--safe"]);
+    let safe = run(&["preview", path, "--older-than", "90d", "--safe", "-d", "1"]);
     let stdout = String::from_utf8_lossy(&safe.stdout);
 
     assert!(
@@ -1163,7 +1168,13 @@ fn two_rule_roots_are_both_walked() {
     seed_node_modules(&b, 4096);
     let config = rules_rooted_at(home.path(), &[&a, &b]);
 
-    let output = run(&["--config", config.to_str().expect("utf8"), "preview"]);
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "preview",
+        "-d",
+        "1",
+    ]);
 
     assert!(output.status.success(), "{:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1218,7 +1229,13 @@ fn a_rule_root_that_is_gone_is_skipped_not_fatal() {
     let vanished = home.path().join("vanished");
     let config = rules_rooted_at(home.path(), &[&vanished, &real]);
 
-    let output = run(&["--config", config.to_str().expect("utf8"), "preview"]);
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "preview",
+        "-d",
+        "1",
+    ]);
 
     assert!(
         output.status.success(),

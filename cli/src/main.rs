@@ -10,7 +10,7 @@ mod env;
 mod render;
 mod ui;
 
-use args::{Args, Environment, Intent, Mode, validate_root};
+use args::{Args, Environment, Intent, Mode, Report, validate_root};
 use clap::Parser;
 use disk_tools_core::{
     CleanOptions, CleanOutcome, CleanPlan, Removal, ScanOptions, ScanTree, SkippedEntry, Tier,
@@ -84,6 +84,7 @@ fn main() -> ExitCode {
             clean,
             intent,
             removal,
+            report,
         } => run_clean(
             &roots,
             roots_from_rules,
@@ -93,6 +94,7 @@ fn main() -> ExitCode {
                 removal,
                 confirm_tier_allowed,
             },
+            report,
             verbose,
         ),
         Mode::ConfigInit { target, force } => run_config_init(&target, force),
@@ -206,6 +208,7 @@ fn run_clean(
     clean: CleanOptions,
     intent: Intent,
     removing: Removing,
+    report: Report,
     verbose: bool,
 ) -> ExitCode {
     if roots.is_empty() {
@@ -263,7 +266,7 @@ fn run_clean(
     let planned = CleanPlan::merge(plans);
 
     if intent == Intent::Removing {
-        return remove(&planned, &removing, &skipped, verbose);
+        return remove(&planned, &removing, report, &skipped, verbose);
     }
 
     // The count of what `--safe` hid comes back with the plan. It used to come
@@ -274,7 +277,7 @@ fn run_clean(
     let hidden = clean.safe_only.then_some(planned.filtered_out);
 
     emit(
-        &render_clean(&planned, hidden, Intent::Preview),
+        &render_clean(&planned, hidden, Intent::Preview, report),
         &skipped,
         verbose,
     )
@@ -288,12 +291,13 @@ fn run_clean(
 fn remove(
     planned: &CleanPlan,
     removing: &Removing,
+    report: Report,
     skipped: &[SkippedEntry],
     verbose: bool,
 ) -> ExitCode {
     if planned.candidates.is_empty() {
         return emit(
-            &render_clean(planned, None, Intent::Preview),
+            &render_clean(planned, None, Intent::Preview, report),
             skipped,
             verbose,
         );
@@ -315,7 +319,7 @@ fn remove(
     // the plan, so the count is zero and there is nothing to refuse.
     if confirm > 0 && !removing.confirm_tier_allowed {
         let code = emit(
-            &render_clean(planned, None, Intent::Preview),
+            &render_clean(planned, None, Intent::Preview, report),
             skipped,
             verbose,
         );
@@ -339,7 +343,7 @@ fn remove(
 
     // To stderr: this is context for the operation, not the report. It also
     // keeps stdout to the outcome alone for anything reading it.
-    eprint!("{}", render_clean(planned, None, Intent::Removing));
+    eprint!("{}", render_clean(planned, None, Intent::Removing, report));
     if confirm > 0 {
         // Reached only with `--yes`, or with `require-confirmation` turned off.
         // Saying the number out loud is what keeps either from being a blind yes.
