@@ -47,9 +47,18 @@ pub enum Command {
     Scan(ScanArgs),
 
     /// Show what `clean` would remove. Changes nothing on disk.
+    ///
+    /// Takes exactly the flags `clean` does, so acting on what you see means
+    /// retyping the line with the other verb.
     Preview(CleanArgs),
 
-    /// Remove what the rules claim. To the OS trash unless a rule says otherwise.
+    /// Remove what the rules claim, to the OS trash. Removes immediately.
+    ///
+    /// There is no --apply: the verb is the intent. Each rule says what happens
+    /// to what it claims — purge destroys, trash recovers, confirm waits for
+    /// --yes — and clean refuses, removing nothing at all and exiting 2, while
+    /// anything needing confirmation is in the plan. Use --safe to drop those,
+    /// or --yes to take them.
     Clean(CleanArgs),
 
     /// Browse a directory, with each entry coloured by what the rules say.
@@ -145,21 +154,30 @@ pub struct CleanArgs {
 
     /// Drop everything that needs per-item confirmation.
     ///
+    /// Keeps both of the other tiers: purge is a stronger claim that something
+    /// regenerates than trash, not a weaker one, so this is about confirmation
+    /// and not about destinations.
+    ///
     /// A config file can turn this on; the command line cannot turn it back off
     /// — which for this one is the right direction, since the file may only make
     /// a cleanup more cautious.
     #[arg(long)]
     pub safe: bool,
 
-    /// Delete outright instead of trashing. Nothing can be put back.
+    /// Delete the whole plan outright instead of trashing. Nothing can be put back.
+    ///
+    /// Per rule this is tier = "purge", which applies to exactly what that rule
+    /// claims. Neither cancels the confirmation: this decides where a candidate
+    /// goes, not whether you were asked about it.
     #[arg(long)]
     pub purge: bool,
 
-    /// Remove candidates that are not regenerable too.
+    /// Remove candidates that need confirmation too.
     ///
     /// Without it, `clean` stops when the plan holds anything that needs
-    /// confirming. There is no config key for this: a file that answered yes in
-    /// advance would cancel the confirmation, and cancel it invisibly.
+    /// confirming, removes nothing and exits 2. There is no config key for this:
+    /// a file that answered yes in advance would cancel the confirmation, and
+    /// cancel it invisibly.
     #[arg(long)]
     pub yes: bool,
 
@@ -1377,50 +1395,79 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
-    /// Both verbs are listed, and they document the **same** flags — which is
-    /// the claim the whole split rests on, and the one a reader checks in
-    /// `--help` rather than in this file.
+    /// Both verbs are listed, and they take the **same** flags — the claim the
+    /// whole split rests on.
+    ///
+    /// Asked of clap rather than of the rendered page. Scraping words beginning
+    /// `--` out of the help text made the prose part of the assertion: naming
+    /// `--apply` in `clean`'s description, to say where it went, registered as a
+    /// flag `preview` did not have.
     #[test]
-    fn help_documents_both_verbs_identically() {
+    fn both_verbs_take_the_same_flags() {
         use clap::CommandFactory;
 
-        let top = Args::command().render_long_help().to_string();
+        let mut command = Args::command();
+        // Globals are propagated into subcommands at build time, so the two
+        // verbs are only comparable after this.
+        command.build();
+
+        let top = command.render_long_help().to_string();
         for verb in ["preview", "clean"] {
             assert!(top.contains(verb), "--help must list {verb}:\n{top}");
         }
 
-        let page = |verb: &str| {
-            Args::command()
-                .find_subcommand_mut(verb)
+        let flags = |verb: &str| {
+            let mut names: Vec<&str> = command
+                .find_subcommand(verb)
                 .unwrap_or_else(|| panic!("the {verb} subcommand exists"))
-                .render_long_help()
-                .to_string()
-        };
-        let flags = |page: &str| {
-            let mut found: Vec<String> = page
-                .split_whitespace()
-                .filter(|word| word.starts_with("--"))
-                .map(|word| word.trim_end_matches(&[',', '.'][..]).to_owned())
+                .get_arguments()
+                .filter_map(|arg| arg.get_long())
                 .collect();
-            found.sort();
-            found.dedup();
-            found
+            names.sort_unstable();
+            names
         };
 
-        let preview = page("preview");
-        let clean = page("clean");
-        for flag in ["--safe", "--purge", "--yes", "--min-size", "--older-than"] {
-            assert!(clean.contains(flag), "`clean --help` must mention {flag}");
+        let clean = flags("clean");
+        for flag in [
+            "safe",
+            "purge",
+            "yes",
+            "min-size",
+            "older-than",
+            "depth",
+            "sort",
+            "json",
+        ] {
+            assert!(
+                clean.contains(&flag),
+                "`clean` must take --{flag}: {clean:?}"
+            );
         }
-        assert_eq!(
-            flags(&preview),
-            flags(&clean),
-            "the two verbs must offer the same flags"
-        );
-        assert!(
-            !clean.contains("--apply") && !clean.contains("--allow-dirty"),
-            "and neither of the two that went:\n{clean}"
-        );
+        for gone in ["apply", "allow-dirty"] {
+            assert!(
+                !clean.contains(&gone),
+                "--{gone} was removed in v0.5: {clean:?}"
+            );
+        }
+        assert_eq!(flags("preview"), clean, "the two must offer the same flags");
+    }
+
+    /// And what they *do* is documented where a user looks — the three tiers and
+    /// both ways out of the refusal, in `clean --help` rather than only in the
+    /// README.
+    #[test]
+    fn the_help_explains_the_tiers_and_the_refusal() {
+        use clap::CommandFactory;
+
+        let page = Args::command()
+            .find_subcommand_mut("clean")
+            .expect("the clean subcommand exists")
+            .render_long_help()
+            .to_string();
+
+        for word in ["purge", "trash", "confirm", "--safe", "--yes"] {
+            assert!(page.contains(word), "{word} missing from:\n{page}");
+        }
     }
 
     /// `--help` is a terminal, not a rendered page.

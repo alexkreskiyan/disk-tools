@@ -4,10 +4,14 @@ Find what's eating your disk. `disk-tools` walks a directory tree in parallel,
 measures **real on-disk (allocated) size**, and prints a size-sorted tree of the
 biggest consumers — or JSON.
 
-**v0.4 — scan, a cleanup engine, a config file, and a browser.**
-`disk-tools clean` finds regenerable junk and stale files and offers to remove
-them **to the OS trash**. It is a dry run by default: nothing is deleted without
-`--apply`.
+**v0.5 — scan, preview, clean, a config file, and a browser.**
+Two verbs, not one flag: **`disk-tools preview` shows what would go and changes
+nothing; `disk-tools clean` removes it**, to the OS trash, immediately. They take
+an identical flag set, because the way a preview is acted on is to retype the
+same line with the other verb.
+
+`clean` still refuses while anything in the plan is not regenerable — that is the
+guard that mattered, and it stayed when `--apply` went.
 
 What counts as junk is not fixed. Detection is a list of rules you can read and
 edit — `disk-tools config init` writes the defaults out with their comments —
@@ -19,8 +23,9 @@ there. See the [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the
 full vision and the specs for the
 [scanner](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md),
 the [cleanup engine](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md),
-[configuration](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md)
-and the [browser](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md).
+[configuration](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md),
+the [browser](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
+and [preview + clean](kb/specs/2026.07/2026.07.29-disk-tools-v0.5-preview-clean.md).
 
 Cross-platform: macOS, Linux, Windows.
 
@@ -56,16 +61,18 @@ because `ratatui` 0.30.2 needs it; before the browser the floor was 1.85.
 disk-tools <COMMAND> [OPTIONS] <PATH>
 ```
 
-Three verbs, and a bare `disk-tools` prints help rather than guessing:
+Four verbs, and a bare `disk-tools` prints help rather than guessing:
 
 | | |
 |---|---|
 | `disk-tools scan <PATH>` | measure and report |
-| `disk-tools clean <PATH>` | find removable junk |
+| `disk-tools preview [PATH]` | what `clean` would remove. Changes nothing |
+| `disk-tools clean [PATH]` | remove it, to the OS trash |
 | `disk-tools ui [PATH]` | interactive browser; defaults to the current directory |
 
-The path is **always explicit** — `disk-tools` never scans the current directory by
-accident.
+`scan` demands a path — it never scans the current directory by accident.
+`preview` and `clean` ask your rules where to look when you give them none, and
+`ui` opens where you are, which is the one case where guessing is what you meant.
 
 ```console
 $ disk-tools scan project
@@ -273,9 +280,9 @@ This is the part to know before you hand-edit `config.toml`.
   neighbours.
 - **Keys that fall back to a default are removed.** A rule that no longer needs
   `requires-sibling` loses the key rather than keeping a stale one. `tier` is
-  the exception and is always written out — it decides whether `--apply` takes
-  something without asking, and a setting that consequential should not be
-  invisible.
+  the exception and is always written out — it decides whether `clean` takes
+  something without asking, and whether it can be brought back afterwards. A
+  setting that consequential should not be invisible.
 - **Adding the first rule to a file with no `[[rules]]` writes the built-ins out
   too.** An absent `[[rules]]` means "leave the built-ins alone", so appending
   one table would silently turn five rules into one. The browser says when it
@@ -294,31 +301,79 @@ matching", which is the thing you would be there to diagnose.
 ### What it will not do
 
 `ui` needs a terminal and refuses a pipe with a sentence rather than escape
-sequences; use `scan` or `clean` for something you can redirect. It never
-deletes: removal is `clean`'s, with its dry run, its tiers and its denylist.
+sequences; use `scan` or `preview` for something you can redirect. It never
+deletes: removal is `clean`'s, with its tiers, its refusal and its denylist.
 
 ## Cleaning up
 
-`disk-tools clean [PATH]` looks for things that can be regenerated, and tells you
-what it would remove:
+Two verbs. **`preview` shows, `clean` removes.**
 
 ```console
-$ disk-tools clean ~/code
-   40.0K  pycache       auto  ~/code/proj/__pycache__
-    1.2M  node-modules  auto  ~/code/proj/node_modules
+$ disk-tools preview ~/code
+   40.0K  pycache        1 candidate   trash
+    1.2M  node-modules   1 candidate   trash
 
 Reclaimable: 1.2M
 
 Not touched:
-  ~/code/proj/target — uncommitted changes; --allow-dirty to include
+  ~/code/proj/target — uncommitted changes; set requires-clean-repo = false on the rule to include
 
-Dry run — nothing was removed. Re-run with --apply.
+Preview — nothing was removed. The same line with `clean` removes it.
 ```
 
-**Nothing is deleted without `--apply`.** The command above touched nothing; it
-is a report. And when you do pass `--apply`, everything goes to the **OS trash**
-— a cleanup tool that is wrong once should cost you a trip to the Trash, not
-your data. (`--purge` deletes outright instead; see [below](#purge).)
+`preview` changes nothing on disk, whatever flags it is given. `clean` takes the
+**same flags** and does it:
+
+```console
+$ disk-tools clean ~/code
+Removed 2 of 2. Freed 1.2M.
+```
+
+That symmetry is the point: you act on a preview by retyping the line with the
+other verb, so a flag one of them refused would break the copy at exactly the
+moment you had decided to act.
+
+Everything goes to the **OS trash** unless a rule or `--purge` says otherwise —
+a cleanup tool that is wrong once should cost you a trip to the Trash, not your
+data. See [tiers](#three-things-stand-between-a-match-and-a-deletion) and
+[purge](#purge).
+
+> **`clean` removes immediately.** There is no `--apply` any more: a flag that
+> decided whether a command was destructive is a flag that gets forgotten in both
+> directions. What replaced it is the verb — and the one guard that was about the
+> *plan* rather than about ceremony is still there, so a bare `clean` takes only
+> what your rules say is regenerable and refuses while anything else is in it.
+
+### How much of the report you get
+
+`-d, --depth` decides how far it unfolds, and `0` is the default:
+
+```console
+$ disk-tools preview ~/code                 # -d 0: one line per rule
+   40.0K  pycache        1 candidate   trash
+    1.2M  node-modules   1 candidate   trash
+
+$ disk-tools preview ~/code -d 1            # every candidate
+   40.0K  pycache       trash  ~/code/proj/__pycache__
+    1.2M  node-modules  trash  ~/code/proj/node_modules
+
+$ disk-tools preview ~/code -d 2            # and inside each one
+    1.2M  node-modules  trash  ~/code/proj/node_modules
+  890.0K    .bin/
+  310.0K    typescript/
+```
+
+Level 0 is what "what would this take" asks of a whole run before it asks it of
+any one path — and it is how a rule set that has grown a mistake shows it in three
+lines rather than in nine hundred. Level 2 and deeper answer "why is this four
+gigabytes", which never changes a decision, since a candidate is removed whole.
+
+`--sort name` (the default) or `--sort size` orders the rows. Equal sizes are
+ordered by path, so two runs over one unchanged disk print identically and can be
+diffed.
+
+All of this is **display only**. Nothing it hides is anything `clean` will spare —
+for that, see [`--min-size`](#cutting-the-noise) and `--safe`.
 
 ### What it looks for
 
@@ -345,72 +400,86 @@ candidate, not 40,000.
 `rust-target` needs the manifest because `target/` is an ordinary directory name.
 Without that check, someone's `target/` of photographs would be build output.
 
-### Four things stand between a match and a deletion
+### Three things stand between a match and a deletion
 
 **1. The never-touch denylist.** `/System`, `/Library/Caches` (no tilde),
 `/Windows`, `/Program Files`, `~/Library/Application Support`, `%APPDATA%` — and
-anything inside them. **No flag overrides this**, including `--apply`. Note the
-tilde: `~/Library/Caches` is a candidate, `/Library/Caches` is not.
+anything inside them. **No flag, no rule and no tier overrides this**, `purge`
+included. Note the tilde: `~/Library/Caches` is a candidate, `/Library/Caches` is
+not.
 
-**2. Two tiers.** The built-in rules above are `auto` — regenerable, so removable
-without argument. Anything matched by age is `confirm`. `--safe` offers only the
-`auto` tier, and `--apply` refuses while anything `confirm` is still in the plan.
+**2. Three tiers.** Each rule says what `clean` does with what it claims:
 
-> **A rule you write sets its own tier, and `auto` is a claim the tool cannot
-> check.** For the five built-ins, `auto` is this project's word that the content
-> comes back from a build or a lockfile install. For a rule in your config file it
-> is *your* word, and `--apply` will take it without asking. Nothing verifies that
-> what you marked regenerable is. If you are unsure, leave `tier` out — an
-> unstated tier is `confirm`.
+| `tier` | What `clean` does | `--safe` admits |
+|--------|-------------------|-----------------|
+| `purge` | destroys it — no confirmation, and no trash | yes |
+| `trash` | moves it to the OS trash | yes |
+| `confirm` (unstated default) | nothing, until `--yes` | no |
+
+All three answer one question, which is why they are one field. `purge` is
+`trash` plus "no undo" — the same claim of regenerability, made harder — so
+**`--safe` keeps it**: that flag drops what needs confirming, and purge needs
+none.
+
+`purge` earns its place because the trash does not free space until it is
+emptied. Moving 20 GB of `node_modules` into it leaves a full disk full and adds
+a second, manual step; for what a single command regenerates, the trash is not a
+safety net but a chore.
+
+> **A rule you write sets its own tier, and anything but `confirm` is a claim the
+> tool cannot check.** For the built-ins, `trash` is this project's word that the
+> content comes back from a build or a lockfile install. For a rule in your config
+> file it is *your* word, and `clean` will act on it without asking. If you are
+> unsure, leave `tier` out — an unstated tier is `confirm`.
 
 **3. The git guard.** Build output belonging to a project with uncommitted
 changes is left alone — you may be mid-work, and it only regenerates identically
-from committed source. `--allow-dirty` includes it anyway. If `git` is missing or
-the repository cannot be read, the answer is "dirty": when the tool cannot know,
-it does not delete.
-
-**4. The dry run itself**, which is the default.
+from committed source. It is the rule's own `requires-clean-repo`, so turning it
+off is a line in the file next to the rule it guards; there is no flag, because a
+global switch would be a coarser duplicate of a setting that was already there.
+If `git` is missing or the repository cannot be read, the answer is "dirty": when
+the tool cannot know, it does not delete.
 
 Exclusions are always reported with a reason, and the two reasons are not
-interchangeable — `--allow-dirty` relaxes the guard and nothing else.
+interchangeable: one is a setting you chose and can unchoose, the other is
+absolute.
 
-### Removing
+### The refusal
 
-```console
-$ disk-tools clean ~/code --apply
-Removed 3 of 3. Freed 2.0M.
-```
+`clean` prints the plan to stderr first, so the last thing you see before a
+deletion is the list of what is about to go. A partial failure exits non-zero and
+names every path still on disk.
 
-The plan is printed first, to stderr, so the last thing you see before a deletion
-is the list of what is about to go. A partial failure exits non-zero and names
-every path still on disk.
-
-**`--apply` stops while anything not regenerable is in the plan:**
+**It stops while anything not regenerable is in the plan:**
 
 ```console
-$ disk-tools clean ~/code --older-than 90d --apply
-   40.0K  pycache       auto     ~/code/proj/__pycache__
-    1.1M  node-modules  auto     ~/code/proj/node_modules
+$ disk-tools clean ~/code --older-than 90d -d 1
+   40.0K  pycache       trash    ~/code/proj/__pycache__
+    1.1M  node-modules  trash    ~/code/proj/node_modules
     4.0K  old           confirm  ~/code/proj/notes.txt
 
 Reclaimable: 1.2M
 
-Dry run — nothing was removed. Re-run with --apply.
+Preview — nothing was removed. The same line with `clean` removes it.
 
 1 candidate is not regenerable, and nothing was removed.
 Add --safe to take only the regenerable ones, or --yes to take all of them.
 ```
 
-It exits 2 and removes nothing at all — not even the two regenerable ones, since
-a partial removal you did not ask for is its own surprise. `--safe` takes the
-`auto` tier and leaves the rest; `--yes` takes everything, saying the count aloud
-first.
+It exits **2** and removes nothing at all — not even the two regenerable ones,
+since a partial removal you did not ask for is its own surprise. `--safe` drops
+what needs confirming and takes the rest; `--yes` takes everything, saying the
+count aloud first.
+
+Exit 2 rather than 1, because 1 already means "the removal partly failed" — and a
+script that cannot tell *nothing happened, add a flag* from *some things could not
+be deleted* has lost the distinction it most needs.
 
 There is no prompt. A real one needs stdin, TTY detection and a story for piped
 input, which belongs with the interactive browser; a refusal gives the same
-guarantee — nothing not regenerable goes without you saying so — for the price of
-one flag. Set `require-confirmation = false` in your config to get v0.2's
-behaviour back, where reading the list and typing `--apply` was the confirmation.
+guarantee — nothing that is not regenerable goes without you saying so — for the
+price of one flag. Set `require-confirmation = false` in your config if you would
+rather the list itself were the confirmation.
 
 ### Cutting the noise
 
@@ -419,8 +488,8 @@ directories of a few kilobytes each, burying the two entries that actually
 matter. `--min-size` drops them:
 
 ```console
-$ disk-tools clean ~/code --min-size 1M
-    2.0M  node-modules  auto  ~/code/proj/node_modules
+$ disk-tools preview ~/code --min-size 1M -d 1
+    2.0M  node-modules  trash  ~/code/proj/node_modules
 
 Reclaimable: 2.0M
 
@@ -433,11 +502,12 @@ one is a flag on this command line, the other a line in a file you have to go an
 find.
 
 **This narrows the plan, not just the display.** `scan --min-size` hides rows
-while the totals stay whole; here the report *is* the list of what `--apply` will
+while the totals stay whole; here the report *is* the list of what `clean` will
 remove, so showing two entries and removing a hundred and fifty would be exactly
-the mismatch every other rule here exists to prevent. The count of what was
-dropped is printed, and it is a separate line from `--safe`'s — the two have
-different remedies.
+the mismatch every other rule here exists to prevent. That is the difference
+between this flag and `-d`: one changes the answer, the other only how much of it
+you are shown. The count of what was dropped is printed, and it is a separate line
+from `--safe`'s — the two have different remedies.
 
 ### Purge
 
@@ -446,21 +516,44 @@ Finder — **~230 ms per call**, whatever the size of what is being removed — 
 tree of many small `__pycache__` directories used to take minutes. Removals are
 now sent in **one batch**, which brought 60 such directories from 14 s to 1.4 s.
 
-Where even that is more ceremony than the content deserves:
+And the trash frees no space at all until it is emptied, which for content a
+single command regenerates makes it a chore rather than a safety net.
+
+Two ways past it. **Per rule**, which is the one to reach for:
+
+```toml
+[[rules]]
+name     = "node-modules"
+root     = "~/Projects"
+includes = ["**/node_modules/"]
+tier     = "purge"          # regenerated by one command; the trash adds nothing
+```
+
+**Or for one run**, over everything in the plan:
 
 ```console
-$ disk-tools clean ~/code --apply --purge
-Deleting outright — these will NOT go to the trash and cannot be put back.
+$ disk-tools clean ~/code --purge
+3 candidates are being deleted outright — NOT to the trash, and cannot be put back.
 Removed 3 of 3. Freed 2.0M.
 ```
 
-**`--purge` deletes permanently.** No trash, no "Put Back", nothing to recover.
-The same 60 directories take 0.02 s.
+**Either way it deletes permanently.** No trash, no "Put Back", nothing to
+recover. The same 60 directories take 0.02 s instead of 1.4.
 
-It requires `--apply` — on its own it is a usage error, so the intent has to be
-stated twice — and the report never claims anything is recoverable after it. Use
-it for build output and caches you would not miss; use the default for anything
-you would.
+The rule is the safer of the two: it applies to exactly what you wrote it about,
+while the flag takes the whole plan. And a mixed run says which half is which:
+
+```
+Removed 4 of 4. Freed 3.2M.
+  1.2M in the trash, recoverable; 2.0M destroyed, not.
+```
+
+`--purge` does **not** cancel the confirmation. It decides where a candidate
+goes, not whether you were asked about it, so `clean --purge` still refuses while
+anything in the plan needs confirming. And the denylist is untouched by both.
+
+Use either for build output and caches you would not miss; leave the default for
+anything you would.
 
 ### Reclaimable is an upper bound
 
@@ -537,7 +630,7 @@ name             = "csharp-bin"
 root             = "~/Projects"
 includes         = ["**/bin/", "**/obj/"]
 requires-sibling = "*.csproj"
-tier             = "auto"
+tier             = "trash"
 ```
 
 `~`, `%LOCALAPPDATA%` and `%APPDATA%` are expanded from your environment. **A
@@ -550,19 +643,24 @@ says which of the two applied. They are different things to go and change.
 ### Running with no path
 
 ```console
-$ disk-tools clean
+$ disk-tools preview
 disk-tools: examining /Users/you
 ```
 
-With no `<PATH>`, `clean` walks the roots of your enabled rules, merged so none
+With no `<PATH>`, both verbs walk the roots of your enabled rules, merged so none
 contains another. The default config roots `user-caches` at your home directory,
-so a bare `clean` walks all of it — slow, but a dry run. Narrow that rule, or
-name a path.
+so a bare invocation walks all of it.
+
+> **Try that one with `preview` first.** A bare `clean` walks your whole home and
+> then removes everything your rules claim in it, which with the shipped rules is
+> every `node_modules`, `target/` and cache under it. That is what the verb says
+> it does, and it is recoverable from the trash — but it is not what most people
+> mean to type while exploring. Narrow the rule's `root`, or name a path.
 
 If nothing names a directory it says so rather than reporting an empty plan:
 
 ```console
-$ disk-tools clean
+$ disk-tools preview
 disk-tools: no rule names a directory to clean.
 Pass a path, or give a rule a `root` other than "*".
 ```
@@ -571,10 +669,10 @@ Pass a path, or give a rule a `root` other than "*".
 
 | Not configurable | Why |
 |------------------|-----|
-| **The denylist** | A denylist a config can edit is not a denylist. `/System`, `/Windows`, `/Library/Caches` and the rest stay in the binary, and no rule, flag or file reaches them |
-| `--purge` | Deleting past the trash stays an explicit choice on one run. A default in a file would make it invisible |
-| `--allow-dirty` | Same: a file that silently disabled the git guard would hide that it had |
+| **The denylist** | A denylist a config can edit is not a denylist. `/System`, `/Windows`, `/Library/Caches` and the rest stay in the binary, and no rule, flag, tier or file reaches them |
+| `--purge` as a global | Sending a *whole plan* past the trash stays an explicit choice on one run. Per rule it is `tier = "purge"`, which applies to exactly what you wrote it about |
 | `--yes` | A file answering yes in advance cancels the confirmation, and cancels it invisibly |
+| A global git-guard switch | It belongs to the rule that wants it: `requires-clean-repo`. A second, coarser way to turn it off would only be a way to turn it off by accident |
 
 One limitation worth knowing: a true/false setting turned **on** in the file
 cannot be turned back off from the command line, because a flag can only be
@@ -598,27 +696,34 @@ file may only make a cleanup more cautious.
 | `--config <PATH>` | Read this file instead of the one in your config directory. **Global** | — |
 | `-h`, `--help` / `-V`, `--version` | Print help / version | — |
 
-`disk-tools clean [PATH]` takes its own. **The path is optional** — without it,
-the roots of your configured rules are walked; see
+`disk-tools preview [PATH]` and `disk-tools clean [PATH]` take **the same set** —
+that is what lets you act on a preview by changing the first word. **The path is
+optional**; without it the roots of your configured rules are walked, see
 [Configuration](#running-with-no-path).
 
-| Flag | Effect |
-|------|--------|
-| `--apply` | **Actually remove**, to the OS trash. Without it nothing is touched |
-| `--yes` | Also remove what is not regenerable. Without it `--apply` refuses while any `confirm`-tier candidate remains. Requires `--apply` |
-| `--safe` | Offer only the `auto` tier — regenerable output, nothing needing confirmation |
-| `--min-size <SIZE>` | Ignore anything smaller. **Narrows the plan, not just the printout** — unlike `scan`'s flag of the same name, what is shown is what `--apply` removes |
-| `--purge` | Delete **permanently** instead of trashing. Nothing can be put back; requires `--apply` |
-| `--allow-dirty` | Include build output whose project has uncommitted changes. Relaxes **only** the git guard |
-| `--older-than <DURATION>` | Also offer anything untouched for this long: `90d`, `2w`, `6m`, `1y`. A bare number is rejected — `90` could mean seconds as easily as days. `m` is 30 days, `y` is 365 |
+| Flag | Effect | Changes |
+|------|--------|---------|
+| `--safe` | Drop everything that needs confirming. Keeps `purge` and `trash` — it is about confirmation, not about destinations | the plan |
+| `--min-size <SIZE>` | Ignore anything smaller. **Narrows the plan, not just the printout** — unlike `scan`'s flag of the same name, what is shown is what `clean` removes | the plan |
+| `--older-than <DURATION>` | Also offer anything untouched for this long: `90d`, `2w`, `6m`, `1y`. A bare number is rejected — `90` could mean seconds as easily as days. `m` is 30 days, `y` is 365 | the plan |
+| `--purge` | Send the **whole plan** past the trash. Nothing can be put back. Per rule this is `tier = "purge"`; neither cancels the confirmation | the plan |
+| `--yes` | Also remove what needs confirming. Without it `clean` refuses while any `confirm`-tier candidate remains, and exits 2 | the plan |
+| `-d`, `--depth <N>` | `0` groups by rule (default), `1` lists candidates, `2`+ unfolds inside them | the display |
+| `--sort <KEY>` | `name` (default) or `size`. Largest first, ties broken by path | the display |
+| `--json` | The whole plan (`preview`) or the whole outcome (`clean`). Ignores `-d` and `--sort` | the display |
 
-**`--depth` and `--min-size` filter what is printed, never what is counted.** A
-directory's size is always its full subtree, exactly like `du`. Hiding a 400 MB
-child does not shrink its parent's number — that's the point: you still see where
-the space went.
+`preview` accepts every one of them and still changes nothing — including
+`--purge` and `--yes`, which do nothing there. A flag it refused would break the
+copy at exactly the moment you had decided to act.
 
-`--json` always emits the **full** tree with raw byte counts; the display filters
-apply to the tree report only.
+**Display flags filter what is printed, never what is counted.** In `scan`, a
+directory's size is always its full subtree, exactly like `du`: hiding a 400 MB
+child does not shrink its parent's number. In `preview` and `clean`, nothing `-d`
+hides is anything `clean` will spare.
+
+`--json` always emits the **full** answer with raw byte counts, and no display
+flag can change a byte of it. `preview --json` is a plan and `clean --json` is an
+outcome — two documents, told apart by the fields they have and by the exit code.
 
 `disk-tools ui [PATH]`:
 
@@ -673,7 +778,7 @@ accumulates one total and keeps nothing, where `disk-tools` builds the tree that
 report, and the planned TUI, both need.
 
 Cleanup adds one cost worth knowing: the git guard spawns `git status` once per
-repository, measured at **~23 ms each**, which dominates a dry run over a tree of
+repository, measured at **~23 ms each**, which dominates a `preview` over a tree of
 many projects — see [the note](kb/benchmarks/2026.07/2026.07.25-clean-latency.md).
 Every other rule is a pure pass over the already-built tree.
 
@@ -692,19 +797,21 @@ Reproduce with `just bench-fixtures <dir>` → `just bench <dir>` → `just benc
 
 ## Limitations
 
-Cleanup, first — these are the ones worth reading before `--apply`:
+Cleanup, first — these are the ones worth reading before your first `clean`:
 
 | Limitation | Detail |
 |------------|--------|
 | **On Windows, one failure mode cannot be caught** | The `trash` crate calls `CoCreateInstance(...).unwrap()` on its Windows delete path. If COM cannot be initialised — a service, a session-0 process, some sandboxes — it **panics** rather than returning an error, aborting the run mid-way. No wrapper here can convert a panic, so "the summary names what survived" holds for every failure the backend *reports*, and not for that one. `just smoke-trash` runs on all three platforms in CI so a COM-hostile environment shows up as a red build. |
 | **On macOS, recoverability cannot be verified by a test** | `~/.Trash` needs Full Disk Access and the crate offers no way to list it there, so an automated test can assert only that the original path is gone — which an unrecoverable delete would also satisfy. It rests on the crate's documented behaviour and one manual check. Linux and Windows can be checked properly. |
 | **`(shared)` is not detectable across the scan boundary on Windows** | See [Reclaimable is an upper bound](#reclaimable-is-an-upper-bound). Absence of the flag there is not evidence of unshared content. |
-| **Removing to the trash costs ~230 ms per batch on macOS** | Every trash operation is an `osascript` round-trip to Finder. Removals are batched into one call, so the cost is per *run* rather than per candidate — 60 small directories take 1.4 s, against 0.02 s for `--purge`. |
-| **A dry run costs ~23 ms per repository** | The git guard spawns `git status --porcelain` once per repository. Over 50 dirty Rust projects a `clean` is 1.2 s against 15 ms for a plain scan — 80×. `--allow-dirty` skips it entirely and is free. [Measured.](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) |
-| **`--apply` refuses rather than prompting** | For the `confirm` tier it stops and asks you to add `--safe` or `--yes`, rather than asking about each path. A real prompt needs stdin, TTY detection and a story for piped input, which belongs with the interactive browser. See [Removing](#removing). |
+| **Removing to the trash costs ~230 ms per batch on macOS** | Every trash operation is an `osascript` round-trip to Finder. Removals are batched into one call, so the cost is per *run* rather than per candidate — 60 small directories take 1.4 s, against 0.02 s past the trash. |
+| **The trash frees nothing until it is emptied** | A `clean` that only trashes has moved the problem, not solved it. On a disk that is actually full, `tier = "purge"` on the rules whose content a command regenerates is what recovers the space. |
+| **Planning costs ~23 ms per repository** | The git guard spawns `git status --porcelain` once per repository. Over 50 dirty Rust projects a `preview` is 1.2 s against 15 ms for a plain scan — 80×. It runs only for rules that set `requires-clean-repo`. [Measured.](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) |
+| **`clean` refuses rather than prompting** | For the `confirm` tier it stops and asks you to add `--safe` or `--yes`, rather than asking about each path. A real prompt needs stdin, TTY detection and a story for piped input, which belongs with the interactive browser. See [The refusal](#the-refusal). |
+| **A bare `clean` removes** | It walks your rules' roots and takes what they claim. That is what the verb says, and it goes to the trash, but the shipped config roots `user-caches` at your home directory — so `preview` is the one to explore with. See [Running with no path](#running-with-no-path). |
 | **The browser writes your config file** | `a` then `↵` edits `config.toml` in place. Comments survive and neighbouring rules are untouched, but it is a program editing a file you may also be editing — `R` re-reads, and there is no merge. See [The browser writes your config file](#the-browser-writes-your-config-file). |
 | **Row colours do not consult `requires-clean-repo`** | `included` means the rule's patterns and its cheap predicates match. Whether `clean` will actually act also depends on the git guard, which costs a `git status` per repository and is not run per row. A yellow row inside a dirty repository is still refused by `clean`, with a reason. |
-| **`auto` on a rule you wrote is unverified** | The tool takes your word that the content regenerates, and removes it without asking. For the five built-in rules `auto` is this project's claim; for yours it is yours. See [Two tiers](#four-things-stand-between-a-match-and-a-deletion). |
+| **A tier you wrote is unverified** | `trash` and `purge` both say "this regenerates", and the tool takes your word for it: it removes without asking, and `purge` without a way back. For the built-in rules that word is this project's; for yours it is yours. An unstated tier is `confirm`. See [Three tiers](#three-things-stand-between-a-match-and-a-deletion). |
 
 And the scanner's, unchanged from v0.1:
 

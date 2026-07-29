@@ -2,14 +2,14 @@
 
 Cross-platform disk-utilities CLI in Rust, distributed as `disk-tools`. It finds
 what eats disk space — a fast parallel scan printing a dust-style size-sorted
-tree — offers to clean it up (`disk-tools clean` detects regenerable junk and
-stale files and removes them **to the OS trash**, dry-run by default), and browses
-it interactively (`disk-tools ui`).
+tree — shows what could go (`disk-tools preview`), removes it (`disk-tools
+clean`, **to the OS trash**), and browses it interactively (`disk-tools ui`).
 
 **v0.1 (scan + tree report), v0.2 (detectors + cleanup engine), v0.3 (config +
-declarative rules) and v0.4 (the TUI) are complete.** Detection is declarative and
-reads a TOML config; flags beat the file; `clean` walks the rule roots when given
-no path; `--apply` refuses while anything not regenerable is in the plan. See the
+declarative rules), v0.4 (the TUI) and v0.5 (preview + clean) are complete.**
+Detection is declarative and reads a TOML config; flags beat the file; the
+cleanup verbs walk the rule roots when given no path; `clean` refuses while
+anything needing confirmation is in the plan. See the
 [concept](kb/concepts/2026.07/2026.07.14-disk-tools.md) for the full vision and
 its Roadmap for what lands when; the
 [v0.1](kb/specs/2026.07/2026.07.14-disk-tools-v0.1-scan-report.md),
@@ -19,11 +19,13 @@ the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools
 (the TUI) **is complete** — `disk-tools ui` browses a directory as a table, sizes
 its subdirectories in the background, colours them by what the rules say, filters
 with `/`, writes rules back to `config.toml` with every comment intact, and
-always gives the terminal back. **[v0.5](kb/specs/2026.07/2026.07.29-disk-tools-v0.5-preview-clean.md)
-(preview + clean) is specced, not started**; it splits `clean` into two verbs,
-drops `--apply` and `--allow-dirty`, and makes where a candidate goes a third
-tier. Duplicates move to v0.6. User-facing usage, flags, the safety model and
-the documented limitations live in the [README](README.md).
+always gives the terminal back.
+**[v0.5](kb/specs/2026.07/2026.07.29-disk-tools-v0.5-preview-clean.md) is
+complete** — `preview` shows and `clean` removes, on an identical flag set;
+`--apply` and `--allow-dirty` are gone; the report unfolds by `-d` and orders by
+`--sort`; where a candidate goes is a third tier (`purge` / `trash` / `confirm`);
+and both verbs speak `--json`. **v0.6 is duplicates.** User-facing usage, flags,
+the safety model and the documented limitations live in the [README](README.md).
 
 ## Important: Documentation Requirements
 
@@ -95,7 +97,7 @@ disc-tools/
 ├── cli/                # disk-tools (bin) — CLI frontend
 │   ├── Cargo.toml      # clap, toml, serde, serde_ignored, indicatif, unicode-width
 │   ├── src/
-│   │   ├── main.rs     # verb dispatch (scan | clean); spinner to stderr
+│   │   ├── main.rs     # verb dispatch (scan | preview | clean | ui); spinner to stderr
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
 │   │   ├── config/     # locate/parse/validate the TOML file; `config init`
 │   │   │   └── write.rs    # putting a rule back, comments and all
@@ -111,8 +113,8 @@ disc-tools/
 │   │   └── render/
 │   │       ├── mod.rs
 │   │       ├── tree.rs     # dust-style tree, parent-relative bars
-│   │       ├── json.rs     # --json (full tree, raw byte counts)
-│   │       ├── clean.rs    # the dry-run report and the apply outcome
+│   │       ├── json.rs     # --json: the tree, a plan, or an outcome — raw byte counts
+│   │       ├── clean.rs    # the plan by depth, and what a removal did
 │   │       └── skipped.rs  # skipped-entries summary (capped at 10)
 │   └── tests/cli.rs    # integration tests
 ├── scripts/
@@ -258,8 +260,13 @@ overrides it; `disk-tools config init` writes the commented defaults.
 
 The file supplies the **rules**. An absent `[[rules]]` leaves the built-ins
 alone; an empty list means none. `root` is required, and `"*"` is how a rule says
-it applies wherever the scan goes. The **denylist is not in the file** and cannot
-be put there, and neither are `--purge` or `--allow-dirty`.
+it applies wherever the scan goes. `tier` is one of `purge` / `trash` /
+`confirm`, and `"auto"` is an **error** naming `trash` rather than an alias.
+
+The **denylist is not in the file** and cannot be put there, and neither is
+`--yes` or a global `--purge`. Per rule, `tier = "purge"` says the same thing
+about exactly what that rule claims, which is finer and visible where it applies;
+the git guard is `requires-clean-repo` for the same reason.
 
 Precedence is **flag > file > built-in default**, expressed in exactly one place
 (`Args::resolve`). No overridable flag carries a clap `default_value`: with one,
@@ -291,7 +298,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 
 | Folder | Purpose | Latest snapshot |
 |--------|---------|-----------------|
-| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.27` |
+| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.30` |
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
 | `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.26` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
@@ -306,6 +313,7 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 ## Documentation
 
 **Architecture** (snapshots from `kb/architecture/2026.07/`)
+- [After v0.5: two verbs, three tiers, and a plan that says what it will do](kb/architecture/2026.07/2026.07.30-preview-and-clean.md) — what was ceremony and what was a guard, why `--purge` must not rewrite a tier, display versus plan
 - [After v0.4: the browser, and why it does not scan](kb/architecture/2026.07/2026.07.27-tui-lazy-model.md) — the lazy model, what replaced the generation counter, what four rounds of real use found
 - [After v0.3: detection as data](kb/architecture/2026.07/2026.07.26-overview.md) — the rule engine, the config path, multi-root `clean`, which invariants moved
 - [Overview](kb/architecture/2026.07/2026.07.25-overview.md) — the three-phase pipeline, data model, invariants, platform splits

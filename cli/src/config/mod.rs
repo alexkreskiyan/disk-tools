@@ -88,6 +88,19 @@ safe                 = false    # as if --safe were always passed
 #
 #   requires-sibling = "*.csproj"                   # a .NET project lives here
 #   requires-sibling = ["*.csproj", "*.sln"]        # and a solution beside it
+#
+# `tier` says what `clean` does with what the rule claims. Three answers to one
+# question, and an unstated tier is the cautious one:
+#
+#   purge     destroys it. No confirmation, and no trash — for content a single
+#             command regenerates, where the trash is a chore rather than a
+#             safety net, since it frees nothing until it is emptied.
+#   trash     moves it to the OS trash. No confirmation.
+#   confirm   nothing, until you pass --yes. The default when `tier` is absent.
+#
+# `--safe` drops what needs confirming, so it keeps *both* of the others: purge
+# is a stronger claim of regenerability than trash, not a weaker one. Anything
+# but `confirm` is a claim this tool cannot check — it takes your word and acts.
 
 [[rules]]
 name                = "rust-target"
