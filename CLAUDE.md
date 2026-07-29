@@ -186,6 +186,17 @@ Invariants worth keeping in mind:
 - **The core reads no clock and no environment.** `now` and `UserDirs` come from
   `cli/src/env.rs`; that is what makes every rule testable with a temp directory
   standing in for a home.
+- **Every path the tool acts on is made absolute in `Args::resolve`**, through
+  `args::absolute` — `std::path::absolute`, never `canonicalize`. A rooted rule
+  is compiled against an absolute root (`~` resolves to one), so a relative path
+  produces nodes no such glob can match and the run silently claims nothing:
+  `preview .` inside a project said "Nothing to clean" while `preview /full/path`
+  to the same directory found gigabytes. The core cannot do this itself — it
+  reads no environment, so it has no working directory to join.
+  **Known limitation:** the working directory the kernel returns is already
+  symlink-resolved, so a home behind a symlink (`/var` → `/private/var` on
+  macOS) makes `~`-rooted rules miss a relative path. Fixing that would mean
+  `canonicalize`, which would report and remove somewhere the user never named.
 - **No candidate nests inside another** (`detect` never descends into a match),
   which is what lets totals be summed and removals not repeat.
 - **A measured total is keyed on its absolute path**, never on the row it came

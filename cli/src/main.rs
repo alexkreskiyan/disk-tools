@@ -10,14 +10,14 @@ mod env;
 mod render;
 mod ui;
 
-use args::{Args, Environment, Mode, validate_root};
+use args::{Args, Environment, Intent, Mode, validate_root};
 use clap::Parser;
 use disk_tools_core::{
     CleanOptions, CleanOutcome, CleanPlan, Removal, ScanOptions, ScanTree, SkippedEntry, Tier,
     apply, plan, scan,
 };
 use indicatif::ProgressBar;
-use render::clean::{Intent, render_clean, render_outcome};
+use render::clean::{render_clean, render_outcome};
 use render::json::render_json;
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
@@ -82,14 +82,14 @@ fn main() -> ExitCode {
             confirm_tier_allowed,
             roots_from_rules,
             clean,
-            apply,
+            intent,
             removal,
         } => run_clean(
             &roots,
             roots_from_rules,
             *clean,
+            intent,
             Removing {
-                apply,
                 removal,
                 confirm_tier_allowed,
             },
@@ -176,13 +176,13 @@ fn run_scan(options: ScanOptions, number: Option<usize>, json: bool, verbose: bo
     emit(&report, &tree.skipped, verbose)
 }
 
-/// What `--apply` was asked to do, and how far it is allowed to go.
+/// How far a removal is allowed to go.
 ///
-/// Three booleans that only mean anything together: applying at all, whether the
-/// trash is bypassed, and whether the non-regenerable candidates may go. Passed
-/// as one value so no caller can supply two of the three.
+/// Two settings that only mean anything together: whether the trash is bypassed,
+/// and whether the candidates that are not regenerable may go. *Whether* to
+/// remove at all is no longer one of them — that is the verb, and it arrives as
+/// [`Intent`].
 struct Removing {
-    apply: bool,
     removal: Removal,
     confirm_tier_allowed: bool,
 }
@@ -204,6 +204,7 @@ fn run_clean(
     roots: &[PathBuf],
     roots_from_rules: bool,
     clean: CleanOptions,
+    intent: Intent,
     removing: Removing,
     verbose: bool,
 ) -> ExitCode {
@@ -221,8 +222,8 @@ fn run_clean(
     if roots_from_rules {
         // Announced only when the rules chose them. The default config roots
         // `user-caches` at the home directory, so a bare `disk-tools clean`
-        // walks all of it — slow rather than dangerous, the default still being
-        // a dry run, but no one should have to guess why it is taking a minute.
+        // walks all of it, and no one should have to guess why it is taking a
+        // minute — least of all now that the walk ends in a removal.
         let listed: Vec<String> = roots
             .iter()
             .map(|root| root.display().to_string())
@@ -261,7 +262,7 @@ fn run_clean(
 
     let planned = CleanPlan::merge(plans);
 
-    if removing.apply {
+    if intent == Intent::Removing {
         return remove(&planned, &removing, &skipped, verbose);
     }
 
@@ -273,7 +274,7 @@ fn run_clean(
     let hidden = clean.safe_only.then_some(planned.filtered_out);
 
     emit(
-        &render_clean(&planned, hidden, Intent::DryRun),
+        &render_clean(&planned, hidden, Intent::Preview),
         &skipped,
         verbose,
     )
@@ -292,7 +293,7 @@ fn remove(
 ) -> ExitCode {
     if planned.candidates.is_empty() {
         return emit(
-            &render_clean(planned, None, Intent::DryRun),
+            &render_clean(planned, None, Intent::Preview),
             skipped,
             verbose,
         );
@@ -314,7 +315,7 @@ fn remove(
     // the plan, so the count is zero and there is nothing to refuse.
     if confirm > 0 && !removing.confirm_tier_allowed {
         let code = emit(
-            &render_clean(planned, None, Intent::DryRun),
+            &render_clean(planned, None, Intent::Preview),
             skipped,
             verbose,
         );
@@ -338,7 +339,7 @@ fn remove(
 
     // To stderr: this is context for the operation, not the report. It also
     // keeps stdout to the outcome alone for anything reading it.
-    eprint!("{}", render_clean(planned, None, Intent::AboutToApply));
+    eprint!("{}", render_clean(planned, None, Intent::Removing));
     if confirm > 0 {
         // Reached only with `--yes`, or with `require-confirmation` turned off.
         // Saying the number out loud is what keeps either from being a blind yes.
@@ -573,7 +574,6 @@ mod removing_tests {
     #[test]
     fn only_the_trash_is_recoverable() {
         let removing = |removal| Removing {
-            apply: true,
             removal,
             confirm_tier_allowed: false,
         };

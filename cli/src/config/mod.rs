@@ -44,18 +44,19 @@ pub const DEFAULT_CONFIG: &str = r#"# disk-tools configuration.
 #
 # One exception, and it is a limitation rather than a rule: a true/false setting
 # turned on here cannot be turned back off from the command line, because a flag
-# can only be passed or not passed. `--purge` and `--allow-dirty` are absent
-# from this file for the same reason inverted — a file that silently deleted
-# past the trash, or disabled the git guard, would hide the fact.
+# can only be passed or not passed. `--purge` and `--yes` are absent from this
+# file for the same reason inverted — a file that silently deleted past the
+# trash, or answered a confirmation in advance, would hide that it had. The git
+# guard is settled per rule instead, by `requires-clean-repo`.
 #
 # The never-touch denylist is NOT here and cannot be configured.
 
 [scan]                          # walk behaviour, for `scan <PATH>` only
 one-file-system = false
 
-# `scan` only, and display only — none of it ever changes a total. `clean`
-# always lists every candidate, because that list is what you approve by typing
-# --apply, and a truncated one would be approval of what was never shown.
+# `scan` only, and display only — none of it ever changes a total. `preview`
+# and `clean` list every candidate: that list is what you act on by running the
+# other verb, and a truncated one would be acting on what was never shown.
 #
 # Commented-out keys are the built-in defaults; uncomment to change them.
 #   n     = 20    # show at most this many entries. Default: all of them.

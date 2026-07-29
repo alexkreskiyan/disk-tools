@@ -46,7 +46,10 @@ pub enum Command {
     /// Measure a directory and print a size-sorted tree.
     Scan(ScanArgs),
 
-    /// Find removable junk. Dry-run by default — nothing is deleted without --apply.
+    /// Show what `clean` would remove. Changes nothing on disk.
+    Preview(CleanArgs),
+
+    /// Remove what the rules claim. To the OS trash unless a rule says otherwise.
     Clean(CleanArgs),
 
     /// Browse a directory, with each entry coloured by what the rules say.
@@ -124,6 +127,12 @@ pub struct ScanArgs {
     pub json: bool,
 }
 
+/// The flags `preview` and `clean` share.
+///
+/// **One struct, both verbs, deliberately.** Preview is used by retyping the
+/// same line with the other verb, so a flag either verb did not accept would
+/// break the copy at exactly the moment the user had decided to act. Where a
+/// flag has nothing to do under `preview` it is still accepted and does nothing.
 #[derive(clap::Args, Debug)]
 pub struct CleanArgs {
     /// Directory to examine. Without one, the roots of your configured rules.
@@ -134,8 +143,7 @@ pub struct CleanArgs {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
-    /// Only offer regenerable safe-list categories; skip anything needing
-    /// per-item confirmation.
+    /// Drop everything that needs per-item confirmation.
     ///
     /// A config file can turn this on; the command line cannot turn it back off
     /// — which for this one is the right direction, since the file may only make
@@ -143,36 +151,43 @@ pub struct CleanArgs {
     #[arg(long)]
     pub safe: bool,
 
-    /// Actually remove the candidates, to the OS trash.
+    /// Delete outright instead of trashing. Nothing can be put back.
     #[arg(long)]
-    pub apply: bool,
-
-    /// Delete outright instead of trashing. Nothing can be put back. Requires --apply.
-    #[arg(long, requires = "apply")]
     pub purge: bool,
 
-    /// Remove candidates that are not regenerable too. Requires --apply.
+    /// Remove candidates that are not regenerable too.
     ///
-    /// Without it, --apply stops when the plan holds anything that needs
+    /// Without it, `clean` stops when the plan holds anything that needs
     /// confirming. There is no config key for this: a file that answered yes in
     /// advance would cancel the confirmation, and cancel it invisibly.
-    #[arg(long, requires = "apply")]
+    #[arg(long)]
     pub yes: bool,
-
-    /// Include build output whose project has uncommitted changes.
-    #[arg(long = "allow-dirty")]
-    pub allow_dirty: bool,
 
     /// Ignore anything smaller than this, e.g. 1M, 512K (1024-based). Default: 0.
     ///
     /// Unlike the scan flag of the same name this narrows the plan itself, so a
-    /// candidate it hides is one `--apply` will not remove.
+    /// candidate it hides is one `clean` will not remove.
     #[arg(long = "min-size", value_parser = parse_size)]
     pub min_size: Option<u64>,
 
     /// Also offer anything untouched for this long: 90d, 6m, 1y.
     #[arg(long = "older-than", value_parser = parse_duration, value_name = "DURATION")]
     pub older_than: Option<Duration>,
+}
+
+/// Whether this invocation removes anything.
+///
+/// The verb, as a value. It replaces v0.2's `--apply` boolean and lives here
+/// rather than in the renderer because it is what was *asked for*, and because
+/// the report and the removal must not be able to disagree about it: the
+/// closing line of a preview promises nothing happened, and printing that
+/// before a removal would make the last sentence a user reads the false one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// `preview`: print the plan. Nothing on disk changes.
+    Preview,
+    /// `clean`: the removal follows immediately.
+    Removing,
 }
 
 /// What the parsed arguments actually asked for.
@@ -211,7 +226,9 @@ pub enum Mode {
         /// the indirection every `Mode::Scan` — which needs none of it — would
         /// pay for the space anyway.
         clean: Box<CleanOptions>,
-        apply: bool,
+
+        /// Which verb this was. The only thing that differs between them.
+        intent: Intent,
         removal: Removal,
     },
     /// Write the default configuration to `target`.
@@ -289,7 +306,7 @@ impl Args {
             // `--no-…` counterpart per flag.
             Command::Scan(scan) => Ok(Mode::Scan {
                 options: ScanOptions {
-                    root: scan.root,
+                    root: absolute(scan.root),
                     min_size: scan.min_size.or(config.report.min_size).unwrap_or(0),
                     depth: scan.depth.or(config.report.depth),
                     apparent: scan.apparent || config.report.apparent.unwrap_or(false),
@@ -303,10 +320,12 @@ impl Args {
             }),
 
             Command::Ui(ui) => Ok(Mode::Ui {
-                // `.` rather than an absolute path: what the user typed is what
-                // the title bar should say, and `validate_root` is about to
-                // check it either way.
-                root: ui.path.unwrap_or_else(|| PathBuf::from(".")),
+                // Absolute, like every other path here. It was once left as
+                // typed so the path line would echo what the user wrote — but a
+                // relative `.` is a path no rooted rule can match, so the screen
+                // coloured a home full of junk as untracked and said nothing
+                // about why.
+                root: absolute(ui.path.unwrap_or_else(|| PathBuf::from("."))),
                 // No age rule: `--older-than` is a `clean` flag, and a browser
                 // that coloured every old file as junk would say nothing.
                 rules: Box::new(Rules::new(config.rules, &user_dirs).map_err(ResolveError::Rule)?),
@@ -323,56 +342,72 @@ impl Args {
                 .map(|target| Mode::ConfigInit { target, force })
                 .ok_or(ResolveError::NoConfigPath),
 
-            Command::Clean(clean) => {
-                // The configured rules — the built-ins when the file said nothing
-                // — plus the age rule **last** if it was asked for. Order is
-                // precedence, so appending it there is what keeps a `target/`
-                // reported as build output rather than merely as something old,
-                // which is what decides its tier.
-                let mut rules = config.rules;
-                let clean_settings = config.clean;
-                if let Some(older_than) = clean.older_than {
-                    rules.push(age_rule(older_than));
-                }
-
-                let rules = Rules::new(rules, &user_dirs).map_err(ResolveError::Rule)?;
-                // A path narrows the walk to itself; the rules still apply
-                // within it, and one rooted elsewhere simply matches nothing —
-                // `Rules::prunes` sees to that. With no path, the rules say
-                // where to look, which is what `root` is required for.
-                let roots_from_rules = clean.path.is_none();
-                let roots = match clean.path {
-                    Some(path) => vec![path],
-                    None => rules.scan_roots(),
-                };
-
-                Ok(Mode::Clean {
-                    roots,
-                    // **True** when nothing says otherwise. The concept asks for
-                    // confirmation on this tier, and the asymmetry the denylist
-                    // already states applies: refusing too readily costs a user
-                    // one extra flag, refusing too rarely costs them data.
-                    confirm_tier_allowed: clean.yes
-                        || !clean_settings.require_confirmation.unwrap_or(true),
-                    roots_from_rules,
-                    clean: Box::new(CleanOptions {
-                        detect: DetectOptions { rules, now },
-                        user_dirs,
-                        safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
-                        // Deliberately not configurable: a file that quietly
-                        // disabled the git guard would hide the disabling.
-                        allow_dirty: clean.allow_dirty,
-                        min_size: clean.min_size.unwrap_or(0),
-                    }),
-                    apply: clean.apply,
-                    removal: if clean.purge {
-                        Removal::Purge
-                    } else {
-                        Removal::Trash
-                    },
-                })
+            // One function for both, so that "the two verbs take the same flags
+            // and resolve them the same way" is a property of the code rather
+            // than of two arms staying in step.
+            Command::Preview(clean) => {
+                Self::cleanup(clean, Intent::Preview, now, user_dirs, config)
             }
+            Command::Clean(clean) => Self::cleanup(clean, Intent::Removing, now, user_dirs, config),
         }
+    }
+
+    /// The shared resolution of `preview` and `clean`.
+    fn cleanup(
+        clean: CleanArgs,
+        intent: Intent,
+        now: SystemTime,
+        user_dirs: UserDirs,
+        config: Config,
+    ) -> Result<Mode, ResolveError> {
+        // The configured rules — the built-ins when the file said nothing —
+        // plus the age rule **last** if it was asked for. Order is precedence,
+        // so appending it there is what keeps a `target/` reported as build
+        // output rather than merely as something old, which is what decides its
+        // tier.
+        let mut rules = config.rules;
+        let clean_settings = config.clean;
+        if let Some(older_than) = clean.older_than {
+            rules.push(age_rule(older_than));
+        }
+
+        let rules = Rules::new(rules, &user_dirs).map_err(ResolveError::Rule)?;
+        // A path narrows the walk to itself; the rules still apply within it,
+        // and one rooted elsewhere simply matches nothing — `Rules::prunes` sees
+        // to that. With no path, the rules say where to look, which is what
+        // `root` is required for.
+        let roots_from_rules = clean.path.is_none();
+        let roots = match clean.path {
+            Some(path) => vec![absolute(path)],
+            None => rules.scan_roots(),
+        };
+
+        Ok(Mode::Clean {
+            roots,
+            // **True** when nothing says otherwise. The concept asks for
+            // confirmation on this tier, and the asymmetry the denylist already
+            // states applies: refusing too readily costs a user one extra flag,
+            // refusing too rarely costs them data.
+            confirm_tier_allowed: clean.yes || !clean_settings.require_confirmation.unwrap_or(true),
+            roots_from_rules,
+            clean: Box::new(CleanOptions {
+                detect: DetectOptions { rules, now },
+                user_dirs,
+                safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
+                // Not a flag any more: the git guard is settled per rule, by
+                // `requires-clean-repo`, which is where it belongs. A global
+                // switch would be a coarser duplicate of it, and a file able to
+                // disable a guard would hide the disabling.
+                allow_dirty: false,
+                min_size: clean.min_size.unwrap_or(0),
+            }),
+            intent,
+            removal: if clean.purge {
+                Removal::Purge
+            } else {
+                Removal::Trash
+            },
+        })
     }
 }
 
@@ -463,6 +498,28 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
         .and_then(|days| days.checked_mul(DAY))
         .map(Duration::from_secs)
         .ok_or_else(|| format!("duration `{s}` is too large"))
+}
+
+/// The path made absolute, without touching the filesystem.
+///
+/// **Every path this tool acts on goes through here first.** A rooted rule is
+/// compiled against an absolute root — `~` resolves to one — so a relative path
+/// produces nodes like `./target` that no such glob can match, and the run finds
+/// nothing at all. `preview .` inside a project reported "Nothing to clean"
+/// while `preview /full/path` to the same directory reported four gigabytes.
+///
+/// [`std::path::absolute`], never `canonicalize`. This joins the working
+/// directory and drops `.` components **without following a single symlink**,
+/// which is the whole reason `canonicalize` is banned here: the path shown has
+/// to be the path acted on, and resolving links would report — and remove —
+/// somewhere the user never named.
+///
+/// A failure (an empty path, or no readable working directory) leaves the path
+/// as it was. Nothing downstream can succeed on such a path anyway, so it falls
+/// to `validate_root` to say so plainly, and the rules see a relative path they
+/// cannot match — which claims nothing, the safe direction.
+fn absolute(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
 }
 
 /// Fail before scanning if the root is missing or unreadable, so the user gets
@@ -945,35 +1002,85 @@ mod tests {
         }
     }
 
-    #[test]
-    fn clean_subcommand_parses_its_flags() {
-        let mode = resolved(&[
-            "clean",
-            "/x",
-            "--safe",
-            "--allow-dirty",
-            "--older-than",
-            "90d",
-            "--apply",
-        ])
-        .expect("parse");
+    /// What the verb resolved to, and how far it may go.
+    fn intent_of(args: &[&str]) -> Intent {
+        match resolved(args).expect("resolve") {
+            Mode::Clean { intent, .. } => intent,
+            other => panic!("expected a cleanup, got {other:?}"),
+        }
+    }
 
-        let Mode::Clean {
-            roots,
-            clean,
-            apply,
-            ..
-        } = mode
-        else {
-            panic!("expected the clean subcommand");
+    #[test]
+    fn both_verbs_parse_their_flags() {
+        for verb in ["preview", "clean"] {
+            let mode = resolved(&[verb, "/x", "--safe", "--older-than", "90d"]).expect("parse");
+
+            let Mode::Clean { roots, clean, .. } = mode else {
+                panic!("{verb} must resolve to a cleanup");
+            };
+            assert_eq!(roots, vec![PathBuf::from("/x")]);
+            assert!(clean.safe_only);
+            assert_eq!(
+                older_than_of(&clean),
+                Some(Duration::from_secs(90 * 24 * 60 * 60))
+            );
+        }
+    }
+
+    /// The verb is the whole difference. Anything else that varied between them
+    /// would be a preview describing a run the user is not about to get.
+    #[test]
+    fn the_verb_is_the_only_thing_that_differs() {
+        let flags = ["/x", "--safe", "--purge", "--yes", "--min-size", "4K"];
+        let of = |verb: &str| {
+            let mut args = vec![verb];
+            args.extend_from_slice(&flags);
+            match resolved(&args).expect("resolve") {
+                Mode::Clean {
+                    roots,
+                    confirm_tier_allowed,
+                    roots_from_rules,
+                    clean,
+                    removal,
+                    intent,
+                } => (
+                    intent,
+                    (
+                        roots,
+                        confirm_tier_allowed,
+                        roots_from_rules,
+                        removal,
+                        clean.safe_only,
+                        clean.min_size,
+                    ),
+                ),
+                other => panic!("expected a cleanup, got {other:?}"),
+            }
         };
-        assert_eq!(roots, vec![PathBuf::from("/x")]);
-        assert!(clean.safe_only);
-        assert!(clean.allow_dirty);
-        assert!(apply);
-        assert_eq!(
-            older_than_of(&clean),
-            Some(Duration::from_secs(90 * 24 * 60 * 60))
+
+        let (preview, from_preview) = of("preview");
+        let (clean, from_clean) = of("clean");
+
+        assert_eq!(preview, Intent::Preview);
+        assert_eq!(clean, Intent::Removing);
+        assert_eq!(from_preview, from_clean, "everything else is identical");
+    }
+
+    /// Both are gone from the surface entirely. `--apply` because removing is
+    /// what `clean` now *is*; `--allow-dirty` because `requires-clean-repo`
+    /// settles the git guard per rule, where a global switch would be a coarser
+    /// duplicate of it.
+    #[test]
+    fn apply_and_allow_dirty_are_not_flags_any_more() {
+        for verb in ["preview", "clean"] {
+            for flag in ["--apply", "--allow-dirty"] {
+                let err = parse(&[verb, "/x", flag]).expect_err("must not parse");
+                assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+            }
+        }
+        assert!(
+            !clean_options(&["clean", "/x"]).allow_dirty,
+            "and nothing can turn the git guard off"
         );
     }
 
@@ -1012,35 +1119,64 @@ mod tests {
         assert!(matches!(resolved(&["scan", "/x"]), Ok(Mode::Scan { .. })));
     }
 
-    /// `--purge` alone would read as "prepare to delete permanently" and do
-    /// nothing, which is the worst possible reading of a destructive flag. clap
-    /// enforces the pairing so the intent has to be stated twice.
+    /// `--purge` stands alone now: there is no `--apply` left for it to require,
+    /// and the verb it modifies already removes.
     #[test]
-    fn purge_requires_apply() {
-        let err = parse(&["clean", "/x", "--purge"])
-            .expect_err("--purge without --apply must be a usage error");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    fn purge_needs_no_companion_flag() {
+        assert!(parse(&["clean", "/x", "--purge"]).is_ok());
+        assert!(
+            parse(&["preview", "/x", "--purge"]).is_ok(),
+            "and preview takes it, to show what it would do"
+        );
+    }
 
-        assert!(parse(&["clean", "/x", "--purge", "--apply"]).is_ok());
+    /// Likewise `--yes`, which used to require `--apply`. It still means only
+    /// one thing, and `preview` accepts it so the line can be retyped intact.
+    #[test]
+    fn yes_needs_no_companion_flag() {
+        for verb in ["preview", "clean"] {
+            let mode = resolved(&[verb, "/x", "--yes"]).expect("resolve");
+            let Mode::Clean {
+                confirm_tier_allowed,
+                ..
+            } = mode
+            else {
+                panic!("expected a cleanup");
+            };
+            assert!(confirm_tier_allowed, "{verb}");
+        }
     }
 
     #[test]
     fn removal_defaults_to_the_trash() {
-        let mode = resolved(&["clean", "/x", "--apply"]).expect("resolve");
-        let Mode::Clean { removal, .. } = mode else {
-            panic!("expected the clean subcommand");
-        };
-        assert_eq!(
-            removal,
-            Removal::Trash,
-            "nothing becomes unrecoverable without being asked for"
-        );
+        for verb in ["preview", "clean"] {
+            let Mode::Clean { removal, .. } = resolved(&[verb, "/x"]).expect("resolve") else {
+                panic!("expected a cleanup");
+            };
+            assert_eq!(
+                removal,
+                Removal::Trash,
+                "nothing becomes unrecoverable without being asked for"
+            );
 
-        let mode = resolved(&["clean", "/x", "--apply", "--purge"]).expect("resolve");
-        let Mode::Clean { removal, .. } = mode else {
-            panic!("expected the clean subcommand");
-        };
-        assert_eq!(removal, Removal::Purge);
+            let Mode::Clean { removal, .. } = resolved(&[verb, "/x", "--purge"]).expect("resolve")
+            else {
+                panic!("expected a cleanup");
+            };
+            assert_eq!(removal, Removal::Purge);
+        }
+    }
+
+    /// The verb decides, and nothing else does.
+    #[test]
+    fn preview_shows_and_clean_removes() {
+        assert_eq!(intent_of(&["preview", "/x"]), Intent::Preview);
+        assert_eq!(intent_of(&["clean", "/x"]), Intent::Removing);
+        assert_eq!(
+            intent_of(&["preview", "/x", "--purge", "--yes"]),
+            Intent::Preview,
+            "no flag can turn a preview into a removal"
+        );
     }
 
     #[test]
@@ -1190,27 +1326,50 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
+    /// Both verbs are listed, and they document the **same** flags — which is
+    /// the claim the whole split rests on, and the one a reader checks in
+    /// `--help` rather than in this file.
     #[test]
-    fn help_documents_both_forms() {
+    fn help_documents_both_verbs_identically() {
         use clap::CommandFactory;
 
-        let help = Args::command().render_long_help().to_string();
-        assert!(
-            help.contains("clean"),
-            "--help must list the subcommand:\n{help}"
-        );
-
-        let clean_help = Args::command()
-            .find_subcommand_mut("clean")
-            .expect("the clean subcommand exists")
-            .render_long_help()
-            .to_string();
-        for flag in ["--safe", "--apply", "--allow-dirty", "--older-than"] {
-            assert!(
-                clean_help.contains(flag),
-                "`clean --help` must mention {flag}, got:\n{clean_help}"
-            );
+        let top = Args::command().render_long_help().to_string();
+        for verb in ["preview", "clean"] {
+            assert!(top.contains(verb), "--help must list {verb}:\n{top}");
         }
+
+        let page = |verb: &str| {
+            Args::command()
+                .find_subcommand_mut(verb)
+                .unwrap_or_else(|| panic!("the {verb} subcommand exists"))
+                .render_long_help()
+                .to_string()
+        };
+        let flags = |page: &str| {
+            let mut found: Vec<String> = page
+                .split_whitespace()
+                .filter(|word| word.starts_with("--"))
+                .map(|word| word.trim_end_matches(&[',', '.'][..]).to_owned())
+                .collect();
+            found.sort();
+            found.dedup();
+            found
+        };
+
+        let preview = page("preview");
+        let clean = page("clean");
+        for flag in ["--safe", "--purge", "--yes", "--min-size", "--older-than"] {
+            assert!(clean.contains(flag), "`clean --help` must mention {flag}");
+        }
+        assert_eq!(
+            flags(&preview),
+            flags(&clean),
+            "the two verbs must offer the same flags"
+        );
+        assert!(
+            !clean.contains("--apply") && !clean.contains("--allow-dirty"),
+            "and neither of the two that went:\n{clean}"
+        );
     }
 
     /// `--help` is a terminal, not a rendered page.

@@ -1,31 +1,23 @@
-//! The dry-run report — what a cleanup *would* do.
+//! The plan, as a report — what a cleanup would do, or is about to.
 //!
-//! This is the safety story's user-facing half. A dry run is the default, so
-//! this text is what someone reads before deciding to type `--apply`, and every
+//! This is the safety story's user-facing half. `preview` prints this and stops,
+//! so the text is what someone reads before deciding to run `clean`, and every
 //! wording choice below exists because getting it wrong would mislead them into
 //! a deletion.
 //!
 //! Shaped like [`super::skipped`] — a flat list and a summary — rather than
 //! [`super::tree`]: bars and percentages answer "what is big", and this answers
 //! "what would go".
+//!
+//! The same list serves both verbs, and the **closing line must not**. Printed
+//! by `clean`, "nothing was removed" is about to become false — which would make
+//! the last thing a user reads before a deletion the one sentence in the report
+//! that is a lie. That is what [`crate::args::Intent`] is for.
 
 use super::tree::format_size;
+use crate::args::Intent;
 use disk_tools_core::{Candidate, CleanOutcome, CleanPlan, ExcludeReason, Excluded, Tier};
 use std::fmt::Write;
-
-/// Why the plan is being shown.
-///
-/// The same list serves two moments, and the closing line must not. Printed
-/// before an `--apply`, "nothing was removed" is about to become false — which
-/// would make the last thing a user reads before a deletion the one sentence in
-/// the report that is a lie.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Intent {
-    /// A dry run: this is the whole output, and nothing will happen.
-    DryRun,
-    /// A preview: the removal follows immediately.
-    AboutToApply,
-}
 
 /// Render the plan for a human.
 ///
@@ -95,8 +87,14 @@ pub fn render_clean(plan: &CleanPlan, hidden_by_safe: Option<usize>, intent: Int
         );
     }
 
-    if !plan.candidates.is_empty() && intent == Intent::DryRun {
-        let _ = writeln!(out, "\nDry run — nothing was removed. Re-run with --apply.");
+    if !plan.candidates.is_empty() && intent == Intent::Preview {
+        // Naming the verb rather than a flag: the way this report is acted on is
+        // to retype the line that produced it, and the only thing that changes
+        // is the first word.
+        let _ = writeln!(
+            out,
+            "\nPreview — nothing was removed. The same line with `clean` removes it."
+        );
     }
 
     out
@@ -310,7 +308,7 @@ mod tests {
                 candidate("/p/old.bin", "old", Tier::Confirm, 1_048_576),
             ]),
             None,
-            Intent::DryRun,
+            Intent::Preview,
         );
 
         // Path, rule and tier for each, then the total.
@@ -322,8 +320,8 @@ mod tests {
         assert!(report.contains("confirm"), "{report}");
         assert!(report.contains("Reclaimable: 2.0M"), "{report}");
         assert!(
-            report.contains("Dry run") && report.contains("--apply"),
-            "a dry run must say it removed nothing and how to proceed: {report}"
+            report.contains("Preview") && report.contains("`clean`"),
+            "a preview must say it removed nothing and name the verb that does: {report}"
         );
     }
 
@@ -334,7 +332,7 @@ mod tests {
         let mut shared = candidate("/p/node_modules", "node-modules", Tier::Auto, 2048);
         shared.shared = true;
 
-        let report = render_clean(&plan(vec![shared]), None, Intent::DryRun);
+        let report = render_clean(&plan(vec![shared]), None, Intent::Preview);
 
         assert!(
             report.contains("(shared)"),
@@ -360,7 +358,7 @@ mod tests {
                 2048,
             )]),
             None,
-            Intent::DryRun,
+            Intent::Preview,
         );
 
         assert!(report.contains("Reclaimable: 2.0K"), "{report}");
@@ -372,7 +370,7 @@ mod tests {
 
     #[test]
     fn empty_plan_renders_a_plain_message() {
-        let report = render_clean(&plan(Vec::new()), None, Intent::DryRun);
+        let report = render_clean(&plan(Vec::new()), None, Intent::Preview);
 
         assert_eq!(report, "Nothing to clean.\n");
     }
@@ -387,7 +385,7 @@ mod tests {
             reason: ExcludeReason::Denylisted,
         }];
 
-        let report = render_clean(&empty, None, Intent::DryRun);
+        let report = render_clean(&empty, None, Intent::Preview);
 
         assert!(report.contains("Nothing to clean."), "{report}");
         assert!(report.contains("/Windows/target"), "{report}");
@@ -408,7 +406,7 @@ mod tests {
             },
         ];
 
-        let report = render_clean(&with_both, None, Intent::DryRun);
+        let report = render_clean(&with_both, None, Intent::Preview);
         let denied = report
             .lines()
             .find(|line| line.contains("/Windows/target"))
@@ -444,7 +442,7 @@ mod tests {
                 2048,
             )]),
             Some(3),
-            Intent::DryRun,
+            Intent::Preview,
         );
 
         assert!(
@@ -459,7 +457,7 @@ mod tests {
         let report = render_clean(
             &plan(vec![candidate("/p/nm", "node-modules", Tier::Auto, 1)]),
             Some(0),
-            Intent::DryRun,
+            Intent::Preview,
         );
 
         assert!(
@@ -474,7 +472,7 @@ mod tests {
     fn counts_are_singular_where_they_should_be() {
         let mut shared = candidate("/p/nm", "node-modules", Tier::Auto, 2048);
         shared.shared = true;
-        let report = render_clean(&plan(vec![shared]), Some(1), Intent::DryRun);
+        let report = render_clean(&plan(vec![shared]), Some(1), Intent::Preview);
 
         assert!(report.contains("1 candidate shares"), "{report}");
         assert!(
@@ -501,7 +499,7 @@ mod tests {
             candidate("/p/b", "a-very-long-user-rule-name", Tier::Auto, 1024),
         ]);
 
-        let report = render_clean(&plan, None, Intent::DryRun);
+        let report = render_clean(&plan, None, Intent::Preview);
 
         assert!(
             report.contains("nm                          auto"),
@@ -655,15 +653,15 @@ mod intent_tests {
     /// directly and none knew about the `--apply` path.
     #[test]
     fn a_preview_does_not_claim_nothing_was_removed() {
-        let report = render_clean(&one_candidate(), None, Intent::AboutToApply);
+        let report = render_clean(&one_candidate(), None, Intent::Removing);
 
         assert!(
             report.contains("/p/node_modules"),
             "the preview still lists what is about to go: {report}"
         );
         assert!(
-            !report.contains("Dry run"),
-            "but must not say a dry run happened, because one is not: {report}"
+            !report.contains("Preview"),
+            "but must not call itself a preview, because it is not: {report}"
         );
         assert!(
             !report.contains("nothing was removed"),
@@ -671,13 +669,14 @@ mod intent_tests {
         );
     }
 
-    /// And the dry run still says so — the guard must not have silenced both.
+    /// And the preview still says so — the guard must not have silenced both.
     #[test]
-    fn a_dry_run_still_says_it_removed_nothing() {
-        let report = render_clean(&one_candidate(), None, Intent::DryRun);
+    fn a_preview_still_says_it_removed_nothing() {
+        let report = render_clean(&one_candidate(), None, Intent::Preview);
 
         assert!(
-            report.contains("Dry run — nothing was removed. Re-run with --apply."),
+            report
+                .contains("Preview — nothing was removed. The same line with `clean` removes it."),
             "{report}"
         );
     }
@@ -752,7 +751,7 @@ mod min_size_tests {
             below_rule_minimum: 0,
         };
 
-        let report = render_clean(&plan, None, Intent::DryRun);
+        let report = render_clean(&plan, None, Intent::Preview);
 
         assert!(
             report.contains("150 more candidates are below --min-size"),
@@ -766,7 +765,7 @@ mod min_size_tests {
         // And with all three narrowings in effect, all three are stated.
         plan.filtered_out = 3;
         plan.below_rule_minimum = 7;
-        let all = render_clean(&plan, Some(3), Intent::DryRun);
+        let all = render_clean(&plan, Some(3), Intent::Preview);
         assert!(all.contains("3 more candidates need confirmation"), "{all}");
         assert!(
             all.contains("150 more candidates are below --min-size"),
@@ -793,7 +792,7 @@ mod min_size_tests {
             below_rule_minimum: 2,
         };
 
-        let report = render_clean(&plan, None, Intent::DryRun);
+        let report = render_clean(&plan, None, Intent::Preview);
 
         assert!(
             report.contains("2 more candidates are below their rule's own min-size"),
@@ -820,7 +819,7 @@ mod min_size_tests {
             below_rule_minimum: 1,
         };
 
-        let report = render_clean(&plan, None, Intent::DryRun);
+        let report = render_clean(&plan, None, Intent::Preview);
 
         assert!(
             report.contains("1 more candidate is below their rule's own min-size"),
@@ -843,7 +842,7 @@ mod min_size_tests {
             below_rule_minimum: 0,
         };
 
-        assert!(!render_clean(&plan, None, Intent::DryRun).contains("--min-size"));
+        assert!(!render_clean(&plan, None, Intent::Preview).contains("--min-size"));
     }
 
     #[test]
@@ -858,7 +857,7 @@ mod min_size_tests {
         };
 
         assert!(
-            render_clean(&plan, None, Intent::DryRun).contains("1 more candidate is below"),
+            render_clean(&plan, None, Intent::Preview).contains("1 more candidate is below"),
             "not `1 more candidates are`"
         );
     }
