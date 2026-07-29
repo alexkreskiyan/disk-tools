@@ -115,11 +115,11 @@ pub fn render_clean(
 /// delete is acceptable; leaving the user to guess which half happened is not.
 /// So a failure names its path and what the OS said, and the closing line states
 /// plainly that something is still there.
-pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, recoverable: bool) -> String {
+pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool) -> String {
     let mut out = String::new();
-    let attempted = outcome.removed.len() + outcome.failed.len();
+    let attempted = outcome.count() + outcome.failed.len();
 
-    if outcome.removed.is_empty() {
+    if outcome.count() == 0 {
         let _ = writeln!(out, "Removed nothing.");
     } else {
         // "At most" whenever something removed held content reachable from
@@ -128,15 +128,24 @@ pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, recoverable:
         // preview and flatly in the outcome would be one run disagreeing with
         // itself, and the flat version is the wrong one.
         let freed = if shared_removed {
-            format!("Freed at most {}", format_size(outcome.reclaimed))
+            format!("Freed at most {}", format_size(outcome.reclaimed()))
         } else {
-            format!("Freed {}", format_size(outcome.reclaimed))
+            format!("Freed {}", format_size(outcome.reclaimed()))
         };
-        let _ = writeln!(
-            out,
-            "Removed {} of {attempted}. {freed}.",
-            outcome.removed.len()
-        );
+        let _ = writeln!(out, "Removed {} of {attempted}. {freed}.", outcome.count());
+
+        // The two halves, whenever the run was mixed. A single "freed" figure
+        // over both does not say what can be brought back, which is the one
+        // thing a reader wants from it — and the split is the whole reason the
+        // core refuses to add them up itself.
+        if !outcome.trashed.paths.is_empty() && !outcome.purged.paths.is_empty() {
+            let _ = writeln!(
+                out,
+                "  {} in the trash, recoverable; {} destroyed, not.",
+                format_size(outcome.trashed.bytes),
+                format_size(outcome.purged.bytes)
+            );
+        }
     }
 
     if outcome.failed.is_empty() {
@@ -163,19 +172,20 @@ pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool, recoverable:
     // items that are *not* in the trash. This is the sentence a user reads to
     // find out whether their work survived.
     //
-    // Phrased as `recoverable` rather than `!purged`: a double negative guarding
-    // the one sentence that tells a user whether their data still exists is a
-    // negation too many.
-    if !outcome.removed.is_empty() && recoverable {
-        let removed = outcome.removed.len();
-        let (noun, verb) = if removed == 1 {
+    // Read straight off the outcome rather than from a flag: the claim covers
+    // exactly the paths that went to the trash, and after v0.5 one run can send
+    // some there and destroy the rest. A sentence derived from `--purge` would
+    // have described the invocation, not the paths it is standing under.
+    if !outcome.trashed.paths.is_empty() {
+        let trashed = outcome.trashed.paths.len();
+        let (noun, verb) = if trashed == 1 {
             ("candidate", "is")
         } else {
             ("candidates", "are")
         };
         let _ = writeln!(
             out,
-            "The other {removed} {noun} {verb} in the trash and can be put back."
+            "{trashed} {noun} {verb} in the trash and can be put back."
         );
     }
 
@@ -211,6 +221,7 @@ fn write_rules(candidates: &[Candidate], sort: Sort, out: &mut String) {
             None => groups.push(Group {
                 rule: &candidate.rule,
                 tier: candidate.tier,
+                purge: candidate.purge,
                 count: 1,
                 allocated: candidate.allocated,
             }),
@@ -249,7 +260,7 @@ fn write_rules(candidates: &[Candidate], sort: Sort, out: &mut String) {
             } else {
                 "candidates"
             },
-            tier = tier(group.tier),
+            tier = fate(group.tier, group.purge),
             rw = rule_width,
             cw = count_width,
         );
@@ -260,6 +271,8 @@ fn write_rules(candidates: &[Candidate], sort: Sort, out: &mut String) {
 struct Group<'a> {
     rule: &'a str,
     tier: Tier,
+    /// Every candidate of a rule shares its destination, so a group has one.
+    purge: bool,
     count: usize,
     allocated: u64,
 }
@@ -286,7 +299,7 @@ fn write_candidates(candidates: &[Candidate], sort: Sort, out: &mut String) {
         .unwrap_or(0);
     let tier_width = candidates
         .iter()
-        .map(|c| tier(c.tier).len())
+        .map(|c| fate(c.tier, c.purge).len())
         .max()
         .unwrap_or(0);
 
@@ -297,7 +310,7 @@ fn write_candidates(candidates: &[Candidate], sort: Sort, out: &mut String) {
             "{size:>8}  {rule:<rw$}  {tier:<tw$}  {path}{shared}",
             size = format_size(candidate.allocated),
             rule = candidate.rule,
-            tier = tier(candidate.tier),
+            tier = fate(candidate.tier, candidate.purge),
             path = candidate.path.display(),
             shared = if candidate.shared { "  (shared)" } else { "" },
             rw = rule_width,
@@ -363,9 +376,21 @@ fn excuse(reason: &ExcludeReason) -> &'static str {
     }
 }
 
-fn tier(tier: Tier) -> &'static str {
+/// What will happen to this one, in a word.
+///
+/// The tier's word, except where `--purge` has overruled it. The column answers
+/// "what does `clean` do with this", which is what the three tier names were
+/// renamed to answer — so a candidate about to be destroyed says `purge` here
+/// whether that came from its rule or from the flag.
+///
+/// `tier` itself is left alone on the candidate: `--safe` and the confirm-tier
+/// refusal read it, and a flag that rewrote it would cancel a confirmation it
+/// has nothing to do with.
+fn fate(tier: Tier, purge: bool) -> &'static str {
     match tier {
-        Tier::Auto => "auto",
+        _ if purge => "purge",
+        Tier::Purge => "purge",
+        Tier::Trash => "trash",
         Tier::Confirm => "confirm",
     }
 }
@@ -390,6 +415,7 @@ mod tests {
             path: PathBuf::from(path),
             rule: rule.into(),
             tier,
+            purge: tier == Tier::Purge,
             allocated,
             shared: false,
         }
@@ -410,9 +436,9 @@ mod tests {
     /// Two rules, three candidates, sizes that make every ordering visible.
     fn spread() -> CleanPlan {
         plan(vec![
-            candidate("/p/a/node_modules", "node-modules", Tier::Auto, 1_048_576),
-            candidate("/p/b/node_modules", "node-modules", Tier::Auto, 2_097_152),
-            candidate("/p/target", "rust-target", Tier::Auto, 4_194_304),
+            candidate("/p/a/node_modules", "node-modules", Tier::Trash, 1_048_576),
+            candidate("/p/b/node_modules", "node-modules", Tier::Trash, 2_097_152),
+            candidate("/p/target", "rust-target", Tier::Trash, 4_194_304),
         ])
     }
 
@@ -499,9 +525,9 @@ mod tests {
     #[test]
     fn equal_sizes_are_ordered_by_path() {
         let tied = plan(vec![
-            candidate("/p/zulu", "r", Tier::Auto, 4096),
-            candidate("/p/alpha", "r", Tier::Auto, 4096),
-            candidate("/p/mike", "r", Tier::Auto, 4096),
+            candidate("/p/zulu", "r", Tier::Trash, 4096),
+            candidate("/p/alpha", "r", Tier::Trash, 4096),
+            candidate("/p/mike", "r", Tier::Trash, 4096),
         ]);
 
         let report = render_clean(&tied, None, Intent::Preview, at(1, Sort::Size));
@@ -542,7 +568,7 @@ mod tests {
     fn dry_run_lists_candidates_with_a_total() {
         let report = render_clean(
             &plan(vec![
-                candidate("/p/node_modules", "node-modules", Tier::Auto, 1_048_576),
+                candidate("/p/node_modules", "node-modules", Tier::Trash, 1_048_576),
                 candidate("/p/old.bin", "old", Tier::Confirm, 1_048_576),
             ]),
             None,
@@ -553,7 +579,7 @@ mod tests {
         // Path, rule and tier for each, then the total.
         assert!(report.contains("/p/node_modules"), "{report}");
         assert!(report.contains("node-modules"), "{report}");
-        assert!(report.contains("auto"), "{report}");
+        assert!(report.contains("trash"), "{report}");
         assert!(report.contains("/p/old.bin"), "{report}");
         assert!(report.contains("old"), "{report}");
         assert!(report.contains("confirm"), "{report}");
@@ -568,7 +594,7 @@ mod tests {
     /// "will not be freed" would be a different, stronger and wrong one.
     #[test]
     fn shared_candidate_is_flagged_and_total_labelled_upper_bound() {
-        let mut shared = candidate("/p/node_modules", "node-modules", Tier::Auto, 2048);
+        let mut shared = candidate("/p/node_modules", "node-modules", Tier::Trash, 2048);
         shared.shared = true;
 
         let report = render_clean(&plan(vec![shared]), None, Intent::Preview, listed());
@@ -593,7 +619,7 @@ mod tests {
             &plan(vec![candidate(
                 "/p/node_modules",
                 "node-modules",
-                Tier::Auto,
+                Tier::Trash,
                 2048,
             )]),
             None,
@@ -679,7 +705,7 @@ mod tests {
             &plan(vec![candidate(
                 "/p/node_modules",
                 "node-modules",
-                Tier::Auto,
+                Tier::Trash,
                 2048,
             )]),
             Some(3),
@@ -697,7 +723,7 @@ mod tests {
     #[test]
     fn nothing_hidden_says_nothing() {
         let report = render_clean(
-            &plan(vec![candidate("/p/nm", "node-modules", Tier::Auto, 1)]),
+            &plan(vec![candidate("/p/nm", "node-modules", Tier::Trash, 1)]),
             Some(0),
             Intent::Preview,
             listed(),
@@ -713,7 +739,7 @@ mod tests {
     /// prose a person reads under some pressure.
     #[test]
     fn counts_are_singular_where_they_should_be() {
-        let mut shared = candidate("/p/nm", "node-modules", Tier::Auto, 2048);
+        let mut shared = candidate("/p/nm", "node-modules", Tier::Trash, 2048);
         shared.shared = true;
         let report = render_clean(&plan(vec![shared]), Some(1), Intent::Preview, listed());
 
@@ -724,13 +750,23 @@ mod tests {
         );
     }
 
-    /// Only the tier still has a label that could be got wrong. Rule names are
-    /// printed verbatim in v0.3 — they are the user's own text, so there is no
-    /// mapping left that could omit one.
+    /// The column answers "what does `clean` do with this", which is what the
+    /// three names were chosen to answer — so `--purge` overruling a tier shows
+    /// there, and the tier itself is left alone on the candidate for `--safe`
+    /// and the refusal to read.
     #[test]
-    fn every_tier_has_a_label() {
-        assert_eq!(tier(Tier::Auto), "auto");
-        assert_eq!(tier(Tier::Confirm), "confirm");
+    fn the_column_says_what_will_happen() {
+        assert_eq!(fate(Tier::Purge, true), "purge");
+        assert_eq!(fate(Tier::Trash, false), "trash");
+        assert_eq!(fate(Tier::Confirm, false), "confirm");
+
+        for tier in [Tier::Purge, Tier::Trash, Tier::Confirm] {
+            assert_eq!(
+                fate(tier, true),
+                "purge",
+                "{tier:?} under --purge is destroyed like everything else"
+            );
+        }
     }
 
     /// A user's rule name is not from a fixed set, so the column has to size
@@ -738,14 +774,14 @@ mod tests {
     #[test]
     fn the_rule_column_fits_the_longest_name_present() {
         let plan = plan(vec![
-            candidate("/p/a", "nm", Tier::Auto, 1024),
-            candidate("/p/b", "a-very-long-user-rule-name", Tier::Auto, 1024),
+            candidate("/p/a", "nm", Tier::Trash, 1024),
+            candidate("/p/b", "a-very-long-user-rule-name", Tier::Trash, 1024),
         ]);
 
         let report = render_clean(&plan, None, Intent::Preview, listed());
 
         assert!(
-            report.contains("nm                          auto"),
+            report.contains("nm                          trash"),
             "the short name must be padded to the long one:\n{report}"
         );
     }
@@ -754,6 +790,7 @@ mod tests {
 #[cfg(test)]
 mod outcome_tests {
     use super::*;
+    use disk_tools_core::Reclaimed;
     use disk_tools_core::TrashFailure;
     use std::path::PathBuf;
 
@@ -767,12 +804,15 @@ mod outcome_tests {
     #[test]
     fn a_complete_run_states_what_it_freed() {
         let outcome = CleanOutcome {
-            removed: vec![PathBuf::from("/p/node_modules")],
+            trashed: Reclaimed {
+                paths: vec![PathBuf::from("/p/node_modules")],
+                bytes: 2048,
+            },
+            purged: Reclaimed::default(),
             failed: Vec::new(),
-            reclaimed: 2048,
         };
 
-        let report = render_outcome(&outcome, false, true);
+        let report = render_outcome(&outcome, false);
 
         assert!(report.contains("Removed 1 of 1"), "{report}");
         assert!(report.contains("Freed 2.0K"), "{report}");
@@ -788,12 +828,15 @@ mod outcome_tests {
     #[test]
     fn a_run_that_removed_nothing_promises_nothing() {
         let outcome = CleanOutcome {
-            removed: Vec::new(),
+            trashed: Reclaimed {
+                paths: Vec::new(),
+                bytes: 0,
+            },
+            purged: Reclaimed::default(),
             failed: vec![failure("/p/one"), failure("/p/two")],
-            reclaimed: 0,
         };
 
-        let report = render_outcome(&outcome, false, true);
+        let report = render_outcome(&outcome, false);
 
         assert!(report.contains("Removed nothing."), "{report}");
         assert!(report.contains("2 candidates still on disk"), "{report}");
@@ -809,16 +852,19 @@ mod outcome_tests {
     #[test]
     fn a_partial_run_says_which_items_are_recoverable() {
         let outcome = CleanOutcome {
-            removed: vec![PathBuf::from("/p/gone")],
+            trashed: Reclaimed {
+                paths: vec![PathBuf::from("/p/gone")],
+                bytes: 1024,
+            },
+            purged: Reclaimed::default(),
             failed: vec![failure("/p/stuck")],
-            reclaimed: 1024,
         };
 
-        let report = render_outcome(&outcome, false, true);
+        let report = render_outcome(&outcome, false);
 
         assert!(report.contains("1 candidate still on disk"), "{report}");
         assert!(
-            report.contains("The other 1 candidate is in the trash"),
+            report.contains("1 candidate is in the trash"),
             "the recoverable set is named, not implied: {report}"
         );
         assert!(
@@ -833,18 +879,21 @@ mod outcome_tests {
     #[test]
     fn a_shared_removal_reports_the_freed_total_as_an_upper_bound() {
         let outcome = CleanOutcome {
-            removed: vec![PathBuf::from("/p/node_modules")],
+            trashed: Reclaimed {
+                paths: vec![PathBuf::from("/p/node_modules")],
+                bytes: 4096,
+            },
+            purged: Reclaimed::default(),
             failed: Vec::new(),
-            reclaimed: 4096,
         };
 
         assert!(
-            render_outcome(&outcome, true, true).contains("Freed at most 4.0K"),
+            render_outcome(&outcome, true).contains("Freed at most 4.0K"),
             "{}",
-            render_outcome(&outcome, true, true)
+            render_outcome(&outcome, true)
         );
         assert!(
-            render_outcome(&outcome, false, true).contains("Freed 4.0K"),
+            render_outcome(&outcome, false).contains("Freed 4.0K"),
             "and without sharing the figure is exact"
         );
     }
@@ -852,13 +901,16 @@ mod outcome_tests {
     #[test]
     fn counts_are_singular_where_they_should_be() {
         let outcome = CleanOutcome {
-            removed: Vec::new(),
+            trashed: Reclaimed {
+                paths: Vec::new(),
+                bytes: 0,
+            },
+            purged: Reclaimed::default(),
             failed: vec![failure("/p/one")],
-            reclaimed: 0,
         };
 
         assert!(
-            render_outcome(&outcome, false, true).contains("1 candidate still on disk"),
+            render_outcome(&outcome, false).contains("1 candidate still on disk"),
             "not `1 candidates`"
         );
     }
@@ -874,7 +926,8 @@ mod intent_tests {
             candidates: vec![Candidate {
                 path: PathBuf::from("/p/node_modules"),
                 rule: "node-modules".into(),
-                tier: Tier::Auto,
+                tier: Tier::Trash,
+                purge: false,
                 allocated: 2048,
                 shared: false,
             }],
@@ -928,26 +981,36 @@ mod intent_tests {
 #[cfg(test)]
 mod purge_tests {
     use super::*;
+    use disk_tools_core::Reclaimed;
     use disk_tools_core::TrashFailure;
     use std::path::PathBuf;
 
     fn partial() -> CleanOutcome {
         CleanOutcome {
-            removed: vec![PathBuf::from("/p/gone")],
+            trashed: Reclaimed {
+                paths: vec![PathBuf::from("/p/gone")],
+                bytes: 1024,
+            },
+            purged: Reclaimed::default(),
             failed: vec![TrashFailure {
                 path: PathBuf::from("/p/stuck"),
                 reason: "Permission denied".to_owned(),
             }],
-            reclaimed: 1024,
         }
     }
 
-    /// The recoverability line is the whole difference between the two modes,
-    /// and after `--purge` it would be a plain lie: there is nothing in the
-    /// trash to put back.
+    /// The recoverability line is read off the outcome, not off a flag: after a
+    /// run that destroyed everything it would be a plain lie, since there is
+    /// nothing in the trash to put back.
     #[test]
     fn a_purged_run_never_claims_anything_can_be_put_back() {
-        let report = render_outcome(&partial(), false, false);
+        let purged = CleanOutcome {
+            purged: partial().trashed,
+            trashed: Reclaimed::default(),
+            failed: partial().failed,
+        };
+
+        let report = render_outcome(&purged, false);
 
         assert!(report.contains("1 candidate still on disk"), "{report}");
         assert!(
@@ -960,7 +1023,7 @@ mod purge_tests {
     /// both.
     #[test]
     fn a_trashed_run_still_says_what_can_be_put_back() {
-        let report = render_outcome(&partial(), false, true);
+        let report = render_outcome(&partial(), false);
 
         assert!(
             report.contains("in the trash and can be put back"),
@@ -983,7 +1046,8 @@ mod min_size_tests {
             candidates: vec![Candidate {
                 path: PathBuf::from("/p/node_modules"),
                 rule: "node-modules".into(),
-                tier: Tier::Auto,
+                tier: Tier::Trash,
+                purge: false,
                 allocated: 2_000_000,
                 shared: false,
             }],

@@ -662,7 +662,7 @@ mod tests {
             name: "csharp-bin".into(),
             includes: vec!["**/bin/".into(), "**/obj/".into()],
             requires_sibling: vec!["*.csproj".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         }];
 
@@ -706,7 +706,7 @@ mod tests {
                 name: "needs-marker".into(),
                 includes: vec!["**/target/".into()],
                 requires_sibling: vec!["Cargo.toml".into()],
-                tier: Tier::Auto,
+                tier: Tier::Trash,
                 ..Rule::default()
             },
             Rule {
@@ -733,7 +733,7 @@ mod tests {
                 name: "narrow".into(),
                 includes: vec!["**/node_modules/".into()],
                 excludes: vec!["**/vendor/**".into()],
-                tier: Tier::Auto,
+                tier: Tier::Trash,
                 ..Rule::default()
             },
             Rule {
@@ -770,7 +770,7 @@ mod tests {
             name: "small".into(),
             includes: vec!["**/__pycache__/".into()],
             min_size: 1_048_576,
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         }];
 
@@ -797,7 +797,7 @@ mod tests {
             name: "scoped".into(),
             root: Some("/home/me/Projects".into()),
             includes: vec!["**/node_modules/".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         }];
 

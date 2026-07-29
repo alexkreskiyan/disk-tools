@@ -56,7 +56,18 @@ pub struct Candidate {
     /// here; rules are open-ended, so an enum can no longer name them.
     pub rule: String,
 
+    /// What the **rule** says to do with it, untouched by any flag.
+    ///
+    /// `--safe` and the frontend's refusal both read this, and they must: a
+    /// `--purge` that rewrote it would cancel a confirmation it has nothing to
+    /// do with. Where the candidate actually goes is [`Self::purge`].
     pub tier: Tier,
+
+    /// This one is deleted outright rather than trashed.
+    ///
+    /// The rule's tier and `--purge` resolved together — the only new fact
+    /// either produces, and the reason `apply` needs nothing but the plan.
+    pub purge: bool,
 
     /// Attributed bytes — what removing this would free, before the question
     /// [`Self::shared`] asks.
@@ -80,7 +91,8 @@ pub enum ExcludeReason {
 
     /// Build output whose project has uncommitted work — you may be mid-change,
     /// and it only regenerates identically from committed source.
-    /// `--allow-dirty` overrides this one.
+    ///
+    /// Settled by the rule's own `requires-clean-repo`; no flag overrides it.
     DirtyRepo,
 }
 
@@ -194,8 +206,13 @@ pub struct CleanOptions {
     /// `--safe`: admit auto-tier candidates only.
     pub safe_only: bool,
 
-    /// `--allow-dirty`: relax the git guard. **Never** the denylist.
-    pub allow_dirty: bool,
+    /// `--purge`: send the whole plan past the trash, whatever each rule says.
+    ///
+    /// Flag beats file, as everywhere. A `--purge` that honoured a rule's
+    /// `trash` would be a flag that lies about its own name. It is read **after**
+    /// `safe_only`, so it can never turn something that needed confirming into
+    /// something that does not.
+    pub purge_all: bool,
 
     /// `--min-size`: do not offer anything smaller than this.
     ///
@@ -263,7 +280,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
             continue;
         }
 
-        if is_mid_change(&detection.path, rule, options, &mut repos) {
+        if is_mid_change(&detection.path, rule, &mut repos) {
             excluded.push(Excluded {
                 path: detection.path,
                 reason: ExcludeReason::DirtyRepo,
@@ -294,7 +311,12 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
         // narrowing, and putting the two in one list would show a protected
         // system directory beside something they asked to hide. The frontend
         // knows the flag was passed and can say so itself.
-        if options.safe_only && tier != Tier::Auto {
+        //
+        // **Asked of the rule's own tier**, before `--purge` is applied below.
+        // `--safe` means "drop what needs confirming", and `purge` needs none —
+        // it is a stronger claim of regenerability than `trash`, not a weaker
+        // one.
+        if options.safe_only && tier.needs_confirming() {
             filtered_out += 1;
             continue;
         }
@@ -307,6 +329,10 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
             path: detection.path,
             rule: detection.rule,
             tier,
+            // The rule's tier and the flag, resolved once and written down, so
+            // that the plan says what will happen and `apply` needs no second
+            // input to work it out.
+            purge: tier == Tier::Purge || options.purge_all,
             allocated: detection.allocated,
             shared,
         });
@@ -371,18 +397,20 @@ fn matches_denylist(path: &Path, absolute: &[PathBuf]) -> bool {
 /// enum to ask, so each rule states it — which also means a user writing a rule
 /// for their own build output can have the same protection.
 ///
-/// `--allow-dirty` short-circuits **before** the filesystem is touched, so the
-/// override costs nothing rather than merely ignoring the answer.
+/// A rule that does not ask short-circuits **before** the filesystem is touched,
+/// so the common case costs nothing rather than merely ignoring the answer.
+/// There is no flag that overrides this: `--allow-dirty` went in v0.5, because
+/// the guard belongs to the rule that wants it and a global switch would be a
+/// coarser duplicate.
 ///
 /// `repos` memoises the verdict per repository, since several candidates often
 /// share one.
 fn is_mid_change(
     path: &Path,
     rule: Option<&Rule>,
-    options: &CleanOptions,
     repos: &mut HashMap<PathBuf, git::RepoState>,
 ) -> bool {
-    if options.allow_dirty || !rule.is_some_and(|rule| rule.requires_clean_repo) {
+    if !rule.is_some_and(|rule| rule.requires_clean_repo) {
         return false;
     }
 
@@ -810,6 +838,174 @@ mod tests {
         );
     }
 
+    // ---- the three tiers -------------------------------------------------
+
+    /// A rule set with one rule at each tier, over the same three names.
+    fn tiered() -> CleanOptions {
+        let rules = Rules::new(
+            vec![
+                Rule {
+                    name: "destroyed".into(),
+                    includes: vec!["**/node_modules/".into()],
+                    tier: Tier::Purge,
+                    ..Rule::default()
+                },
+                Rule {
+                    name: "recovered".into(),
+                    includes: vec!["**/target/".into()],
+                    tier: Tier::Trash,
+                    ..Rule::default()
+                },
+                Rule {
+                    name: "asked".into(),
+                    includes: vec!["**/notes/".into()],
+                    tier: Tier::Confirm,
+                    ..Rule::default()
+                },
+            ],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+
+        CleanOptions {
+            detect: DetectOptions {
+                rules,
+                now: SystemTime::UNIX_EPOCH,
+            },
+            ..opts()
+        }
+    }
+
+    fn three_tiers() -> ScanTree {
+        tree(dir(
+            "/p",
+            vec![
+                dir("/p/node_modules", vec![]),
+                dir("/p/target", vec![]),
+                dir("/p/notes", vec![]),
+            ],
+        ))
+    }
+
+    /// Where a candidate goes is decided here, so that `apply` needs nothing
+    /// but the plan and `preview` can print exactly what will happen.
+    #[test]
+    fn the_plan_says_where_each_candidate_goes() {
+        let plan = plan(&three_tiers(), &tiered());
+        let fate = |rule: &str| {
+            plan.candidates
+                .iter()
+                .find(|c| c.rule == rule)
+                .unwrap_or_else(|| panic!("{rule} is in the plan"))
+                .purge
+        };
+
+        assert!(
+            fate("destroyed"),
+            "a purge-tier rule destroys its candidates"
+        );
+        assert!(!fate("recovered"));
+        assert!(!fate("asked"));
+    }
+
+    /// `--safe` drops what needs confirming, which is the whole of what it
+    /// means. Purge is a **stronger** claim of regenerability than trash, not a
+    /// weaker one, so it survives.
+    #[test]
+    fn safe_keeps_purge_and_trash_and_drops_confirm() {
+        let plan = plan(
+            &three_tiers(),
+            &CleanOptions {
+                safe_only: true,
+                ..tiered()
+            },
+        );
+
+        let rules: Vec<&str> = plan.candidates.iter().map(|c| c.rule.as_str()).collect();
+        assert_eq!(rules, ["destroyed", "recovered"]);
+        assert_eq!(plan.filtered_out, 1);
+    }
+
+    /// The flag says "all of them", and beats every rule's tier — a `--purge`
+    /// that honoured a `trash` would be a flag that lies about its own name.
+    #[test]
+    fn the_purge_flag_overrides_every_tier() {
+        let plan = plan(
+            &three_tiers(),
+            &CleanOptions {
+                purge_all: true,
+                ..tiered()
+            },
+        );
+
+        assert!(
+            plan.candidates.iter().all(|c| c.purge),
+            "{:?}",
+            plan.candidates
+        );
+    }
+
+    /// The trap the two fields exist to avoid. `--purge` decides a destination;
+    /// it must not turn something that needed confirming into something that
+    /// does not, or a single flag would cancel a confirmation it has nothing to
+    /// do with.
+    #[test]
+    fn the_purge_flag_never_cancels_a_confirmation() {
+        let plan = plan(
+            &three_tiers(),
+            &CleanOptions {
+                purge_all: true,
+                ..tiered()
+            },
+        );
+        let asked = plan
+            .candidates
+            .iter()
+            .find(|c| c.rule == "asked")
+            .expect("still in the plan");
+
+        assert!(asked.purge, "it is destroyed, as asked");
+        assert!(
+            asked.tier.needs_confirming(),
+            "but it still needs confirming, so `clean` will still refuse"
+        );
+    }
+
+    /// And `--safe` with `--purge` together: the confirm-tier candidate is gone
+    /// from the plan rather than destroyed by it.
+    #[test]
+    fn safe_still_drops_confirm_under_the_purge_flag() {
+        let plan = plan(
+            &three_tiers(),
+            &CleanOptions {
+                safe_only: true,
+                purge_all: true,
+                ..tiered()
+            },
+        );
+
+        assert!(
+            !plan.candidates.iter().any(|c| c.rule == "asked"),
+            "{:?}",
+            plan.candidates
+        );
+        assert!(plan.candidates.iter().all(|c| c.purge));
+    }
+
+    /// No rule, no tier: the cautious answer, and it is not destroyed.
+    #[test]
+    fn an_unclaimed_candidate_asks_and_is_not_destroyed() {
+        let plan = plan(&three_tiers(), &tiered());
+
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|c| c.purge == (c.rule == "destroyed")),
+            "only the rule that said so: {:?}",
+            plan.candidates
+        );
+    }
+
     #[test]
     fn clean_repo_keeps_the_candidate() {
         let Some(handle) = repo_fixture(true) else {
@@ -827,14 +1023,33 @@ mod tests {
         assert!(plan.excluded.is_empty(), "{:?}", plan.excluded);
     }
 
+    /// The guard belongs to the rule that wants it. `--allow-dirty` went in
+    /// v0.5 because a global switch would have been a coarser duplicate of a
+    /// setting that was already there — and this is what turning it off looks
+    /// like now.
     #[test]
-    fn allow_dirty_disables_the_guard() {
+    fn a_rule_that_does_not_ask_is_not_guarded() {
         let Some(handle) = repo_fixture(false) else {
             return;
         };
         let root = handle.path();
+        let unguarded = Rules::new(
+            vec![Rule {
+                name: "rust-target".into(),
+                includes: vec!["**/target/".into()],
+                requires_sibling: vec!["Cargo.toml".into()],
+                requires_clean_repo: false,
+                tier: Tier::Trash,
+                ..Rule::default()
+            }],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
         let options = CleanOptions {
-            allow_dirty: true,
+            detect: DetectOptions {
+                rules: unguarded,
+                now: SystemTime::UNIX_EPOCH,
+            },
             ..opts()
         };
 
@@ -842,7 +1057,7 @@ mod tests {
 
         assert!(
             paths(&plan).contains(&root.join("target").as_path()),
-            "the user overrode the guard: {:?}",
+            "the rule did not ask to be guarded: {:?}",
             paths(&plan)
         );
         assert!(plan.excluded.is_empty(), "{:?}", plan.excluded);
@@ -933,7 +1148,7 @@ mod tests {
 
         assert_eq!(plan.candidates.len(), 3, "{:?}", paths(&plan));
         assert!(
-            plan.candidates.iter().all(|c| c.tier == Tier::Auto),
+            plan.candidates.iter().all(|c| c.tier == Tier::Trash),
             "regenerable output needs no per-item confirmation: {:?}",
             plan.candidates
         );
@@ -985,7 +1200,7 @@ mod tests {
             vec![Rule {
                 name: "mine".into(),
                 includes: vec!["**/venv/".into()],
-                tier: Tier::Auto,
+                tier: Tier::Trash,
                 ..Rule::default()
             }],
         );
@@ -995,7 +1210,7 @@ mod tests {
         assert_eq!(paths(&plan), vec![Path::new("/p/venv")]);
         assert_eq!(
             plan.candidates[0].tier,
-            Tier::Auto,
+            Tier::Trash,
             "the user said auto, so it is auto"
         );
     }
@@ -1010,7 +1225,7 @@ mod tests {
                 name: "big-only".into(),
                 includes: vec!["**/node_modules/".into()],
                 min_size: 1_048_576,
-                tier: Tier::Auto,
+                tier: Tier::Trash,
                 ..Rule::default()
             }],
         );
@@ -1058,13 +1273,13 @@ mod tests {
                         name: "strict".into(),
                         includes: vec!["**/__pycache__/".into()],
                         min_size: 4_194_304,
-                        tier: Tier::Auto,
+                        tier: Tier::Trash,
                         ..Rule::default()
                     },
                     Rule {
                         name: "loose".into(),
                         includes: vec!["**/node_modules/".into()],
-                        tier: Tier::Auto,
+                        tier: Tier::Trash,
                         ..Rule::default()
                     },
                 ],
@@ -1107,7 +1322,7 @@ mod tests {
                     name: "strict".into(),
                     includes: vec!["**/node_modules/".into()],
                     min_size: 4_194_304,
-                    tier: Tier::Auto,
+                    tier: Tier::Trash,
                     ..Rule::default()
                 }],
             )

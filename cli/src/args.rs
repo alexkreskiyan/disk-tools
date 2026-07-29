@@ -8,7 +8,7 @@
 use crate::config::Config;
 use clap::{Parser, Subcommand};
 use disk_tools_core::{
-    CleanOptions, DetectOptions, Removal, RuleError, Rules, ScanOptions, UserDirs, age_rule,
+    CleanOptions, DetectOptions, RuleError, Rules, ScanOptions, UserDirs, age_rule,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -270,7 +270,6 @@ pub enum Mode {
 
         /// Which verb this was. The only thing that differs between them.
         intent: Intent,
-        removal: Removal,
 
         /// How to show the plan. Never how to choose it: nothing in here can
         /// keep a candidate out of the removal, only out of the printout.
@@ -439,19 +438,10 @@ impl Args {
                 detect: DetectOptions { rules, now },
                 user_dirs,
                 safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
-                // Not a flag any more: the git guard is settled per rule, by
-                // `requires-clean-repo`, which is where it belongs. A global
-                // switch would be a coarser duplicate of it, and a file able to
-                // disable a guard would hide the disabling.
-                allow_dirty: false,
+                purge_all: clean.purge,
                 min_size: clean.min_size.unwrap_or(0),
             }),
             intent,
-            removal: if clean.purge {
-                Removal::Purge
-            } else {
-                Removal::Trash
-            },
             report: Report {
                 // Grouped by rule unless asked for more. The overview is what
                 // the question "what would this take" wants first; the list is
@@ -1093,7 +1083,6 @@ mod tests {
                     confirm_tier_allowed,
                     roots_from_rules,
                     clean,
-                    removal,
                     intent,
                     report: _,
                 } => (
@@ -1102,7 +1091,7 @@ mod tests {
                         roots,
                         confirm_tier_allowed,
                         roots_from_rules,
-                        removal,
+                        clean.purge_all,
                         clean.safe_only,
                         clean.min_size,
                     ),
@@ -1132,8 +1121,11 @@ mod tests {
             }
         }
         assert!(
-            !clean_options(&["clean", "/x"]).allow_dirty,
-            "and nothing can turn the git guard off"
+            Rules::builtin(&UserDirs::default())
+                .get("rust-target")
+                .expect("a built-in")
+                .requires_clean_repo,
+            "the git guard survives as the per-rule setting that replaced the flag"
         );
     }
 
@@ -1200,23 +1192,16 @@ mod tests {
         }
     }
 
+    /// Where a candidate goes is settled in the plan, from its rule's tier and
+    /// this flag together. All the flag does is say "all of them".
     #[test]
-    fn removal_defaults_to_the_trash() {
+    fn nothing_is_destroyed_without_being_asked_for() {
         for verb in ["preview", "clean"] {
-            let Mode::Clean { removal, .. } = resolved(&[verb, "/x"]).expect("resolve") else {
-                panic!("expected a cleanup");
-            };
-            assert_eq!(
-                removal,
-                Removal::Trash,
-                "nothing becomes unrecoverable without being asked for"
+            assert!(
+                !clean_options(&[verb, "/x"]).purge_all,
+                "{verb} without the flag leaves every rule's tier alone"
             );
-
-            let Mode::Clean { removal, .. } = resolved(&[verb, "/x", "--purge"]).expect("resolve")
-            else {
-                panic!("expected a cleanup");
-            };
-            assert_eq!(removal, Removal::Purge);
+            assert!(clean_options(&[verb, "/x", "--purge"]).purge_all, "{verb}");
         }
     }
 

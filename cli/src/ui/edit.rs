@@ -78,7 +78,7 @@ impl Field {
             Field::RequiresCleanRepo => "refuse while the git repository has uncommitted work",
             Field::MinSize => "skip anything smaller, e.g. 10M; empty for no floor",
             Field::OlderThan => "only if untouched this long, e.g. 30d; empty for any age",
-            Field::Tier => "auto removes without asking; confirm does not",
+            Field::Tier => "purge destroys it, trash recovers, confirm waits for --yes",
             Field::Enabled => "a disabled rule matches nothing",
         }
     }
@@ -319,8 +319,10 @@ impl Form {
         }
         let value = &mut self.values[self.focus];
         *value = match focus {
-            Field::Tier if value == "auto" => tier_word(Tier::Confirm),
-            Field::Tier => tier_word(Tier::Auto),
+            // Three values now, so a cycle rather than a flip — one key, and it
+            // comes round. The order is the ladder the tiers are: destroy,
+            // recover, ask.
+            Field::Tier => tier_word(next_tier(value)),
             // Every other choice field is a yes/no.
             _ if value == "yes" => yes_no(false),
             _ => yes_no(true),
@@ -472,10 +474,7 @@ impl Form {
             requires_clean_repo: self.value(Field::RequiresCleanRepo) == "yes",
             older_than,
             min_size,
-            tier: match self.value(Field::Tier) {
-                "auto" => Tier::Auto,
-                _ => Tier::Confirm,
-            },
+            tier: read_tier(self.value(Field::Tier)),
             enabled: self.value(Field::Enabled) == "yes",
         };
 
@@ -510,10 +509,34 @@ fn join(parts: &[String]) -> String {
 
 fn tier_word(tier: Tier) -> String {
     match tier {
-        Tier::Auto => "auto",
+        Tier::Purge => "purge",
+        Tier::Trash => "trash",
         Tier::Confirm => "confirm",
     }
     .to_owned()
+}
+
+/// The tier a word names, defaulting to the cautious one.
+///
+/// Unknown reads as `confirm`, never as something that removes: the field is
+/// cycled rather than typed, so a value that is not one of the three can only
+/// come from a form built wrong — and for input to a delete the safe reading of
+/// unknown is "ask".
+fn read_tier(word: &str) -> Tier {
+    match word {
+        "purge" => Tier::Purge,
+        "trash" => Tier::Trash,
+        _ => Tier::Confirm,
+    }
+}
+
+/// The next tier round the cycle.
+fn next_tier(word: &str) -> Tier {
+    match read_tier(word) {
+        Tier::Purge => Tier::Trash,
+        Tier::Trash => Tier::Confirm,
+        Tier::Confirm => Tier::Purge,
+    }
 }
 
 fn yes_no(yes: bool) -> String {
@@ -613,7 +636,7 @@ mod tests {
             requires_sibling: vec!["Cargo.toml".into()],
             older_than: Some(Duration::from_secs(30 * 86_400)),
             min_size: 1024,
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             enabled: false,
             ..Rule::default()
         };
@@ -625,7 +648,7 @@ mod tests {
         assert_eq!(form.value(Field::RequiresSibling), "Cargo.toml");
         assert_eq!(form.value(Field::MinSize), "1024");
         assert_eq!(form.value(Field::OlderThan), "30d");
-        assert_eq!(form.value(Field::Tier), "auto");
+        assert_eq!(form.value(Field::Tier), "trash");
         assert_eq!(form.value(Field::Enabled), "no");
         assert!(form.is_edit());
     }
@@ -714,10 +737,19 @@ mod tests {
             "letters do nothing here"
         );
 
+        // Three values, so a cycle rather than a flip — and it must come round,
+        // or a field the keys cannot return to is a field the user can only get
+        // wrong once.
         form.toggle();
-        assert_eq!(form.value(Field::Tier), "auto");
+        assert_eq!(form.value(Field::Tier), "purge");
         form.toggle();
-        assert_eq!(form.value(Field::Tier), "confirm");
+        assert_eq!(form.value(Field::Tier), "trash");
+        form.toggle();
+        assert_eq!(
+            form.value(Field::Tier),
+            "confirm",
+            "and back where it began"
+        );
     }
 
     #[test]

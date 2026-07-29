@@ -13,8 +13,7 @@ mod ui;
 use args::{Args, Environment, Intent, Mode, Report, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOptions, CleanOutcome, CleanPlan, Removal, ScanOptions, ScanTree, SkippedEntry, Tier,
-    apply, plan, scan,
+    CleanOptions, CleanOutcome, CleanPlan, ScanOptions, ScanTree, SkippedEntry, apply, plan, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{render_clean, render_outcome};
@@ -83,17 +82,13 @@ fn main() -> ExitCode {
             roots_from_rules,
             clean,
             intent,
-            removal,
             report,
         } => run_clean(
             &roots,
             roots_from_rules,
             *clean,
             intent,
-            Removing {
-                removal,
-                confirm_tier_allowed,
-            },
+            confirm_tier_allowed,
             report,
             verbose,
         ),
@@ -178,36 +173,12 @@ fn run_scan(options: ScanOptions, number: Option<usize>, json: bool, verbose: bo
     emit(&report, &tree.skipped, verbose)
 }
 
-/// How far a removal is allowed to go.
-///
-/// Two settings that only mean anything together: whether the trash is bypassed,
-/// and whether the candidates that are not regenerable may go. *Whether* to
-/// remove at all is no longer one of them — that is the verb, and it arrives as
-/// [`Intent`].
-struct Removing {
-    removal: Removal,
-    confirm_tier_allowed: bool,
-}
-
-impl Removing {
-    /// May the outcome describe what it removed as still retrievable?
-    ///
-    /// Only the trash makes that true. Named rather than written inline as
-    /// `!= Removal::Purge` because it guards the one sentence a user reads to
-    /// find out whether their data still exists — and because inline it was
-    /// untestable: that sentence prints only after a partial failure, which
-    /// cannot be provoked against the macOS trash.
-    fn recoverable(&self) -> bool {
-        self.removal == Removal::Trash
-    }
-}
-
 fn run_clean(
     roots: &[PathBuf],
     roots_from_rules: bool,
     clean: CleanOptions,
     intent: Intent,
-    removing: Removing,
+    confirm_tier_allowed: bool,
     report: Report,
     verbose: bool,
 ) -> ExitCode {
@@ -266,7 +237,7 @@ fn run_clean(
     let planned = CleanPlan::merge(plans);
 
     if intent == Intent::Removing {
-        return remove(&planned, &removing, report, &skipped, verbose);
+        return remove(&planned, confirm_tier_allowed, report, &skipped, verbose);
     }
 
     // The count of what `--safe` hid comes back with the plan. It used to come
@@ -290,7 +261,7 @@ fn run_clean(
 /// a dry run would have given them.
 fn remove(
     planned: &CleanPlan,
-    removing: &Removing,
+    confirm_tier_allowed: bool,
     report: Report,
     skipped: &[SkippedEntry],
     verbose: bool,
@@ -306,7 +277,7 @@ fn remove(
     let confirm = planned
         .candidates
         .iter()
-        .filter(|c| c.tier == Tier::Confirm)
+        .filter(|c| c.tier.needs_confirming())
         .count();
 
     // Decided **before** anything is printed. The plan below goes out with an
@@ -317,7 +288,7 @@ fn remove(
     //
     // `--safe` needs no case of its own: it keeps confirm-tier candidates out of
     // the plan, so the count is zero and there is nothing to refuse.
-    if confirm > 0 && !removing.confirm_tier_allowed {
+    if confirm > 0 && !confirm_tier_allowed {
         let code = emit(
             &render_clean(planned, None, Intent::Preview, report),
             skipped,
@@ -347,14 +318,27 @@ fn remove(
     if confirm > 0 {
         // Reached only with `--yes`, or with `require-confirmation` turned off.
         // Saying the number out loud is what keeps either from being a blind yes.
-        eprintln!("{confirm} of these are not regenerable — removing anyway, as asked.");
+        // The verb agrees with the count, as everywhere else in this report:
+        // "1 of these are" is the kind of slip that makes a reader doubt the
+        // number beside it, and this one is counting deletions.
+        let verb = if confirm == 1 { "is" } else { "are" };
+        eprintln!("{confirm} of these {verb} not regenerable — removing anyway, as asked.");
     }
 
-    if removing.removal == Removal::Purge {
-        // The last word before something becomes unrecoverable. `--purge` is a
-        // deliberate reversal of this tool's central promise, so it is said
-        // plainly rather than assumed understood.
-        eprintln!("Deleting outright — these will NOT go to the trash and cannot be put back.");
+    // The last word before something becomes unrecoverable, and counted from
+    // the plan rather than from a flag: after v0.5 a rule can carry `purge` on
+    // its own, so a run that destroys things need never have been asked to.
+    let destroying = planned.candidates.iter().filter(|c| c.purge).count();
+    if destroying > 0 {
+        let (noun, verb) = if destroying == 1 {
+            ("candidate", "is")
+        } else {
+            ("candidates", "are")
+        };
+        eprintln!(
+            "{destroying} {noun} {verb} being deleted outright — NOT to the trash, \
+             and cannot be put back."
+        );
     }
 
     // A spinner, not a bar. Trashing is **one** batched call: a bar would fill
@@ -365,15 +349,11 @@ fn remove(
     let spinner = ProgressBar::new_spinner();
     spinner.set_message(format!("Removing {} items…", planned.candidates.len()));
     spinner.enable_steady_tick(Duration::from_millis(100));
-    let outcome = apply(planned, removing.removal, |_| {});
+    let outcome = apply(planned, |_| {});
     spinner.finish_and_clear();
 
     let code = emit(
-        &render_outcome(
-            &outcome,
-            shared_was_removed(planned, &outcome),
-            removing.recoverable(),
-        ),
+        &render_outcome(&outcome, shared_was_removed(planned, &outcome)),
         skipped,
         verbose,
     );
@@ -450,7 +430,7 @@ fn shared_was_removed(planned: &CleanPlan, outcome: &CleanOutcome) -> bool {
     planned
         .candidates
         .iter()
-        .any(|candidate| candidate.shared && outcome.removed.contains(&candidate.path))
+        .any(|candidate| candidate.shared && outcome.removed().any(|gone| *gone == candidate.path))
 }
 
 /// Write the finished report to stdout in one buffered pass.
@@ -476,13 +456,14 @@ fn terminal_width() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_tools_core::{Candidate, TrashFailure};
+    use disk_tools_core::{Candidate, Reclaimed, Tier, TrashFailure};
 
     fn candidate(path: &str, shared: bool) -> Candidate {
         Candidate {
             path: PathBuf::from(path),
             rule: "node-modules".into(),
-            tier: Tier::Auto,
+            tier: Tier::Trash,
+            purge: false,
             allocated: 4096,
             shared,
         }
@@ -498,7 +479,11 @@ mod tests {
 
     fn outcome(removed: &[&str], failed: &[&str]) -> CleanOutcome {
         CleanOutcome {
-            removed: removed.iter().map(PathBuf::from).collect(),
+            trashed: Reclaimed {
+                paths: removed.iter().map(PathBuf::from).collect(),
+                bytes: 0,
+            },
+            purged: Reclaimed::default(),
             failed: failed
                 .iter()
                 .map(|path| TrashFailure {
@@ -506,7 +491,6 @@ mod tests {
                     reason: "denied".into(),
                 })
                 .collect(),
-            reclaimed: 0,
         }
     }
 
@@ -563,29 +547,5 @@ mod tests {
             &CleanPlan::default(),
             &outcome(&[], &[])
         ));
-    }
-}
-
-#[cfg(test)]
-mod removing_tests {
-    use super::*;
-
-    /// The one sentence a user reads to find out whether their data still
-    /// exists. Inline as `removal == Removal::Purge` it was untestable — the
-    /// line prints only after a partial failure, which cannot be provoked
-    /// against the macOS trash — and mutation testing showed nothing caught it
-    /// being inverted.
-    #[test]
-    fn only_the_trash_is_recoverable() {
-        let removing = |removal| Removing {
-            removal,
-            confirm_tier_allowed: false,
-        };
-
-        assert!(removing(Removal::Trash).recoverable());
-        assert!(
-            !removing(Removal::Purge).recoverable(),
-            "there is nothing in the trash to put back"
-        );
     }
 }

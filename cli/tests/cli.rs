@@ -574,7 +574,7 @@ fn a_relative_path_finds_what_the_absolute_one_does() {
     let config = home_dir.join("rules.toml");
     std::fs::write(
         &config,
-        "[[rules]]\nname = \"js\"\nroot = \"~\"\nincludes = [\"**/node_modules/\"]\ntier = \"auto\"\n",
+        "[[rules]]\nname = \"js\"\nroot = \"~\"\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n",
     )
     .expect("write config");
     let config = config.to_str().expect("utf8");
@@ -953,7 +953,7 @@ fn a_configured_rule_replaces_the_builtins() {
     let config = write(
         home.path(),
         "config.toml",
-        "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"**/node_modules/\"]\ntier = \"auto\"\n",
+        "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n",
     );
 
     let output = run(&[
@@ -1151,7 +1151,7 @@ fn rules_rooted_at(at: &Path, roots: &[&Path]) -> std::path::PathBuf {
     let mut text = String::new();
     for (index, root) in roots.iter().enumerate() {
         text.push_str(&format!(
-            "[[rules]]\nname = \"r{index}\"\nroot = {:?}\nincludes = [\"**/node_modules/\"]\ntier = \"auto\"\n\n",
+            "[[rules]]\nname = \"r{index}\"\nroot = {:?}\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n\n",
             root.to_str().expect("utf8")
         ));
     }

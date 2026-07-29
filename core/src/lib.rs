@@ -52,7 +52,7 @@ pub use rules::{
 };
 pub use size::allocated_size;
 #[cfg(feature = "trash")]
-pub use trash::{CleanOutcome, Removal, TrashFailure, apply, move_to_trash};
+pub use trash::{CleanOutcome, Reclaimed, TrashFailure, apply, move_to_trash};
 pub use tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
 
 /// Scan `options.root` and return a size-annotated tree plus whatever was

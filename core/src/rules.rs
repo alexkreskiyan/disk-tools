@@ -53,21 +53,50 @@ pub struct UserDirs {
     pub app_data: Option<PathBuf>,
 }
 
-/// How eligible a candidate is.
+/// What `clean` does with what this rule claims.
+///
+/// Three answers to **one** question, which is why they are one field. v0.5
+/// renamed them from `purge` / `auto` / `confirm`: `purge` named a destination
+/// while `auto` named a ceremony, so the contrast between the two resolved on no
+/// axis at all.
+///
+/// [`Tier::Purge`] is [`Tier::Trash`] plus "no undo" — the same claim of
+/// regenerability, made harder. As a separate `purge = true` key beside a tier
+/// it would be writable against `confirm`, a combination that has to be
+/// rejected; as a third value it cannot be written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Tier {
-    /// Regenerable, so removable without per-item confirmation.
-    Auto,
-    /// Needs the user to say yes to this specific path.
+    /// Deleted outright, no confirmation and no trash.
+    ///
+    /// For what a command regenerates: the trash does not free space until it
+    /// is emptied, so moving 20 GB of `node_modules` into it leaves a full disk
+    /// full and adds a second, manual step.
+    Purge,
+    /// Moved to the OS trash, without per-item confirmation.
+    Trash,
+    /// Nothing, until the user says so.
     Confirm,
+}
+
+impl Tier {
+    /// Does this need the user to agree to each path?
+    ///
+    /// The one question `--safe` and the `clean` refusal both ask, named rather
+    /// than written as `== Tier::Confirm` at each site — so that a fourth tier
+    /// could be added without hunting for the comparisons that would then be
+    /// wrong.
+    pub fn needs_confirming(self) -> bool {
+        self == Tier::Confirm
+    }
 }
 
 impl Default for Tier {
     /// **Confirm**, so a rule that forgets to say gets the cautious answer.
     ///
-    /// v0.3 lets a user mark their own rule `auto`, which is a claim the tool
-    /// cannot check. Making the *unstated* case ask is the least this can do.
+    /// v0.3 lets a user mark their own rule as needing no confirmation, which is
+    /// a claim the tool cannot check. Making the *unstated* case ask is the
+    /// least this can do.
     fn default() -> Self {
         Tier::Confirm
     }
@@ -612,19 +641,19 @@ pub fn builtin_rules() -> Vec<Rule> {
             // share a name with a build one.
             requires_sibling: vec!["Cargo.toml".into()],
             requires_clean_repo: true,
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
         Rule {
             name: "node-modules".into(),
             includes: vec!["**/node_modules/".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
         Rule {
             name: "pycache".into(),
             includes: vec!["**/__pycache__/".into(), "**/*.pyc".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
         // The tilde is the entire safety of this one: `~/Library/Caches` is
@@ -637,7 +666,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             name: "user-caches".into(),
             root: Some("~".into()),
             includes: vec![".cache/".into(), "Library/Caches/".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
         // Separate from `user-caches` because it has a different root, and one
@@ -647,7 +676,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             name: "windows-temp".into(),
             root: Some("%LOCALAPPDATA%".into()),
             includes: vec!["Temp/".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
     ]
@@ -1190,7 +1219,7 @@ mod tests {
         for name in ["rust-target", "node-modules", "pycache", "user-caches"] {
             assert_eq!(
                 rules.get(name).expect(name).tier,
-                Tier::Auto,
+                Tier::Trash,
                 "{name} is regenerable"
             );
         }

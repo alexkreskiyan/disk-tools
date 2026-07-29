@@ -171,7 +171,8 @@ fn apply(table: &mut Table, rule: &Rule) {
         table,
         "tier",
         value(match rule.tier {
-            Tier::Auto => "auto",
+            Tier::Purge => "purge",
+            Tier::Trash => "trash",
             Tier::Confirm => "confirm",
         }),
     );
@@ -233,7 +234,7 @@ one-file-system = false
 name = "keeper"            # and a trailing one
 root = "*"
 includes = ["**/node_modules/"]
-tier = "auto"
+tier = "trash"
 
 # A comment between rules.
 [[rules]]
@@ -364,7 +365,7 @@ tier = "confirm"
             requires_clean_repo: true,
             older_than: Some(Duration::from_secs(30 * 86_400)),
             min_size: 10 * 1024 * 1024,
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             enabled: false,
         };
 
@@ -401,14 +402,14 @@ requires-sibling = ["Cargo.toml"]
 requires-clean-repo = true
 min-size = "1024"
 older-than = "30d"
-tier = "auto"
+tier = "trash"
 enabled = false
 "#;
         let stripped = Rule {
             name: "junk".into(),
             root: None,
             includes: vec!["**/target/".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             enabled: true,
             ..Rule::default()
         };

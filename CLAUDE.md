@@ -135,18 +135,19 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `CleanPlan::merge(Vec<CleanPlan>)` | `core/src/clean.rs` | One plan from several roots. Additive **only because** `Rules::scan_roots` drops nested roots |
 | `measure(root, claim, cancel, finished) -> Measured` | `core/src/measure.rs` | One subtree's bytes **and what the rules claim of them**, from one walk. Reports **every directory as that directory finishes**, so an outer walk subsumes the inner ones instead of racing them |
 | `Claim` | `core/src/measure.rs` | The rules, `now`, and whether `root` is *already* claimed — without the last, a walk of a `node_modules` reports nothing reclaimable, since nothing inside one matches `**/node_modules/` |
-| `apply(&CleanPlan, Removal, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. `Removal::Trash` batches; `Removal::Purge` deletes outright |
+| `apply(&CleanPlan, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. Takes **no** removal mode: where each candidate goes is already on it, so `preview` prints exactly what this does. Trashing batches; purging is per item |
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
 | `Rule` / `Rules` | `core/src/rules.rs` | Detection as data. **List order is precedence**; a rule that cannot be expressed matches nothing |
 | `Rules::state -> State` | `core/src/rules.rs` | Why a row is that colour: `untracked` / `in scope` / `included` / `excluded`. Shares `matching`, `excluded` **and `predicates_hold`** with `detect`, so `included` means exactly "detect would claim this" |
 | `Facts` | `core/src/rules.rs` | What the caller already knows — siblings, mtime, `now` — so the other predicates need no filesystem and no clock. `any_sibling` is a *predicate over names*, not a name: `requires_sibling` is a glob and only `Rules` has it compiled |
 | `DetectOptions` / `Detection` | `core/src/detect.rs` | The pass's input and output. `now` is mandatory, so a rule's `older_than` can never be half-armed |
-| `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason; `filtered_out` / `too_small` count the user's own narrowings |
-| `CleanOutcome` | `core/src/trash.rs` | `removed` / `failed` / `reclaimed` — never a `Result` |
+| `CleanPlan` / `Candidate` / `Excluded` | `core/src/clean.rs` | Sorted, non-overlapping candidates; refusals carried with a reason; `filtered_out` / `too_small` count the user's own narrowings. `Candidate.tier` is the **rule's** word and `Candidate.purge` is where it actually goes — see the invariant |
+| `CleanOutcome` | `core/src/trash.rs` | `trashed` / `purged` / `failed` — never a `Result`, and the two halves are **never added up by the core**: one figure over both would not say what can be brought back |
 | `SkippedEntry` / `SkipReason` | `core/src/tree.rs` | Failures returned **as data** — the core never prints |
 | `RenderOptions` | `cli/src/render/tree.rs` | Display-only knobs |
-| `Intent` | `cli/src/render/clean.rs` | Whether the plan is a dry run or a preview — the closing line differs |
+| `Intent` | `cli/src/args.rs` | `Preview` or `Removing` — the verb, as a value. The closing line of the report differs, and printing the wrong one before a deletion is the defect it exists for |
+| `Report` | `cli/src/args.rs` | `depth` and `sort` — display only. Nothing in it can keep a candidate out of the removal, only out of the printout |
 | `Config` / `Environment` | `cli/src/config.rs`, `cli/src/args.rs` | The file's contents, and everything the frontend resolved before the args became work |
 
 Invariants worth keeping in mind:
@@ -173,13 +174,29 @@ Invariants worth keeping in mind:
   siblings are two questions and a set could only say *something* matched.
 - **`deny(unsafe_code)` is exempted per function, never per module** — four
   `#[cfg(windows)]` functions, each listed in `core/src/lib.rs`.
-- **`--apply` refuses while a confirm-tier candidate remains,** unless `--safe`
-  or `--yes`. There is no interactive prompt and no config key for `--yes`: a
-  file that answered yes in advance would cancel the confirmation invisibly.
-- **Nothing is deleted without `--apply`,** and the default destination is the OS
-  trash. `--purge` deletes outright — an opt-in reversal of that rule, which
-  requires `--apply` and which the report never describes as recoverable. The
-  denylist stays absolute: no flag overrides it, `--purge` included.
+- **`clean` refuses while a confirm-tier candidate remains,** unless `--safe` or
+  `--yes`, and exits **2** — not 1, which already means "the removal partly
+  failed". It reads the *plan*, not the arguments, which is why clap could never
+  have enforced it. There is no interactive prompt and no config key for
+  `--yes`: a file that answered yes in advance would cancel the confirmation
+  invisibly.
+- **`preview` shows and `clean` removes.** Identical flag sets, resolved by one
+  function, because a preview is acted on by retyping the same line with the
+  other verb. `--apply` is gone.
+- **Three tiers, one field: `purge` · `trash` · `confirm`.** All three answer
+  *what does `clean` do with this*, which the old `purge`/`auto`/`confirm` could
+  not — `purge` named a destination while `auto` named a ceremony. `--safe`
+  drops what needs confirming, so it **admits purge**: that is a stronger claim
+  of regenerability than trash, not a weaker one.
+- **`Candidate.tier` is the rule's word; `Candidate.purge` is where it goes.**
+  Two fields because `--purge` overrides only the destination. Rewriting the
+  tier would let one flag cancel a confirmation it has nothing to do with, so
+  `--safe` and the refusal read `tier` and `apply` reads `purge`.
+- **The plan says what will happen, so `apply` takes no removal mode.** That is
+  what lets `preview` print exactly what `clean` does instead of a description
+  kept in step by hand.
+- The denylist stays absolute: no flag and no tier overrides it, `purge`
+  included.
 - **Trashing is batched** — one backend call, not one per candidate, because on
   macOS each is a ~230 ms `osascript` round-trip. The per-item loop survives as
   the diagnostic path, run only when the batch reports a failure.
