@@ -17,7 +17,7 @@ use disk_tools_core::{
 };
 use indicatif::ProgressBar;
 use render::clean::{render_clean, render_outcome};
-use render::json::render_json;
+use render::json::{render_json, render_outcome_json, render_plan};
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
 use std::io::{self, BufWriter, Write};
@@ -247,11 +247,37 @@ fn run_clean(
     // subtracting two independently-measured numbers, which could disagree.
     let hidden = clean.safe_only.then_some(planned.filtered_out);
 
+    if report.json {
+        // `hidden` is a sentence for a human about a flag they passed. A
+        // consumer knows what it passed, and can count the plan.
+        return match render_plan(&planned) {
+            Ok(payload) => emit(&(payload + "\n"), &skipped, verbose),
+            Err(err) => json_failed(err),
+        };
+    }
     emit(
         &render_clean(&planned, hidden, Intent::Preview, report),
         &skipped,
         verbose,
     )
+}
+
+/// The plan, in whichever shape was asked for.
+fn render(planned: &CleanPlan, report: Report, intent: Intent) -> serde_json::Result<String> {
+    if report.json {
+        return render_plan(planned).map(|payload| payload + "\n");
+    }
+    Ok(render_clean(planned, None, intent, report))
+}
+
+/// A path that is not UTF-8 cannot be a JSON string.
+///
+/// An error and a non-zero exit rather than a document with a path silently
+/// missing from it — this output exists to be acted on by something that cannot
+/// notice the gap.
+fn json_failed(err: serde_json::Error) -> ExitCode {
+    eprintln!("disk-tools: cannot encode JSON: {err}");
+    ExitCode::FAILURE
 }
 
 /// The one path in this program that deletes anything.
@@ -289,11 +315,13 @@ fn remove(
     // `--safe` needs no case of its own: it keeps confirm-tier candidates out of
     // the plan, so the count is zero and there is nothing to refuse.
     if confirm > 0 && !confirm_tier_allowed {
-        let code = emit(
-            &render_clean(planned, None, Intent::Preview, report),
-            skipped,
-            verbose,
-        );
+        // Nothing happened, so what there is to report is the plan — the same
+        // document `preview` would have produced. A consumer tells the two
+        // apart by the exit code, which is the thing it has to read anyway.
+        let code = match render(planned, report, Intent::Preview) {
+            Ok(shown) => emit(&shown, skipped, verbose),
+            Err(err) => return json_failed(err),
+        };
         let (noun, verb) = if confirm == 1 {
             ("candidate", "is")
         } else {
@@ -312,8 +340,9 @@ fn remove(
         };
     }
 
-    // To stderr: this is context for the operation, not the report. It also
-    // keeps stdout to the outcome alone for anything reading it.
+    // To stderr: this is context for the operation, not the report, and it stays
+    // text even under `--json` — stdout is reserved for the one document, and a
+    // second JSON value on the way to it would make the stream unparseable.
     eprint!("{}", render_clean(planned, None, Intent::Removing, report));
     if confirm > 0 {
         // Reached only with `--yes`, or with `require-confirmation` turned off.
@@ -352,11 +381,15 @@ fn remove(
     let outcome = apply(planned, |_| {});
     spinner.finish_and_clear();
 
-    let code = emit(
-        &render_outcome(&outcome, shared_was_removed(planned, &outcome)),
-        skipped,
-        verbose,
-    );
+    let shown = if report.json {
+        match render_outcome_json(&outcome) {
+            Ok(payload) => payload + "\n",
+            Err(err) => return json_failed(err),
+        }
+    } else {
+        render_outcome(&outcome, shared_was_removed(planned, &outcome))
+    };
+    let code = emit(&shown, skipped, verbose);
     if !outcome.is_complete() {
         // A partial removal is not a success, whatever else went right.
         return ExitCode::FAILURE;

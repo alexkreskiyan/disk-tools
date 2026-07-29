@@ -601,6 +601,132 @@ fn a_relative_path_finds_what_the_absolute_one_does() {
     );
 }
 
+/// The one property a machine-readable output has to keep: a display flag
+/// cannot change a byte of it. Anything else and a consumer is reading a
+/// document that was quietly shortened, with nothing in it saying so.
+#[test]
+fn display_flags_cannot_change_the_json() {
+    let dir = cleanable_dir();
+    let path = dir.path().to_str().expect("utf8");
+    let plain = run(&["preview", path, "--json"]);
+    assert!(plain.status.success(), "{:?}", plain.status);
+
+    for extra in [
+        vec!["-d", "1"],
+        vec!["-d", "9"],
+        vec!["--sort", "size"],
+        vec!["-d", "1", "--sort", "size"],
+    ] {
+        let mut args = vec!["preview", path, "--json"];
+        args.extend_from_slice(&extra);
+        let output = run(&args);
+
+        assert_eq!(
+            output.stdout, plain.stdout,
+            "{extra:?} changed the document"
+        );
+    }
+}
+
+/// And a flag that narrows the *plan* is of course reflected: it changes what
+/// the answer is, not how it is shown.
+#[test]
+fn a_narrowing_flag_does_change_the_json() {
+    let dir = cleanable_dir();
+    let path = dir.path().to_str().expect("utf8");
+
+    let whole = run(&["preview", path, "--json"]);
+    let narrowed = run(&["preview", path, "--json", "--min-size", "1G"]);
+
+    let of = |out: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice(&out.stdout).expect("valid JSON")
+    };
+    assert!(
+        !of(&whole)["candidates"]
+            .as_array()
+            .expect("array")
+            .is_empty()
+    );
+    assert!(
+        of(&narrowed)["candidates"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "nothing here is a gigabyte"
+    );
+}
+
+/// stdout is the document and stderr is everything else — which is what makes
+/// the output pipeable at all.
+#[test]
+fn preview_json_is_one_document_on_stdout() {
+    let dir = cleanable_dir();
+
+    let output = run(&[
+        "preview",
+        dir.path().to_str().expect("utf8"),
+        "--json",
+        "-v",
+    ]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    let first = &value["candidates"][0];
+    assert_eq!(first["rule"], "node-modules");
+    assert_eq!(first["tier"], "trash");
+    assert_eq!(first["purge"], false);
+    assert!(
+        first["allocated"]
+            .as_u64()
+            .is_some_and(|bytes| bytes >= 4096),
+        "a raw byte count: {first}"
+    );
+}
+
+/// `clean --json` answers a different question — what was *done* — so it is a
+/// different document, and the two halves are both in it.
+#[test]
+fn clean_json_reports_what_it_did() {
+    let dir = cleanable_dir();
+
+    let output = run(&["clean", dir.path().to_str().expect("utf8"), "--json"]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    assert!(value.get("trashed").is_some(), "{value}");
+    assert!(value.get("purged").is_some(), "{value}");
+    assert_eq!(value["failed"].as_array().expect("array").len(), 0);
+    assert!(
+        value.get("candidates").is_none(),
+        "an outcome is not a plan, and must not look like one: {value}"
+    );
+}
+
+/// A refusal removed nothing, so what there is to report is the plan. The two
+/// are told apart by the exit code, which a consumer has to read anyway.
+#[test]
+fn a_refusal_emits_the_plan_and_exits_two() {
+    let dir = mixed_tiers_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    assert!(
+        value.get("candidates").is_some(),
+        "nothing happened, so the plan is what there is to say: {value}"
+    );
+}
+
 /// Every path under `root`, with its length — enough to catch a creation, a
 /// deletion or a truncation.
 fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, u64)> {

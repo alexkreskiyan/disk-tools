@@ -402,6 +402,7 @@ fn listed() -> Report {
     Report {
         depth: 1,
         sort: Sort::Name,
+        json: false,
     }
 }
 
@@ -443,7 +444,11 @@ mod tests {
     }
 
     fn at(depth: usize, sort: Sort) -> Report {
-        Report { depth, sort }
+        Report {
+            depth,
+            sort,
+            json: false,
+        }
     }
 
     /// The default. "What would this take" is asked of the whole run before it

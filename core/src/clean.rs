@@ -85,6 +85,7 @@ pub struct Candidate {
 /// Why something that matched is not in the plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum ExcludeReason {
     /// On the never-touch denylist. No flag overrides this.
     Denylisted,

@@ -66,6 +66,9 @@ pub struct UserDirs {
 /// rejected; as a third value it cannot be written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// Lowercase, so the word in `--json` is the word in the config file. A consumer
+// reading `"Trash"` and writing `tier = "Trash"` back would find it refused.
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum Tier {
     /// Deleted outright, no confirmation and no trash.
     ///

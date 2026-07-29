@@ -1,9 +1,20 @@
-//! `--json`: the scan as machine-readable JSON on stdout.
+//! `--json`: the answer as machine-readable JSON on stdout.
 //!
 //! Sizes are the raw byte counts (the human report formats the same numbers), so
-//! the two outputs never disagree. `skipped` is carried alongside the tree.
+//! the two outputs never disagree.
+//!
+//! **Display flags do not reach here.** `-n`, `-d` and `--sort` change how a
+//! report is laid out for a person; a machine-readable output quietly shortened
+//! by one of them is the worst kind of shortened, because nothing in the
+//! document says it happened. The flags that narrow the *plan* — `--safe`,
+//! `--min-size`, `--older-than`, `--purge` — are of course reflected, since they
+//! change what the answer is rather than how it is shown.
+//!
+//! `preview --json` and `clean --json` are **different documents**, one a plan
+//! and the other an outcome. Giving them one shape with half the fields null
+//! would make every consumer branch on emptiness to discover which it had.
 
-use disk_tools_core::ScanTree;
+use disk_tools_core::{CleanOutcome, CleanPlan, ScanTree};
 
 /// Serialize the whole scan (tree + skipped) as pretty JSON.
 ///
@@ -14,10 +25,28 @@ pub fn render_json(tree: &ScanTree) -> serde_json::Result<String> {
     serde_json::to_string_pretty(tree)
 }
 
+/// The whole plan: what `clean` would remove, and what it refused.
+///
+/// Every candidate carries its rule, its tier, whether it will be destroyed
+/// rather than trashed, and the `shared` marker that makes its size an upper
+/// bound — so a consumer can reach the same conclusions the human report does
+/// without parsing it.
+pub fn render_plan(plan: &CleanPlan) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(plan)
+}
+
+/// What a cleanup actually did: the two halves and every failure.
+pub fn render_outcome_json(outcome: &CleanOutcome) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_tools_core::{ScanNode, ScanTree, SkipReason, SkippedEntry};
+    use disk_tools_core::{
+        Candidate, ExcludeReason, Excluded, Reclaimed, ScanNode, ScanTree, SkipReason,
+        SkippedEntry, Tier, TrashFailure,
+    };
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -45,6 +74,165 @@ mod tests {
             skipped,
             link_groups: Vec::new(),
         }
+    }
+
+    // ---- the plan and the outcome ----------------------------------------
+
+    fn a_plan() -> CleanPlan {
+        CleanPlan {
+            candidates: vec![
+                Candidate {
+                    path: PathBuf::from("/p/node_modules"),
+                    rule: "node-modules".into(),
+                    tier: Tier::Purge,
+                    purge: true,
+                    allocated: 4096,
+                    shared: false,
+                },
+                Candidate {
+                    path: PathBuf::from("/p/old.bin"),
+                    rule: "old".into(),
+                    tier: Tier::Confirm,
+                    purge: false,
+                    allocated: 1024,
+                    shared: true,
+                },
+            ],
+            reclaimable: 5120,
+            excluded: vec![Excluded {
+                path: PathBuf::from("/Windows"),
+                reason: ExcludeReason::Denylisted,
+            }],
+            filtered_out: 1,
+            too_small: 2,
+            below_rule_minimum: 3,
+        }
+    }
+
+    #[test]
+    fn a_plan_round_trips() {
+        let plan = a_plan();
+
+        let json = render_plan(&plan).expect("serialize");
+        let parsed: CleanPlan = serde_json::from_str(&json).expect("parse back");
+
+        assert_eq!(parsed, plan);
+    }
+
+    /// Everything the human report says about a candidate, so a consumer can
+    /// reach the same conclusions without parsing prose.
+    #[test]
+    fn every_candidate_carries_what_the_report_shows() {
+        let value: serde_json::Value =
+            serde_json::from_str(&render_plan(&a_plan()).expect("serialize")).expect("parse");
+        let first = &value["candidates"][0];
+
+        assert_eq!(first["path"], "/p/node_modules");
+        assert_eq!(first["rule"], "node-modules");
+        assert_eq!(first["tier"], "purge");
+        assert_eq!(first["purge"], true);
+        assert_eq!(first["allocated"], 4096, "a raw byte count, never `4.0K`");
+        assert_eq!(first["shared"], false);
+        assert_eq!(value["candidates"][1]["shared"], true);
+    }
+
+    /// The two are different questions: what a rule says, and where the
+    /// candidate goes. `--purge` moves the second and not the first.
+    #[test]
+    fn the_tier_and_the_destination_are_both_there() {
+        let mut plan = a_plan();
+        for candidate in &mut plan.candidates {
+            candidate.purge = true;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&render_plan(&plan).expect("serialize")).expect("parse");
+
+        assert_eq!(value["candidates"][1]["tier"], "confirm");
+        assert_eq!(
+            value["candidates"][1]["purge"], true,
+            "destroyed under the flag, and still needing confirmation"
+        );
+    }
+
+    /// The word in the document is the word in the config file. A consumer
+    /// reading `"Trash"` and writing it back would find it refused.
+    #[test]
+    fn a_tier_is_spelled_as_the_config_file_spells_it() {
+        for (tier, word) in [
+            (Tier::Purge, "purge"),
+            (Tier::Trash, "trash"),
+            (Tier::Confirm, "confirm"),
+        ] {
+            let plan = CleanPlan {
+                candidates: vec![Candidate {
+                    tier,
+                    ..a_plan().candidates[0].clone()
+                }],
+                ..CleanPlan::default()
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&render_plan(&plan).expect("serialize")).expect("parse");
+
+            assert_eq!(value["candidates"][0]["tier"], word);
+        }
+    }
+
+    /// Why something was refused is machine-readable too — a consumer that
+    /// cannot tell the denylist from the git guard cannot decide what to do.
+    #[test]
+    fn a_refusal_carries_its_reason() {
+        let value: serde_json::Value =
+            serde_json::from_str(&render_plan(&a_plan()).expect("serialize")).expect("parse");
+
+        assert_eq!(value["excluded"][0]["path"], "/Windows");
+        assert_eq!(value["excluded"][0]["reason"], "denylisted");
+    }
+
+    /// The counts the report turns into three separate sentences, each naming a
+    /// different remedy.
+    #[test]
+    fn the_narrowings_are_counted_separately() {
+        let value: serde_json::Value =
+            serde_json::from_str(&render_plan(&a_plan()).expect("serialize")).expect("parse");
+
+        assert_eq!(value["filtered_out"], 1);
+        assert_eq!(value["too_small"], 2);
+        assert_eq!(value["below_rule_minimum"], 3);
+    }
+
+    /// The outcome is a different document from the plan, and says which half
+    /// of a mixed run can be brought back.
+    #[test]
+    fn an_outcome_reports_both_halves_and_every_failure() {
+        let outcome = CleanOutcome {
+            trashed: Reclaimed {
+                paths: vec![PathBuf::from("/p/target")],
+                bytes: 2048,
+            },
+            purged: Reclaimed {
+                paths: vec![PathBuf::from("/p/node_modules")],
+                bytes: 4096,
+            },
+            failed: vec![TrashFailure {
+                path: PathBuf::from("/p/stuck"),
+                reason: "Permission denied".into(),
+            }],
+        };
+
+        let json = render_outcome_json(&outcome).expect("serialize");
+        let parsed: CleanOutcome = serde_json::from_str(&json).expect("parse back");
+        assert_eq!(parsed, outcome);
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(value["trashed"]["bytes"], 2048);
+        assert_eq!(value["purged"]["bytes"], 4096);
+        assert_eq!(
+            value.get("reclaimed"),
+            None,
+            "the two are never added up here: one figure would not say what \
+             can be brought back"
+        );
+        assert_eq!(value["failed"][0]["reason"], "Permission denied");
     }
 
     #[test]

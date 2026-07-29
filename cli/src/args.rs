@@ -189,6 +189,12 @@ pub struct CleanArgs {
     /// Order the report by `name` or by `size`. Default: name.
     #[arg(long, value_enum, value_name = "KEY")]
     pub sort: Option<Sort>,
+
+    /// Emit JSON instead of the report.
+    ///
+    /// The whole plan, or the whole outcome — `-d` and `--sort` do not reach it.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// What the report is ordered by.
@@ -229,6 +235,12 @@ pub struct Report {
     /// 0 groups by rule, 1 lists candidates, 2+ unfolds inside them.
     pub depth: usize,
     pub sort: Sort,
+
+    /// Emit the whole thing as JSON, ignoring the two above.
+    ///
+    /// They lay a report out for a person; a machine-readable output quietly
+    /// shortened by one of them would say nothing about having been.
+    pub json: bool,
 }
 
 /// What the parsed arguments actually asked for.
@@ -448,6 +460,7 @@ impl Args {
                 // one keystroke away.
                 depth: clean.depth.unwrap_or(0),
                 sort: clean.sort.unwrap_or(Sort::Name),
+                json: clean.json,
             },
         })
     }
