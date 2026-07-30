@@ -49,23 +49,70 @@ const CHUNK: usize = 128 * 1024;
 
 /// Which copy survives when several are identical.
 ///
-/// The default is [`Keep::First`] — the byte-lexicographically first path, the
-/// same rule `dedup::attribute` uses to pick which name of a hardlink
-/// owns its bytes, and for the same reason: two runs over one tree must agree,
-/// and the rule has to be explainable in one line.
+/// The default is [`Keep::OldestCreated`]: the original is the one that existed
+/// first, and copying makes a new inode with a new creation time. Modification
+/// time cannot say that on its own — `cp -p`, `rsync` and unpacking an archive
+/// all carry the original's mtime onto the copy, which leaves a group whose
+/// members all claim the same age.
+///
+/// Every date-based rule **degrades rather than misleads**: a member whose date
+/// the platform did not record never wins, and a group where *no* member has the
+/// requested date falls back to the other date and then to
+/// [`Keep::First`] — recorded in [`DuplicateGroup::keeper_fell_back`], so the
+/// report can say so instead of quietly answering a different question. Linux
+/// without `statx` birth times is where this happens.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum Keep {
-    /// The byte-lexicographically first path.
-    #[default]
+    /// The byte-lexicographically first path. The only rule that needs no
+    /// metadata and so can never degrade.
     First,
-    /// The earliest mtime. An unknown time never wins.
-    Oldest,
-    /// The latest mtime. An unknown time never wins.
-    Newest,
-    /// The shortest path, ties broken by [`Keep::First`].
-    Shortest,
+    /// The earliest creation time — the original.
+    #[default]
+    OldestCreated,
+    /// The latest creation time — the most recently made copy.
+    NewestCreated,
+    /// The earliest modification time.
+    OldestModified,
+    /// The latest modification time.
+    NewestModified,
+}
+
+impl Keep {
+    /// Which date this rule reads, if any.
+    fn date(self) -> Option<Date> {
+        match self {
+            Keep::First => None,
+            Keep::OldestCreated | Keep::NewestCreated => Some(Date::Created),
+            Keep::OldestModified | Keep::NewestModified => Some(Date::Modified),
+        }
+    }
+
+    /// Does it want the earliest or the latest?
+    fn wants_earliest(self) -> bool {
+        matches!(
+            self,
+            Keep::First | Keep::OldestCreated | Keep::OldestModified
+        )
+    }
+}
+
+/// Which timestamp a keeper rule reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Date {
+    Created,
+    Modified,
+}
+
+impl Date {
+    /// The one the rule falls back to when this one is unrecorded.
+    fn other(self) -> Date {
+        match self {
+            Date::Created => Date::Modified,
+            Date::Modified => Date::Created,
+        }
+    }
 }
 
 /// Everything the pass needs, all of it explicit.
@@ -110,6 +157,16 @@ pub struct DuplicateGroup {
 
     pub keeper: PathBuf,
 
+    /// The keeper rule asked for could not be applied here, and a weaker one
+    /// chose instead.
+    ///
+    /// Only ever true for a date-based [`Keep`] on a group where **no** member
+    /// carried that date — a Linux filesystem with no birth times, most often.
+    /// Carried per group rather than counted once for the run, because that is
+    /// the granularity a report can act on: this row is the one whose keeper was
+    /// not chosen the way you asked.
+    pub keeper_fell_back: bool,
+
     /// The redundant copies, ordered by path bytes. Never empty.
     pub copies: Vec<Copy>,
 
@@ -150,12 +207,27 @@ pub struct Hashed<'a> {
 }
 
 /// One file on its way through the pipeline.
+///
+/// Both dates are read from the `symlink_metadata` the pass already makes to
+/// confirm the file is still there — so the keeper rules cost no extra call,
+/// and nothing above this module has to start carrying a creation time it would
+/// otherwise never use.
 #[derive(Debug, Clone)]
 struct Member {
     path: PathBuf,
     allocated: u64,
     apparent: u64,
+    created: Option<SystemTime>,
     modified: Option<SystemTime>,
+}
+
+impl Member {
+    fn date(&self, which: Date) -> Option<SystemTime> {
+        match which {
+            Date::Created => self.created,
+            Date::Modified => self.modified,
+        }
+    }
 }
 
 /// Everything the parallel stages share.
@@ -269,7 +341,9 @@ fn collect(node: &ScanNode, claimed: &HashSet<PathBuf>, min_size: u64, out: &mut
         path: node.path.clone(),
         allocated: node.allocated,
         apparent: node.apparent,
-        modified: node.modified,
+        // Both filled by `still_there`, from the stat it makes anyway.
+        created: None,
+        modified: None,
     });
 }
 
@@ -319,17 +393,27 @@ fn resolve(
         .collect()
 }
 
-/// Confirm each member is still the regular file of that size the scan saw.
+/// Confirm each member is still the regular file of that size the scan saw, and
+/// take its dates while the metadata is in hand.
 ///
 /// One `symlink_metadata` per file in a contested bucket — cheap beside the
 /// reads to come, and it is what keeps three things out of a removal plan: a
 /// symlink (its content is a path, not the file it names), a file that changed
-/// under us, and one that is already gone.
+/// under us, and one that is already gone. The keeper's dates ride along on it,
+/// which is why choosing by creation time costs nothing and why `ScanNode` never
+/// had to grow a field for it.
 fn still_there(members: Vec<Member>, size: u64, progress: &Progress<'_>) -> Vec<Member> {
     members
         .into_iter()
-        .filter(|member| match std::fs::symlink_metadata(&member.path) {
-            Ok(metadata) if metadata.is_file() && metadata.len() == size => true,
+        .filter_map(|member| match std::fs::symlink_metadata(&member.path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == size => Some(Member {
+                // `created` is unsupported on some Linux filesystems and
+                // `modified` on almost none; either way an error is "unknown",
+                // which the keeper rules treat as never winning.
+                created: metadata.created().ok(),
+                modified: metadata.modified().ok(),
+                ..member
+            }),
             Ok(metadata) if metadata.is_file() => {
                 progress.skip(
                     &member.path,
@@ -338,14 +422,14 @@ fn still_there(members: Vec<Member>, size: u64, progress: &Progress<'_>) -> Vec<
                         metadata.len()
                     )),
                 );
-                false
+                None
             }
             // A symlink or a device node is silently not a duplicate — nothing
             // went wrong, it was simply never a candidate.
-            Ok(_) => false,
+            Ok(_) => None,
             Err(err) => {
                 progress.skip(&member.path, skip_reason(&err));
-                false
+                None
             }
         })
         .collect()
@@ -389,7 +473,7 @@ fn group(
     }
     members.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
 
-    let keeper = choose_keeper(&members, options);
+    let (keeper, keeper_fell_back) = choose_keeper(&members, options);
     let keeper_path = members[keeper].path.clone();
     let copies: Vec<Copy> = members
         .into_iter()
@@ -404,14 +488,17 @@ fn group(
     Some(DuplicateGroup {
         apparent,
         keeper: keeper_path,
+        keeper_fell_back,
         reclaimable: copies.iter().map(|copy| copy.allocated).sum(),
         copies,
     })
 }
 
-/// Which member stays. `members` is already sorted by path bytes, so every
-/// "first" below is the byte-lexicographic one and every tie breaks that way.
-fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> usize {
+/// Which member stays, and whether the rule asked for had to give way.
+///
+/// `members` is already sorted by path bytes, so every "first" below is the
+/// byte-lexicographic one and every tie breaks that way.
+fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> (usize, bool) {
     // A preferred root beats the policy outright; the policy then only chooses
     // among the members inside it.
     let inside: Vec<usize> = options
@@ -428,33 +515,38 @@ fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> usize {
         })
         .unwrap_or_else(|| (0..members.len()).collect());
 
-    let by_time = |pick: fn(&SystemTime, &SystemTime) -> bool| {
-        // An unknown mtime never wins: `None` is "we do not know", and treating
-        // it as the epoch would hand the keeper to whichever file the platform
+    let Some(date) = options.keep.date() else {
+        return (inside[0], false); // `First` reads nothing and cannot degrade
+    };
+    let earliest = options.keep.wants_earliest();
+
+    let by_date = |which: Date| {
+        // An unknown date never wins: `None` is "we do not know", and reading it
+        // as the epoch would hand the keeper to whichever file the platform
         // happened to be quiet about.
         let mut best: Option<(usize, SystemTime)> = None;
         for &index in &inside {
-            let Some(time) = members[index].modified else {
+            let Some(time) = members[index].date(which) else {
                 continue;
             };
-            match best {
-                Some((_, current)) if !pick(&time, &current) => {}
-                _ => best = Some((index, time)),
+            let better = match best {
+                None => true,
+                Some((_, current)) if earliest => time < current,
+                Some((_, current)) => time > current,
+            };
+            if better {
+                best = Some((index, time));
             }
         }
         best.map(|(index, _)| index)
     };
 
-    match options.keep {
-        Keep::First => inside[0],
-        Keep::Shortest => *inside
-            .iter()
-            .min_by_key(|&&index| members[index].path.as_os_str().len())
-            .expect("a group is never empty"),
-        // Every member unknown falls back to the path rule rather than to an
-        // arbitrary member.
-        Keep::Oldest => by_time(|new, current| new < current).unwrap_or(inside[0]),
-        Keep::Newest => by_time(|new, current| new > current).unwrap_or(inside[0]),
+    match by_date(date) {
+        Some(index) => (index, false),
+        // No member carries the date asked for. Degrade rather than mislead:
+        // the other date, then the path — and say so, because "kept the oldest"
+        // and "kept the first path" are different claims about the same run.
+        None => (by_date(date.other()).unwrap_or(inside[0]), true),
     }
 }
 
@@ -557,7 +649,11 @@ mod tests {
 
         assert_eq!(found.groups.len(), 1, "{:?}", found.groups);
         let group = &found.groups[0];
-        assert_eq!(group.keeper, root.join("a.bin"), "byte-first path stays");
+        assert_eq!(
+            group.keeper,
+            root.join("a.bin"),
+            "the file written first stays"
+        );
         assert_eq!(group.copies.len(), 1);
         assert_eq!(group.copies[0].path, root.join("b.bin"));
         assert_eq!(
@@ -800,6 +896,36 @@ mod tests {
         assert_eq!(found.groups[0].keeper, root.join("big-a.bin"));
     }
 
+    /// The point of the default, on a real filesystem: the original is the file
+    /// that existed first, and its path has nothing to do with it.
+    #[test]
+    fn the_default_keeps_the_original_not_the_first_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let bytes = content(19, 8192);
+        // Written first, but sorts last.
+        write(&root.join("z-original.bin"), &bytes);
+        std::thread::sleep(Duration::from_millis(20));
+        write(&root.join("a-copy.bin"), &bytes);
+
+        let dates = |name: &str| {
+            let metadata = fs::metadata(root.join(name)).expect("stat");
+            (metadata.created().ok(), metadata.modified().ok())
+        };
+        if dates("z-original.bin") == dates("a-copy.bin") {
+            eprintln!("skipping: this filesystem cannot tell the two writes apart");
+            return;
+        }
+
+        let group = &plain(root).groups[0];
+        assert_eq!(
+            group.keeper,
+            root.join("z-original.bin"),
+            "the earlier file stays even though the other sorts first"
+        );
+        assert_eq!(group.copies[0].path, root.join("a-copy.bin"));
+    }
+
     #[test]
     fn keep_in_beats_the_policy() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -814,7 +940,7 @@ mod tests {
         assert_eq!(
             plain(root).groups[0].keeper,
             root.join("elsewhere/a.bin"),
-            "without a preferred root the byte-first path wins"
+            "without a preferred root the default rule decides, and that file was written first"
         );
 
         let options = DuplicateOptions {
@@ -872,11 +998,13 @@ mod tests {
 
     // ---- the keeper rules, as a pure function -----------------------------
 
-    fn member(path: &str, modified: Option<SystemTime>) -> Member {
+    /// `created` and `modified`, in that order — the two the rules read.
+    fn member(path: &str, created: Option<SystemTime>, modified: Option<SystemTime>) -> Member {
         Member {
             path: PathBuf::from(path),
             allocated: 4096,
             apparent: 4096,
+            created,
             modified,
         }
     }
@@ -892,77 +1020,139 @@ mod tests {
         members
     }
 
-    fn keeper(members: &[Member], keep: Keep, keep_in: Vec<PathBuf>) -> &Path {
+    fn choose(members: &[Member], keep: Keep, keep_in: Vec<PathBuf>) -> (&Path, bool) {
         let options = DuplicateOptions {
             keep,
             keep_in,
             ..DuplicateOptions::default()
         };
-        &members[choose_keeper(members, &options)].path
+        let (index, fell_back) = choose_keeper(members, &options);
+        (&members[index].path, fell_back)
+    }
+
+    fn keeper(members: &[Member], keep: Keep, keep_in: Vec<PathBuf>) -> &Path {
+        choose(members, keep, keep_in).0
+    }
+
+    #[test]
+    fn the_default_keeps_the_earliest_created() {
+        assert_eq!(Keep::default(), Keep::OldestCreated);
     }
 
     #[test]
     fn keep_first_takes_the_byte_first_path() {
         let members = sorted(vec![
-            member("/z/early.bin", at(10)),
-            member("/a/late.bin", at(99)),
+            member("/z/early.bin", at(10), at(10)),
+            member("/a/late.bin", at(99), at(99)),
         ]);
+        let (keeper, fell_back) = choose(&members, Keep::First, vec![]);
+        assert_eq!(keeper, Path::new("/a/late.bin"));
+        assert!(!fell_back, "a rule that reads no date can never degrade");
+    }
+
+    #[test]
+    fn created_and_modified_are_different_questions() {
+        // The copy was made later (created 300) but carries the original's
+        // mtime, exactly as `cp -p` and unpacking an archive leave it.
+        let members = sorted(vec![
+            member("/copy.bin", at(300), at(100)),
+            member("/original.bin", at(100), at(200)),
+        ]);
+
         assert_eq!(
-            keeper(&members, Keep::First, vec![]),
-            Path::new("/a/late.bin")
+            keeper(&members, Keep::OldestCreated, vec![]),
+            Path::new("/original.bin"),
+            "creation time sees which file existed first"
+        );
+        assert_eq!(
+            keeper(&members, Keep::OldestModified, vec![]),
+            Path::new("/copy.bin"),
+            "modification time can be carried onto the copy, and then says the opposite"
         );
     }
 
     #[test]
-    fn keep_shortest_breaks_ties_by_path() {
+    fn oldest_and_newest_pick_opposite_ends() {
         let members = sorted(vec![
-            member("/aaa/deep/nested.bin", None),
-            member("/b.bin", None),
-            member("/c.bin", None),
+            member("/a.bin", at(300), at(30)),
+            member("/b.bin", at(100), at(10)),
+            member("/c.bin", at(200), at(20)),
         ]);
         assert_eq!(
-            keeper(&members, Keep::Shortest, vec![]),
-            Path::new("/b.bin"),
-            "two equally short paths are settled by the byte-first rule"
+            keeper(&members, Keep::OldestCreated, vec![]),
+            Path::new("/b.bin")
+        );
+        assert_eq!(
+            keeper(&members, Keep::NewestCreated, vec![]),
+            Path::new("/a.bin")
+        );
+        assert_eq!(
+            keeper(&members, Keep::OldestModified, vec![]),
+            Path::new("/b.bin")
+        );
+        assert_eq!(
+            keeper(&members, Keep::NewestModified, vec![]),
+            Path::new("/a.bin")
         );
     }
 
-    #[test]
-    fn keep_oldest_and_newest_pick_opposite_ends() {
-        let members = sorted(vec![
-            member("/a.bin", at(300)),
-            member("/b.bin", at(100)),
-            member("/c.bin", at(200)),
-        ]);
-        assert_eq!(keeper(&members, Keep::Oldest, vec![]), Path::new("/b.bin"));
-        assert_eq!(keeper(&members, Keep::Newest, vec![]), Path::new("/a.bin"));
-    }
-
-    /// An unknown mtime is "we do not know", not "the epoch" — reading it as a
+    /// An unknown date is "we do not know", not "the epoch" — reading it as a
     /// time would hand the keeper to whichever file the platform was quiet about.
     #[test]
-    fn an_unknown_mtime_never_wins() {
-        let members = sorted(vec![member("/a.bin", None), member("/b.bin", at(500))]);
-        assert_eq!(keeper(&members, Keep::Oldest, vec![]), Path::new("/b.bin"));
-        assert_eq!(keeper(&members, Keep::Newest, vec![]), Path::new("/b.bin"));
+    fn an_unknown_date_never_wins() {
+        let members = sorted(vec![
+            member("/a.bin", None, None),
+            member("/b.bin", at(500), at(500)),
+        ]);
+        for keep in [Keep::OldestCreated, Keep::NewestCreated] {
+            let (keeper, fell_back) = choose(&members, keep, vec![]);
+            assert_eq!(keeper, Path::new("/b.bin"), "{keep:?}");
+            assert!(
+                !fell_back,
+                "one member with the date is enough to apply the rule asked for"
+            );
+        }
+    }
+
+    /// The filesystem with no birth times — where a rule about creation has to
+    /// degrade rather than mislead.
+    #[test]
+    fn no_creation_time_anywhere_falls_back_to_modified() {
+        let members = sorted(vec![
+            member("/a.bin", None, at(900)),
+            member("/b.bin", None, at(100)),
+        ]);
+
+        let (keeper, fell_back) = choose(&members, Keep::OldestCreated, vec![]);
+        assert_eq!(
+            keeper,
+            Path::new("/b.bin"),
+            "the same end of the other date, not a different question"
+        );
+        assert!(fell_back, "and the report has to be able to say so");
     }
 
     #[test]
-    fn every_mtime_unknown_falls_back_to_the_path() {
-        let members = sorted(vec![member("/z.bin", None), member("/a.bin", None)]);
-        assert_eq!(keeper(&members, Keep::Oldest, vec![]), Path::new("/a.bin"));
+    fn no_date_at_all_falls_back_to_the_path() {
+        let members = sorted(vec![
+            member("/z.bin", None, None),
+            member("/a.bin", None, None),
+        ]);
+        let (keeper, fell_back) = choose(&members, Keep::OldestCreated, vec![]);
+        assert_eq!(keeper, Path::new("/a.bin"));
+        assert!(fell_back);
     }
 
     #[test]
     fn keep_in_tries_its_roots_in_order() {
         let members = sorted(vec![
-            member("/first/a.bin", at(10)),
-            member("/second/b.bin", at(20)),
+            member("/first/a.bin", at(10), at(10)),
+            member("/second/b.bin", at(20), at(20)),
         ]);
         assert_eq!(
             keeper(
                 &members,
-                Keep::Newest,
+                Keep::NewestCreated,
                 vec![PathBuf::from("/nowhere"), PathBuf::from("/first")],
             ),
             Path::new("/first/a.bin"),
@@ -974,12 +1164,12 @@ mod tests {
     #[test]
     fn keep_in_narrows_and_the_policy_decides() {
         let members = sorted(vec![
-            member("/keep/a.bin", at(10)),
-            member("/keep/b.bin", at(90)),
-            member("/other/c.bin", at(99)),
+            member("/keep/a.bin", at(10), at(10)),
+            member("/keep/b.bin", at(90), at(90)),
+            member("/other/c.bin", at(99), at(99)),
         ]);
         assert_eq!(
-            keeper(&members, Keep::Newest, vec![PathBuf::from("/keep")]),
+            keeper(&members, Keep::NewestCreated, vec![PathBuf::from("/keep")]),
             Path::new("/keep/b.bin")
         );
     }
