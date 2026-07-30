@@ -1018,13 +1018,19 @@ mod tests {
     #[test]
     fn keep_in_is_made_absolute_and_the_flag_replaces_the_file() {
         let path = rooted("x");
-        let file = "[duplicates]\nkeep-in = [\"/from/file\"]\n";
+        // Built rather than written, and in a TOML *literal* string: a
+        // hard-coded "/from/file" is drive-relative on Windows, so `absolute`
+        // prepends whichever drive the runner has and the assertion below stops
+        // matching. CI caught exactly this, on a runner whose drive was `D:`.
+        // Single quotes because a basic TOML string would read `\f` as an escape.
+        let configured = rooted("from");
+        let file = format!("[duplicates]\nkeep-in = ['{configured}']\n");
 
-        let from_file = duplicating(file, &["preview", &path, "--dup"]).expect("dup");
-        assert_eq!(from_file.keep_in, vec![PathBuf::from(rooted("from/file"))]);
+        let from_file = duplicating(&file, &["preview", &path, "--dup"]).expect("dup");
+        assert_eq!(from_file.keep_in, vec![PathBuf::from(&configured)]);
 
         let flagged = duplicating(
-            file,
+            &file,
             &["preview", &path, "--dup", "--keep-in", &rooted("named")],
         )
         .expect("dup");
