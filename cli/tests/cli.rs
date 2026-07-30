@@ -546,6 +546,27 @@ fn cleanable_dir() -> tempfile::TempDir {
     dir
 }
 
+/// A fixture path in the form the spawned process's own working directory will
+/// have, so that a `~`-rooted rule and a relative path can meet.
+///
+/// Both halves are the platform's doing and neither is the tool's:
+///
+/// - **macOS** hands `tempdir` a `/var/...` path while `current_dir()` reports
+///   the resolved `/private/var/...`, so without canonicalising, the rule's root
+///   and the candidate disagree.
+/// - **Windows** canonicalises to a *verbatim* path (`\\?\C:\...`), which a
+///   working directory never is — so canonicalising alone makes them disagree in
+///   the other direction. The prefix is stripped.
+///
+/// Only a test needs this. The binary must not canonicalise: the path it shows
+/// has to be the path it removes, and resolving links would report somewhere the
+/// user never named.
+fn as_the_child_sees_it(path: &Path) -> std::path::PathBuf {
+    let canonical = std::fs::canonicalize(path).expect("canonicalize the fixture");
+    let text = canonical.to_string_lossy().into_owned();
+    std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+}
+
 /// The bug a preview cannot survive: `preview .` inside a project reported
 /// "Nothing to clean" while `preview /full/path` to the same directory found
 /// gigabytes.
@@ -558,14 +579,7 @@ fn cleanable_dir() -> tempfile::TempDir {
 #[test]
 fn a_relative_path_finds_what_the_absolute_one_does() {
     let home = isolated();
-    // The one place a test has to canonicalize. `current_dir()` returns the
-    // kernel's working directory, which is already resolved, while `HOME` here
-    // is the path `tempdir` handed back — and on macOS those differ by
-    // `/var` -> `/private/var`. That is the platform's symlink, not the tool's:
-    // the same mismatch would appear for any user whose home is behind one, and
-    // resolving it in the binary would mean `canonicalize`, which this project
-    // refuses because the path shown must be the path removed.
-    let home_dir = std::fs::canonicalize(home.path()).expect("canonicalize the fixture");
+    let home_dir = as_the_child_sees_it(home.path());
     let home_dir = home_dir.as_path();
     let project = home_dir.join("project");
     std::fs::create_dir_all(project.join("node_modules")).expect("mkdir");
