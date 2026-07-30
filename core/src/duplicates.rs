@@ -984,3 +984,93 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod diagnostics {
+    use super::*;
+    use crate::rules::{Rules, UserDirs};
+    use crate::{ScanOptions, scan};
+    use std::time::Instant;
+
+    /// Run the pipeline over a real tree and print what it found.
+    ///
+    /// **Reads only** — nothing here removes, trashes or writes anything; the
+    /// pass itself cannot, and neither can this. It exists because the CLI has
+    /// no `--dup` yet (Task 3), and a pipeline that has only ever seen
+    /// hand-built fixtures has not really been seen at all.
+    ///
+    /// ```text
+    /// just bench-dup ~/Downloads
+    /// DT_DUP_MIN=104857600 just bench-dup ~            # 100 MiB and up
+    /// ```
+    ///
+    /// Ignored by default: it needs a path, prints, and asserts nothing.
+    #[test]
+    #[ignore = "diagnostic: needs DT_PHASE_PATH, prints findings, asserts nothing"]
+    fn over_a_real_tree() {
+        let root = std::env::var("DT_PHASE_PATH")
+            .expect("set DT_PHASE_PATH to the tree to search, e.g. DT_PHASE_PATH=~/Downloads");
+        let min_size: u64 = std::env::var("DT_DUP_MIN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1024 * 1024);
+
+        let started = Instant::now();
+        let tree = scan(&ScanOptions {
+            root: root.clone().into(),
+            ..ScanOptions::default()
+        });
+        let scanned = started.elapsed();
+
+        // The rules a first run gets, so the pruning this pass depends on is
+        // exercised rather than skipped.
+        let dirs = UserDirs {
+            home: std::env::var_os("HOME").map(Into::into),
+            ..UserDirs::default()
+        };
+        let options = DuplicateOptions {
+            detect: DetectOptions {
+                rules: Rules::builtin(&dirs),
+                now: SystemTime::now(),
+            },
+            min_size,
+            ..DuplicateOptions::default()
+        };
+
+        let started = Instant::now();
+        let found = duplicates(&tree, &options, &|_| {});
+        let hashing = started.elapsed();
+
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        let reclaimable: u64 = found.groups.iter().map(|group| group.reclaimable).sum();
+        let copies: usize = found.groups.iter().map(|group| group.copies.len()).sum();
+
+        println!("\n{root} — scanned in {scanned:.1?}, searched in {hashing:.1?}");
+        println!("  minimum      {:.1} MiB", mib(min_size));
+        println!("  groups       {}", found.groups.len());
+        println!("  copies       {copies}");
+        println!("  reclaimable  {:.1} MiB", mib(reclaimable));
+        println!(
+            "  read         {:.1} MiB across {} files",
+            mib(found.bytes_read),
+            found.files_hashed
+        );
+        println!("  skipped      {}", found.skipped.len());
+
+        for group in found.groups.iter().take(20) {
+            println!(
+                "\n  {:.1} MiB  x{}  frees {:.1} MiB",
+                mib(group.apparent),
+                group.copies.len() + 1,
+                mib(group.reclaimable)
+            );
+            println!("    keep    {}", group.keeper.display());
+            for copy in &group.copies {
+                println!("    remove  {}", copy.path.display());
+            }
+        }
+        if found.groups.len() > 20 {
+            println!("\n  … and {} more groups", found.groups.len() - 20);
+        }
+    }
+}
