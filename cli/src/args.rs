@@ -862,11 +862,50 @@ mod tests {
         }
     }
 
+    /// A path that is **already absolute on this platform**, so that a test
+    /// asserting one travels through unchanged still means that.
+    ///
+    /// `/x` is not absolute on Windows — it is relative to the current *drive* —
+    /// so `absolute` prepends whichever that is, and a literal `/x` stops
+    /// matching. CI found this on a runner whose drive was `D:`. The path is not
+    /// touched otherwise, and none of these tests reach the filesystem.
+    fn rooted(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\{name}")
+        } else {
+            format!("/{name}")
+        }
+    }
+
     #[test]
     fn path_maps_to_scan_options_root() {
-        assert_eq!(
-            scan_options(&["scan", "/some/path"]).root,
-            PathBuf::from("/some/path")
+        let path = rooted("some/path");
+
+        assert_eq!(scan_options(&["scan", &path]).root, PathBuf::from(&path));
+    }
+
+    /// The defect this exists to prevent: a rooted rule compiles to an absolute
+    /// glob, so a relative path produces nodes nothing matches and the run
+    /// claims nothing — silently, and in the safe direction. `preview .` inside
+    /// a project reported "Nothing to clean" while the same directory by full
+    /// path reported gigabytes.
+    ///
+    /// Every verb that acts on a path, since the browser had it too.
+    #[test]
+    fn a_relative_path_is_made_absolute() {
+        assert!(scan_options(&["scan", "."]).root.is_absolute());
+
+        for verb in ["preview", "clean"] {
+            let roots = clean_roots(&[verb, "."]);
+            assert!(roots[0].is_absolute(), "{verb}: {roots:?}");
+        }
+
+        let Mode::Ui { root, .. } = resolved(&["ui"]).expect("resolve") else {
+            panic!("expected the browser");
+        };
+        assert!(
+            root.is_absolute(),
+            "with no path at all, `ui` opens the working directory — absolutely: {root:?}"
         );
     }
 
@@ -1096,13 +1135,14 @@ mod tests {
 
     #[test]
     fn both_verbs_parse_their_flags() {
+        let path = rooted("x");
         for verb in ["preview", "clean"] {
-            let mode = resolved(&[verb, "/x", "--safe", "--older-than", "90d"]).expect("parse");
+            let mode = resolved(&[verb, &path, "--safe", "--older-than", "90d"]).expect("parse");
 
             let Mode::Clean(cleanup) = mode else {
                 panic!("{verb} must resolve to a cleanup");
             };
-            assert_eq!(cleanup.roots, vec![PathBuf::from("/x")]);
+            assert_eq!(cleanup.roots, vec![PathBuf::from(&path)]);
             assert!(cleanup.options.safe_only);
             assert_eq!(
                 older_than_of(&cleanup.options),
@@ -1353,7 +1393,8 @@ mod tests {
         let config = crate::config::parse_for_test(
             "[[rules]]\nname = \"a\"\nroot = \"/tmp/a\"\nincludes = [\"**/x/\"]\n",
         );
-        let mode = parse(&["clean", "/elsewhere"])
+        let path = rooted("elsewhere");
+        let mode = parse(&["clean", &path])
             .expect("parse")
             .resolve(env(config))
             .expect("resolve");
@@ -1361,7 +1402,7 @@ mod tests {
         let Mode::Clean(cleanup) = mode else {
             panic!("expected a clean");
         };
-        assert_eq!(cleanup.roots, vec![PathBuf::from("/elsewhere")]);
+        assert_eq!(cleanup.roots, vec![PathBuf::from(&path)]);
         assert!(
             !cleanup.roots_from_rules,
             "a user who named a path knows where they pointed"
