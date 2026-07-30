@@ -24,8 +24,14 @@ always gives the terminal back.
 complete** — `preview` shows and `clean` removes, on an identical flag set;
 `--apply` and `--allow-dirty` are gone; the report unfolds by `-d` and orders by
 `--sort`; where a candidate goes is a third tier (`purge` / `trash` / `confirm`);
-and both verbs speak `--json`. **v0.6 is duplicates.** User-facing usage, flags,
-the safety model and the documented limitations live in the [README](README.md).
+and both verbs speak `--json`.
+**[v0.6](kb/specs/2026.07/2026.07.30-disk-tools-v0.6-duplicates.md) is
+complete** — `--dup` on both verbs switches the candidate source from the rules
+to file *contents*, found by a staged size → xxh3-128 → blake3 funnel; each group
+keeps one copy, chosen by `--keep` (creation time by default) or by `--keep-in`;
+every duplicate is confirm-tier, so `clean --dup` refuses without `--yes`. User-facing
+usage, flags, the safety model and the documented limitations live in the
+[README](README.md).
 
 ## Important: Documentation Requirements
 
@@ -61,6 +67,7 @@ rather than as ad-hoc commands.
 | `just run <ARGS>` | Run the CLI, e.g. `just run scan ~/Downloads --json` |
 | `just release` | Optimized host build → `target/release/disk-tools` |
 | `just install-cli` | `cargo install --path cli`, then check that the installed copy is the one first on PATH |
+| `just bench-dup <dir>` | Read-only diagnostic: run the duplicate pipeline over a real tree and print the funnel and the biggest groups. `DT_DUP_MIN` sets the floor |
 | `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` / `just bench-phases <path>` / `just bench-stat <dir>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
 CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` + `just smoke-trash`
@@ -85,13 +92,14 @@ disc-tools/
 │       ├── walk.rs     # read_dir + rayon par_iter recursion, skip collection
 │       ├── size.rs     # allocated (blocks*512 | GetCompressedFileSizeW) + apparent
 │       ├── dedup.rs    # hardlink attribution + the link groups it finds
+│       ├── duplicates.rs # cfg(feature="duplicates"): identical contents, staged
 │       ├── tree.rs     # ScanNode / ScanTree / SkippedEntry + aggregation
 │       ├── windows_dir.rs  # cfg(windows): AllocationSize, file id, LastWriteTime
 │       ├── paths.rs    # the path comparisons that decide what is a candidate
 │       ├── rules.rs    # Rule / Rules — one GlobSet, list order is precedence
 │       ├── detect.rs   # the one pass that applies them
 │       ├── git.rs      # is there uncommitted work here?
-│       ├── clean.rs    # denylist, tiers, totals → CleanPlan. Writes nothing
+│       ├── clean.rs    # denylist, tiers, totals → CleanPlan (both sources). Writes nothing
 │       ├── measure.rs  # one subtree's bytes and its claim; reports each directory as it finishes
 │       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
 ├── cli/                # disk-tools (bin) — CLI frontend
@@ -113,6 +121,7 @@ disc-tools/
 │   │   └── render/
 │   │       ├── mod.rs
 │   │       ├── tree.rs     # dust-style tree, parent-relative bars
+│   │       ├── dup.rs      # the duplicate report: groups, keep/remove, the basis
 │   │       ├── json.rs     # --json: the tree, a plan, or an outcome — raw byte counts
 │   │       ├── clean.rs    # the plan by depth, and what a removal did
 │   │       └── skipped.rs  # skipped-entries summary (capped at 10)
@@ -134,6 +143,9 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 |------|-------|------|
 | `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs` | Walk → dedup → aggregate, in that order |
 | `plan(&ScanTree, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | Decides what may go and what that frees. **Writes nothing** |
+| `duplicates(&ScanTree, &DuplicateOptions, progress) -> Duplicates` | `core/src/duplicates.rs` | Files with identical contents, as groups with a keeper. The **only** code here that reads file contents; still writes nothing and still returns its failures as data |
+| `plan_duplicates(&ScanTree, &Duplicates, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | The same plan type, from the other source. Keeps the denylist, `--safe`, `--purge`, `--min-size` and `shared`; drops the git guard, which says nothing about a photograph |
+| `Keep` / `Kept` | `core/src/duplicates.rs`, `core/src/clean.rs` | Which copy stays, and — on every candidate — which one did and what decided it |
 | `CleanPlan::merge(Vec<CleanPlan>)` | `core/src/clean.rs` | One plan from several roots. Additive **only because** `Rules::scan_roots` drops nested roots |
 | `measure(root, claim, cancel, finished) -> Measured` | `core/src/measure.rs` | One subtree's bytes **and what the rules claim of them**, from one walk. Reports **every directory as that directory finishes**, so an outer walk subsumes the inner ones instead of racing them |
 | `Claim` | `core/src/measure.rs` | The rules, `now`, and whether `root` is *already* claimed — without the last, a walk of a `node_modules` reports nothing reclaimable, since nothing inside one matches `**/node_modules/` |
@@ -148,6 +160,7 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `CleanOutcome` | `core/src/trash.rs` | `trashed` / `purged` / `failed` — never a `Result`, and the two halves are **never added up by the core**: one figure over both would not say what can be brought back |
 | `SkippedEntry` / `SkipReason` | `core/src/tree.rs` | Failures returned **as data** — the core never prints |
 | `RenderOptions` | `cli/src/render/tree.rs` | Display-only knobs |
+| `Duplicating` | `cli/src/args.rs` | What `--dup` resolved to. **Its presence is the switch**: `Some` means the candidates come from contents, so an empty duplicate run still prints the duplicate report |
 | `Intent` | `cli/src/args.rs` | `Preview` or `Removing` — the verb, as a value. The closing line of the report differs, and printing the wrong one before a deletion is the defect it exists for |
 | `Report` | `cli/src/args.rs` | `depth` and `sort` — display only. Nothing in it can keep a candidate out of the removal, only out of the printout |
 | `Config` / `Environment` | `cli/src/config.rs`, `cli/src/args.rs` | The file's contents, and everything the frontend resolved before the args became work |
@@ -164,6 +177,27 @@ Invariants worth keeping in mind:
   size and file identity both come from one `GetFileInformationByHandleEx` call
   per directory; `size.rs` is only the fallback there. Unix takes the per-file
   path and is unchanged.
+- **Hardlink collapse cost nothing to write.** `dedup::attribute` zeroes every
+  name of an inode but one, and a zeroed entry fails the duplicate pass's first
+  filter — which is exactly right, since removing one name frees no bytes. The
+  concept's "hardlink-collapse" stage is a stage that never had to exist.
+- **A file that could not be read is not evidence.** It drops out of its group
+  **and is reported**; if fewer than two members remain the group disappears. A
+  copy is never proposed for removal against content the tool could not read.
+- **A keeper rule degrades rather than misleads.** A copy whose date the platform
+  did not record never wins; a group where *none* has it falls back to the other
+  date, then to the path, and says so per group (`Kept::fell_back`). "Kept the
+  oldest" and "kept the first path" are different claims about one run.
+- **Both dates come from the re-stat the pass already makes**, so choosing by
+  creation time costs no syscall and `ScanNode` never grew a field for it.
+- **Which report is printed is settled by the mode, not by the plan.** An empty
+  `--dup` run has to say *no duplicates found* and name the two things that
+  explain it; a plan with no candidates cannot be told from any other empty plan.
+- **`--dup` is not a config key**, for the same reason `--yes` and `--purge` are
+  not: a file that switched what `clean` removes would switch it invisibly.
+  `duplicate` is a **reserved rule name** — one line of a plan must not be able
+  to mean two things, and they differ where it matters, since a rule may say
+  `tier = "purge"` and a duplicate never can.
 - **The safe-list is data, not code.** Five built-in `Rule`s replace v0.2's four
   hardcoded categories, and a user may edit any of them. **The denylist is the
   one thing no rule, flag or config can reach.**
@@ -288,7 +322,7 @@ What configuration exists beyond that is build-time:
 | File | Holds |
 |------|-------|
 | `Cargo.toml` (workspace) | `version`, `edition = "2024"`, `rust-version = "1.88"`, inherited by both crates |
-| `core/Cargo.toml` | The optional `serde` feature; `windows-sys` under `[target.'cfg(windows)'.dependencies]` |
+| `core/Cargo.toml` | The optional `serde` and `duplicates` features; `windows-sys` under `[target.'cfg(windows)'.dependencies]`. **blake3 carries `features = ["pure"]`** — its default build assembles x86 sources through `cc`, which needs `ml64.exe` on the Windows target and so breaks `just lint-windows` on a Unix host |
 | `cli/Cargo.toml` | Enables the core's `serde` feature for `--json`; `toml_edit` for writing rules back |
 | `.gitattributes` | `* text=auto eol=lf` — a CRLF checkout would fail `cargo fmt --check` on Windows |
 
@@ -308,9 +342,9 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 |--------|---------|-----------------|
 | `kb/architecture/` | System design, key patterns | `2026.07/2026.07.30` |
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
-| `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.26` |
+| `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.30` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
-| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.29` |
+| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.30` |
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07/2026.07.25` |
 | `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
@@ -321,6 +355,7 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 ## Documentation
 
 **Architecture** (snapshots from `kb/architecture/2026.07/`)
+- [After v0.6: a second source of candidates](kb/architecture/2026.07/2026.07.30-duplicates.md) — why `--dup` is a flag and not a verb, what the staged funnel costs, what the keeper rule went through
 - [After v0.5: two verbs, three tiers, and a plan that says what it will do](kb/architecture/2026.07/2026.07.30-preview-and-clean.md) — what was ceremony and what was a guard, why `--purge` must not rewrite a tier, display versus plan
 - [After v0.4: the browser, and why it does not scan](kb/architecture/2026.07/2026.07.27-tui-lazy-model.md) — the lazy model, what replaced the generation counter, what four rounds of real use found
 - [After v0.3: detection as data](kb/architecture/2026.07/2026.07.26-overview.md) — the rule engine, the config path, multi-root `clean`, which invariants moved
@@ -336,3 +371,4 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 - [What the cleanup engine costs](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) — the git guard at ~23 ms per repository
 - [The trash backend](kb/benchmarks/2026.07/2026.07.25-trash-backend.md) — 10,000 files across three platforms
 - [What detection costs](kb/benchmarks/2026.07/2026.07.26-detect-budget.md) — 285 ns per node before v0.3's rule engine, 201 ns after
+- [What the duplicate search costs](kb/benchmarks/2026.07/2026.07.30-duplicate-cost.md) — the funnel on real trees, and what the 1 MiB floor is worth

@@ -1315,6 +1315,22 @@ mod diagnostics {
             ..DuplicateOptions::default()
         };
 
+        // The funnel, measured with the module's own two stages so that the
+        // report below is about this code rather than about a re-implementation
+        // of it. Stage 2 costs nothing beyond the scan; stage 3 is where the
+        // reads begin.
+        let claimed: HashSet<PathBuf> = detect(&tree, &options.detect)
+            .into_iter()
+            .map(|found| found.path)
+            .collect();
+        let mut eligible = Vec::new();
+        collect(&tree.root, &claimed, options.min_size, &mut eligible);
+        let mut buckets: HashMap<u64, usize> = HashMap::new();
+        for member in &eligible {
+            *buckets.entry(member.apparent).or_default() += 1;
+        }
+        let contested: usize = buckets.values().filter(|&&n| n > 1).sum();
+
         let started = Instant::now();
         let found = duplicates(&tree, &options, &|_| {});
         let hashing = started.elapsed();
@@ -1325,6 +1341,15 @@ mod diagnostics {
 
         println!("\n{root} — scanned in {scanned:.1?}, searched in {hashing:.1?}");
         println!("  minimum      {:.1} MiB", mib(min_size));
+        println!(
+            "  eligible     {} files ({:.1} MiB)",
+            eligible.len(),
+            mib(eligible.iter().map(|m| m.apparent).sum())
+        );
+        println!(
+            "  contested    {contested} files share a size with something ({:.0}%)",
+            100.0 * contested as f64 / eligible.len().max(1) as f64
+        );
         println!("  groups       {}", found.groups.len());
         println!("  copies       {copies}");
         println!("  reclaimable  {:.1} MiB", mib(reclaimable));
