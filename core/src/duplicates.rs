@@ -157,6 +157,14 @@ pub struct DuplicateGroup {
 
     pub keeper: PathBuf,
 
+    /// The date the keeper rule read on the winner, where it read one.
+    ///
+    /// `None` for [`Keep::First`], and for a group in which nothing carried
+    /// either date. Kept so the report can show what the choice was made on: a
+    /// rule whose basis is invisible is one the user can only trust.
+    #[cfg_attr(feature = "serde", serde(with = "crate::tree::unix_seconds"))]
+    pub keeper_date: Option<SystemTime>,
+
     /// The keeper rule asked for could not be applied here, and a weaker one
     /// chose instead.
     ///
@@ -473,12 +481,12 @@ fn group(
     }
     members.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
 
-    let (keeper, keeper_fell_back) = choose_keeper(&members, options);
-    let keeper_path = members[keeper].path.clone();
+    let chosen = choose_keeper(&members, options);
+    let keeper_path = members[chosen.index].path.clone();
     let copies: Vec<Copy> = members
         .into_iter()
         .enumerate()
-        .filter(|(index, _)| *index != keeper)
+        .filter(|(index, _)| *index != chosen.index)
         .map(|(_, member)| Copy {
             path: member.path,
             allocated: member.allocated,
@@ -488,17 +496,33 @@ fn group(
     Some(DuplicateGroup {
         apparent,
         keeper: keeper_path,
-        keeper_fell_back,
+        keeper_date: chosen.date,
+        keeper_fell_back: chosen.fell_back,
         reclaimable: copies.iter().map(|copy| copy.allocated).sum(),
         copies,
     })
 }
 
-/// Which member stays, and whether the rule asked for had to give way.
+/// The keeper, and what decided it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Chosen {
+    index: usize,
+    /// The date the rule actually read on the winner.
+    ///
+    /// `None` where no date was read at all — `First`, or a group in which
+    /// nothing carried either date. It is carried out of here because the report
+    /// shows it: a keeper rule the user cannot check is one they have to trust,
+    /// and this one was changed once already for choosing wrongly in a way that
+    /// was invisible until the paths were read closely.
+    date: Option<SystemTime>,
+    fell_back: bool,
+}
+
+/// Which member stays, and what decided it.
 ///
 /// `members` is already sorted by path bytes, so every "first" below is the
 /// byte-lexicographic one and every tie breaks that way.
-fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> (usize, bool) {
+fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> Chosen {
     // A preferred root beats the policy outright; the policy then only chooses
     // among the members inside it.
     let inside: Vec<usize> = options
@@ -516,7 +540,12 @@ fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> (usize, bool
         .unwrap_or_else(|| (0..members.len()).collect());
 
     let Some(date) = options.keep.date() else {
-        return (inside[0], false); // `First` reads nothing and cannot degrade
+        // `First` reads nothing, so it cannot degrade and has nothing to show.
+        return Chosen {
+            index: inside[0],
+            date: None,
+            fell_back: false,
+        };
     };
     let earliest = options.keep.wants_earliest();
 
@@ -538,15 +567,30 @@ fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> (usize, bool
                 best = Some((index, time));
             }
         }
-        best.map(|(index, _)| index)
+        best
     };
 
     match by_date(date) {
-        Some(index) => (index, false),
+        Some((index, time)) => Chosen {
+            index,
+            date: Some(time),
+            fell_back: false,
+        },
         // No member carries the date asked for. Degrade rather than mislead:
         // the other date, then the path — and say so, because "kept the oldest"
         // and "kept the first path" are different claims about the same run.
-        None => (by_date(date.other()).unwrap_or(inside[0]), true),
+        None => match by_date(date.other()) {
+            Some((index, time)) => Chosen {
+                index,
+                date: Some(time),
+                fell_back: true,
+            },
+            None => Chosen {
+                index: inside[0],
+                date: None,
+                fell_back: true,
+            },
+        },
     }
 }
 
@@ -1026,8 +1070,20 @@ mod tests {
             keep_in,
             ..DuplicateOptions::default()
         };
-        let (index, fell_back) = choose_keeper(members, &options);
-        (&members[index].path, fell_back)
+        let chosen = choose_keeper(members, &options);
+        (&members[chosen.index].path, chosen.fell_back)
+    }
+
+    /// The date the rule read, which is what the report shows beside the keeper.
+    fn decided_on(members: &[Member], keep: Keep) -> Option<SystemTime> {
+        choose_keeper(
+            members,
+            &DuplicateOptions {
+                keep,
+                ..DuplicateOptions::default()
+            },
+        )
+        .date
     }
 
     fn keeper(members: &[Member], keep: Keep, keep_in: Vec<PathBuf>) -> &Path {
@@ -1141,6 +1197,38 @@ mod tests {
         let (keeper, fell_back) = choose(&members, Keep::OldestCreated, vec![]);
         assert_eq!(keeper, Path::new("/a.bin"));
         assert!(fell_back);
+    }
+
+    /// The report shows what the choice was made on, so the value has to be the
+    /// winner's own and the date the rule actually read — not the other one.
+    #[test]
+    fn the_date_that_decided_comes_back_with_the_keeper() {
+        let members = sorted(vec![
+            member("/a.bin", at(300), at(30)),
+            member("/b.bin", at(100), at(10)),
+        ]);
+
+        assert_eq!(decided_on(&members, Keep::OldestCreated), at(100));
+        assert_eq!(decided_on(&members, Keep::NewestCreated), at(300));
+        assert_eq!(decided_on(&members, Keep::OldestModified), at(10));
+        assert_eq!(
+            decided_on(&members, Keep::First),
+            None,
+            "a rule that reads no date has none to show"
+        );
+    }
+
+    /// Degraded, the date shown must be the one that actually decided — showing
+    /// a creation time that no member had would be the misleading this whole
+    /// fallback exists to avoid.
+    #[test]
+    fn a_degraded_rule_shows_the_date_it_fell_back_to() {
+        let members = sorted(vec![
+            member("/a.bin", None, at(900)),
+            member("/b.bin", None, at(100)),
+        ]);
+
+        assert_eq!(decided_on(&members, Keep::OldestCreated), at(100));
     }
 
     #[test]

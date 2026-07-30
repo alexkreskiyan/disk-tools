@@ -20,6 +20,7 @@ use crate::rules::{Rule, UserDirs};
 use crate::tree::{ScanNode, ScanTree};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 pub use crate::rules::Tier;
 
@@ -45,6 +46,26 @@ const DENIED_ROOTS: &[&[&str]] = &[
     &["Program Files"],
     &["Program Files (x86)"],
 ];
+
+/// The copy that stays, and what decided that.
+///
+/// Repeated on every candidate of a group rather than held once beside them:
+/// the report groups by [`Self::path`], and a plan whose rows are self-contained
+/// is one that survives [`CleanPlan::merge`] without renumbering anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Kept {
+    pub path: PathBuf,
+
+    /// The date the keeper rule read on it, where it read one.
+    #[cfg_attr(feature = "serde", serde(with = "crate::tree::unix_seconds"))]
+    pub date: Option<SystemTime>,
+
+    /// The rule asked for could not be applied to this group, and a weaker one
+    /// chose. The report says so; silently answering a different question is
+    /// the thing this field exists to prevent.
+    pub fell_back: bool,
+}
 
 /// One thing the plan proposes to remove.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,9 +102,12 @@ pub struct Candidate {
     /// Carried on the candidate rather than in a table beside the plan so that
     /// [`CleanPlan::merge`] stays a concatenation: group indices would have to
     /// be renumbered per plan, and the second root is where that goes wrong.
+    /// It also keeps the whole of what a report shows **inside the plan**, which
+    /// is what lets `preview` print exactly what `clean` does rather than a
+    /// second description kept in step by hand.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     #[cfg_attr(feature = "serde", serde(default))]
-    pub duplicate_of: Option<PathBuf>,
+    pub duplicate_of: Option<Kept>,
 
     /// This holds content reachable from outside it, so `allocated` is an upper
     /// bound rather than a promise.
@@ -449,7 +473,11 @@ pub fn plan_duplicates(
                 // above stays what it is, so the confirmation it demands cannot
                 // be cancelled by a flag about where files go.
                 purge: options.purge_all,
-                duplicate_of: Some(group.keeper.clone()),
+                duplicate_of: Some(Kept {
+                    path: group.keeper.clone(),
+                    date: group.keeper_date,
+                    fell_back: group.keeper_fell_back,
+                }),
                 allocated: copy.allocated,
                 shared,
             });
@@ -2017,6 +2045,7 @@ mod tests {
             DuplicateGroup {
                 apparent: 4096,
                 keeper: PathBuf::from(keeper),
+                keeper_date: None,
                 keeper_fell_back: false,
                 reclaimable: copies.iter().map(|c| c.allocated).sum(),
                 copies,
@@ -2060,7 +2089,8 @@ mod tests {
                     Tier::Confirm,
                     "a duplicate is always looked at"
                 );
-                assert_eq!(candidate.duplicate_of, Some(PathBuf::from("/p/a.bin")));
+                let kept = candidate.duplicate_of.as_ref().expect("a keeper");
+                assert_eq!(kept.path, PathBuf::from("/p/a.bin"));
                 assert_eq!(candidate.rule, DUPLICATE_RULE);
                 assert!(!candidate.purge, "the trash, unless asked otherwise");
             }
@@ -2188,7 +2218,7 @@ mod tests {
                 merged
                     .candidates
                     .iter()
-                    .map(|c| c.duplicate_of.clone())
+                    .map(|c| c.duplicate_of.as_ref().map(|kept| kept.path.clone()))
                     .collect::<Vec<_>>(),
                 vec![
                     Some(PathBuf::from("/p/a.bin")),
@@ -2216,6 +2246,7 @@ mod tests {
             let found = found(vec![DuplicateGroup {
                 apparent: 1,
                 keeper: keeper.clone(),
+                keeper_date: None,
                 keeper_fell_back: false,
                 reclaimable: 1,
                 copies: vec![crate::duplicates::Copy {

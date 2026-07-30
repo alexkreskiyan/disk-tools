@@ -57,9 +57,37 @@ pub fn render_clean(
         write_total(plan, &mut out);
     }
 
+    write_notices(plan, hidden_by_safe, intent, &mut out);
+
+    out
+}
+
+/// "candidate is" / "candidates are" — the verb has to agree with the noun, not
+/// only the noun with the count.
+fn are(count: usize) -> &'static str {
+    if count == 1 {
+        "candidate is"
+    } else {
+        "candidates are"
+    }
+}
+
+/// Everything a report says **after** the list: refusals, the user's own
+/// narrowings, and which verb this was.
+///
+/// Shared by the rule report and the duplicate one, because none of these
+/// sentences is about where a candidate came from. Two copies would drift, and
+/// the last line — the one a user reads before deciding to delete — is the one
+/// that must not.
+pub(crate) fn write_notices(
+    plan: &CleanPlan,
+    hidden_by_safe: Option<usize>,
+    intent: Intent,
+    out: &mut String,
+) {
     if !plan.excluded.is_empty() {
         let _ = writeln!(out);
-        write_excluded(&plan.excluded, &mut out);
+        write_excluded(&plan.excluded, out);
     }
 
     if let Some(hidden) = hidden_by_safe.filter(|&n| n > 0) {
@@ -115,8 +143,6 @@ pub fn render_clean(
             "\nPreview — nothing was removed. The same line with `clean` removes it."
         );
     }
-
-    out
 }
 
 /// Report what a cleanup actually did.
@@ -200,16 +226,6 @@ pub fn render_outcome(outcome: &CleanOutcome, shared_removed: bool) -> String {
     }
 
     out
-}
-
-/// "candidate is" / "candidates are" — the verb has to agree with the noun, not
-/// only the noun with the count.
-fn are(count: usize) -> &'static str {
-    if count == 1 {
-        "candidate is"
-    } else {
-        "candidates are"
-    }
 }
 
 /// One line per rule: which of them is doing this, and to how much.

@@ -13,12 +13,13 @@ mod ui;
 use args::{Args, Cleanup, Environment, Intent, Mode, Report, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOutcome, CleanPlan, DuplicateOptions, Duplicates, ScanOptions, ScanTree, SkippedEntry,
-    apply, duplicates, plan, plan_duplicates, scan,
+    CleanOutcome, CleanPlan, DuplicateOptions, Duplicates, Keep, ScanOptions, ScanTree,
+    SkippedEntry, apply, duplicates, plan, plan_duplicates, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{render_clean, render_outcome};
-use render::json::{render_json, render_outcome_json, render_plan};
+use render::dup::render_dup;
+use render::json::{render_dup_plan, render_json, render_outcome_json, render_plan};
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
 use std::io::{self, BufWriter, Write};
@@ -173,6 +174,13 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
         ..
     } = &cleanup;
     let (roots_from_rules, intent, report) = (*roots_from_rules, *intent, *report);
+    // Settled once, from the mode rather than from the plan: an empty duplicate
+    // run still has to print the duplicate report, which is the one that says
+    // why it might be empty.
+    let keeping = cleanup.duplicates.as_ref().map(|duplicating| Keeping {
+        keep: duplicating.keep,
+        now: cleanup.options.detect.now,
+    });
 
     if roots.is_empty() {
         // Not an error and not an empty plan. "Nothing to clean" would be a
@@ -251,7 +259,7 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
     let planned = CleanPlan::merge(plans);
 
     if intent == Intent::Removing {
-        return remove(&planned, &cleanup, &trees, &skipped, verbose);
+        return remove(&planned, &cleanup, &trees, &skipped, keeping, verbose);
     }
 
     // The count of what `--safe` hid comes back with the plan. It used to come
@@ -261,19 +269,71 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
     // subtracting two independently-measured numbers, which could disagree.
     let hidden = options.safe_only.then_some(planned.filtered_out);
 
+    match text(&planned, hidden, Intent::Preview, report, &trees, keeping) {
+        Ok(shown) => emit(&shown, &skipped, verbose),
+        Err(err) => json_failed(err),
+    }
+}
+
+/// What a duplicate report needs beyond the plan.
+///
+/// `Some` exactly when `--dup` was passed, so **which report is printed is
+/// settled by the mode** rather than inferred from the plan's contents. An empty
+/// duplicate run has to say "no duplicates found" and name why, which a plan
+/// with no candidates in it cannot distinguish from any other empty plan.
+#[derive(Clone, Copy)]
+struct Keeping {
+    keep: Keep,
+    /// The clock the keeper's date is shown against, taken once at the top of
+    /// the run like every other "now" here.
+    now: SystemTime,
+}
+
+/// The plan as text or as JSON, in whichever of the two shapes it is about.
+fn text(
+    planned: &CleanPlan,
+    hidden_by_safe: Option<usize>,
+    intent: Intent,
+    report: Report,
+    inside: &[ScanTree],
+    keeping: Option<Keeping>,
+) -> serde_json::Result<String> {
     if report.json {
-        // `hidden` is a sentence for a human about a flag they passed. A
-        // consumer knows what it passed, and can count the plan.
-        return match render_plan(&planned) {
-            Ok(payload) => emit(&(payload + "\n"), &skipped, verbose),
-            Err(err) => json_failed(err),
+        return match keeping {
+            Some(_) => render_dup_plan(planned).map(|payload| payload + "\n"),
+            None => render_plan(planned).map(|payload| payload + "\n"),
         };
     }
-    emit(
-        &render_clean(&planned, hidden, Intent::Preview, report, &trees),
-        &skipped,
-        verbose,
-    )
+    Ok(human(
+        planned,
+        hidden_by_safe,
+        intent,
+        report,
+        inside,
+        keeping,
+    ))
+}
+
+/// The report as a person reads it, whatever `--json` said.
+///
+/// Split out because one caller needs exactly that: the plan printed to stderr
+/// immediately before a removal is context for the operation, not the document,
+/// and emitting JSON there would put a second value on a stream that already
+/// carries one on stdout.
+fn human(
+    planned: &CleanPlan,
+    hidden_by_safe: Option<usize>,
+    intent: Intent,
+    report: Report,
+    inside: &[ScanTree],
+    keeping: Option<Keeping>,
+) -> String {
+    match keeping {
+        Some(Keeping { keep, now }) => {
+            render_dup(planned, hidden_by_safe, intent, report, keep, now)
+        }
+        None => render_clean(planned, hidden_by_safe, intent, report, inside),
+    }
 }
 
 /// The plan, in whichever shape was asked for.
@@ -282,11 +342,9 @@ fn render(
     report: Report,
     intent: Intent,
     inside: &[ScanTree],
+    keeping: Option<Keeping>,
 ) -> serde_json::Result<String> {
-    if report.json {
-        return render_plan(planned).map(|payload| payload + "\n");
-    }
-    Ok(render_clean(planned, None, intent, report, inside))
+    text(planned, None, intent, report, inside, keeping)
 }
 
 /// A path that is not UTF-8 cannot be a JSON string.
@@ -309,6 +367,7 @@ fn remove(
     cleanup: &Cleanup,
     inside: &[ScanTree],
     skipped: &[SkippedEntry],
+    keeping: Option<Keeping>,
     verbose: bool,
 ) -> ExitCode {
     let report = cleanup.report;
@@ -316,7 +375,7 @@ fn remove(
         // Nothing to remove, so this is the same "Nothing to clean." a preview
         // prints — and it goes through `render` so that `--json` gets a
         // document rather than a sentence.
-        return match render(planned, report, Intent::Preview, inside) {
+        return match render(planned, report, Intent::Preview, inside, keeping) {
             Ok(shown) => emit(&shown, skipped, verbose),
             Err(err) => json_failed(err),
         };
@@ -340,7 +399,7 @@ fn remove(
         // Nothing happened, so what there is to report is the plan — the same
         // document `preview` would have produced. A consumer tells the two
         // apart by the exit code, which is the thing it has to read anyway.
-        let code = match render(planned, report, Intent::Preview, inside) {
+        let code = match render(planned, report, Intent::Preview, inside, keeping) {
             Ok(shown) => emit(&shown, skipped, verbose),
             Err(err) => return json_failed(err),
         };
@@ -367,7 +426,7 @@ fn remove(
     // second JSON value on the way to it would make the stream unparseable.
     eprint!(
         "{}",
-        render_clean(planned, None, Intent::Removing, report, inside)
+        human(planned, None, Intent::Removing, report, inside, keeping)
     );
     if confirm > 0 {
         // Reached only with `--yes`, or with `require-confirmation` turned off.

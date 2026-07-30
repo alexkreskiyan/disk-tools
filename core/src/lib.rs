@@ -44,7 +44,7 @@ mod walk;
 #[cfg(windows)]
 mod windows_dir;
 
-pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, plan};
+pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, Kept, plan};
 #[cfg(feature = "duplicates")]
 pub use clean::{DUPLICATE_RULE, plan_duplicates};
 pub use detect::{DetectOptions, Detection, detect};

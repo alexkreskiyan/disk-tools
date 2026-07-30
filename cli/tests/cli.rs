@@ -1745,3 +1745,134 @@ fn help_lists_the_ui_verb() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ui"), "{stdout}");
 }
+
+// ---- duplicates -----------------------------------------------------------
+
+/// End to end, on real files: the whole path from `--dup` to a report that names
+/// what stays. Every unit below it is tested on hand-built values, and this is
+/// the only test that proves the hashing, the plan and the report agree.
+#[test]
+fn preview_dup_finds_identical_files_and_says_which_one_stays() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    // Written first, so the default rule keeps it; sorts last, so the *path*
+    // cannot be what decided.
+    std::fs::write(root.join("z-original.bin"), &bytes).expect("write");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(root.join("a-copy.bin"), &bytes).expect("write");
+    std::fs::write(root.join("unique.bin"), vec![b'y'; 2 * 1024 * 1024]).expect("write");
+
+    let output = spawn(
+        &["preview", "--dup", "-d", "1", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(report.contains("keep    "), "{report}");
+    assert!(report.contains("remove  "), "{report}");
+    assert!(
+        report.contains("a-copy.bin"),
+        "the copy is offered: {report}"
+    );
+    assert!(
+        !report.contains("unique.bin"),
+        "a file with no twin is not a duplicate: {report}"
+    );
+    assert!(report.contains("Preview — nothing was removed"), "{report}");
+    // And nothing was: a preview is a preview.
+    assert!(root.join("a-copy.bin").exists());
+}
+
+/// `--dup` needs a scope; the roots of the rules are not one. The message says
+/// so without blaming the config file, which has nothing to do with it.
+#[test]
+fn dup_without_a_path_explains_itself_and_exits_two() {
+    let output = run(&["preview", "--dup"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("--dup needs a PATH"), "{stderr}");
+    assert!(!stderr.contains("config:"), "{stderr}");
+}
+
+/// A duplicate is confirm-tier, always. `clean --dup` without `--yes` therefore
+/// refuses, removes nothing and exits 2 — v0.5's rule, inherited whole.
+#[test]
+fn clean_dup_refuses_without_yes_and_leaves_both_copies() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(root.join("one.bin"), &bytes).expect("write");
+    std::fs::write(root.join("two.bin"), &bytes).expect("write");
+
+    let output = spawn(
+        &["clean", "--dup", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(root.join("one.bin").exists(), "nothing was removed");
+    assert!(root.join("two.bin").exists(), "nothing was removed");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("--yes"), "{stderr}");
+}
+
+/// `--safe` admits only what needs no confirming, and no duplicate does.
+#[test]
+fn safe_and_dup_together_plan_nothing() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(root.join("one.bin"), &bytes).expect("write");
+    std::fs::write(root.join("two.bin"), &bytes).expect("write");
+
+    let output = spawn(
+        &["preview", "--dup", "--safe", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(report.contains("No duplicates found."), "{report}");
+    assert!(
+        report.contains("--safe is hiding"),
+        "and it says the flag is why: {report}"
+    );
+}
+
+/// The machine-readable half, on the same fixture.
+#[test]
+fn dup_json_is_groups_on_stdout_and_nothing_else() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(root.join("one.bin"), &bytes).expect("write");
+    std::fs::write(root.join("two.bin"), &bytes).expect("write");
+
+    let output = spawn(
+        &["preview", "--dup", "--json", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is one JSON document");
+    let groups = value["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["copies"].as_array().expect("copies").len(), 1);
+    assert!(groups[0]["keeper"]["path"].is_string());
+}

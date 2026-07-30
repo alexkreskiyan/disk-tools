@@ -624,7 +624,14 @@ impl Args {
                 // the question "what would this take" wants first; the list is
                 // one keystroke away.
                 depth: clean.depth.unwrap_or(0),
-                sort: clean.sort.unwrap_or(Sort::Name),
+                // The one place a default depends on the mode, and it earns it.
+                // A rule plan is a few dozen directories and alphabetical order
+                // is what makes it reviewable; a duplicate search returns
+                // hundreds of groups, and the only question asked of that list
+                // is which of them are worth acting on.
+                sort: clean
+                    .sort
+                    .unwrap_or(if clean.dup { Sort::Size } else { Sort::Name }),
                 json: clean.json,
             },
         })))
@@ -1074,6 +1081,25 @@ mod tests {
         )
         .expect("dup");
         assert!(found.keep_in.is_empty());
+    }
+
+    /// The only default in this file that depends on another flag, and it is
+    /// stated in `--help` for exactly that reason.
+    #[test]
+    fn the_report_order_defaults_to_size_only_under_dup() {
+        let path = rooted("x");
+        let sort_of = |args: &[&str]| match resolved(args).expect("resolve") {
+            Mode::Clean(cleanup) => cleanup.report.sort,
+            other => panic!("expected a cleanup, got {other:?}"),
+        };
+
+        assert_eq!(sort_of(&["preview", &path]), Sort::Name);
+        assert_eq!(sort_of(&["preview", &path, "--dup"]), Sort::Size);
+        assert_eq!(
+            sort_of(&["preview", &path, "--dup", "--sort", "name"]),
+            Sort::Name,
+            "the flag still wins, as everywhere"
+        );
     }
 
     // ---- precedence: flag > file > default -------------------------------

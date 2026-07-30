@@ -14,7 +14,9 @@
 //! and the other an outcome. Giving them one shape with half the fields null
 //! would make every consumer branch on emptiness to discover which it had.
 
-use disk_tools_core::{CleanOutcome, CleanPlan, ScanTree};
+use disk_tools_core::{CleanOutcome, CleanPlan, Excluded, Kept, ScanTree};
+use serde::Serialize;
+use std::path::Path;
 
 /// Serialize the whole scan (tree + skipped) as pretty JSON.
 ///
@@ -33,6 +35,80 @@ pub fn render_json(tree: &ScanTree) -> serde_json::Result<String> {
 /// without parsing it.
 pub fn render_plan(plan: &CleanPlan) -> serde_json::Result<String> {
     serde_json::to_string_pretty(plan)
+}
+
+/// The same plan, shaped as the groups a `--dup` run is about.
+///
+/// A different document from [`render_plan`], deliberately. The flat candidate
+/// list is a true description of what will be removed, but it makes a consumer
+/// rebuild the groups by keeper path to answer the first question anyone asks of
+/// duplicates — *what is kept and what goes with it*. Serialising what the human
+/// report shows keeps the two outputs saying the same thing.
+///
+/// Built from the **plan**, like the human report, so a copy the denylist
+/// refused is absent from both.
+pub fn render_dup_plan(plan: &CleanPlan) -> serde_json::Result<String> {
+    let mut groups: Vec<DupGroup<'_>> = Vec::new();
+    for candidate in &plan.candidates {
+        let Some(kept) = &candidate.duplicate_of else {
+            continue;
+        };
+        let copy = DupCopy {
+            path: &candidate.path,
+            allocated: candidate.allocated,
+            shared: candidate.shared,
+        };
+        match groups.iter_mut().find(|g| g.keeper.path == kept.path) {
+            Some(group) => {
+                group.reclaimable += candidate.allocated;
+                group.copies.push(copy);
+            }
+            None => groups.push(DupGroup {
+                keeper: kept,
+                reclaimable: candidate.allocated,
+                copies: vec![copy],
+            }),
+        }
+    }
+
+    serde_json::to_string_pretty(&DupPlan {
+        groups,
+        reclaimable: plan.reclaimable,
+        excluded: &plan.excluded,
+        filtered_out: plan.filtered_out,
+        too_small: plan.too_small,
+    })
+}
+
+/// `--json` for a duplicate plan. Word for word the fields of [`CleanPlan`] that
+/// still mean something here — `below-rule-minimum` does not, since no rule is
+/// in play.
+// No `rename_all`: `CleanPlan` serializes its fields as they are written, and a
+// consumer switching between the two documents must not have to switch spelling
+// as well.
+#[derive(Serialize)]
+struct DupPlan<'a> {
+    groups: Vec<DupGroup<'a>>,
+    reclaimable: u64,
+    excluded: &'a [Excluded],
+    filtered_out: usize,
+    too_small: usize,
+}
+
+#[derive(Serialize)]
+struct DupGroup<'a> {
+    keeper: &'a Kept,
+    /// What removing every copy in this group frees.
+    reclaimable: u64,
+    copies: Vec<DupCopy<'a>>,
+}
+
+#[derive(Serialize)]
+struct DupCopy<'a> {
+    path: &'a Path,
+    allocated: u64,
+    /// Its inode has another name, so those bytes may not come back.
+    shared: bool,
 }
 
 /// What a cleanup actually did: the two halves and every failure.
@@ -77,6 +153,101 @@ mod tests {
     }
 
     // ---- the plan and the outcome ----------------------------------------
+
+    // ---- the duplicate plan ----------------------------------------------
+
+    fn kept(path: &str) -> disk_tools_core::Kept {
+        disk_tools_core::Kept {
+            path: PathBuf::from(path),
+            date: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            fell_back: false,
+        }
+    }
+
+    fn duplicate(path: &str, allocated: u64, keeper: &disk_tools_core::Kept) -> Candidate {
+        Candidate {
+            path: PathBuf::from(path),
+            rule: "duplicate".into(),
+            tier: Tier::Confirm,
+            purge: false,
+            duplicate_of: Some(keeper.clone()),
+            allocated,
+            shared: false,
+        }
+    }
+
+    fn dup_plan() -> CleanPlan {
+        let keeper = kept("/p/keeper.bin");
+        let candidates = vec![
+            duplicate("/p/a.bin", 4096, &keeper),
+            duplicate("/p/b.bin", 4096, &keeper),
+        ];
+        CleanPlan {
+            reclaimable: 8192,
+            candidates,
+            ..CleanPlan::default()
+        }
+    }
+
+    fn parsed(payload: String) -> serde_json::Value {
+        serde_json::from_str(&payload).expect("parse")
+    }
+
+    /// The flat list is a true description of the removal; the groups are the
+    /// question anyone actually asks of duplicates. A consumer should not have
+    /// to rebuild them by keeper path.
+    #[test]
+    fn the_duplicate_document_is_groups() {
+        let value = parsed(render_dup_plan(&dup_plan()).expect("serialize"));
+
+        let groups = value["groups"].as_array().expect("groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["keeper"]["path"], "/p/keeper.bin");
+        assert_eq!(groups[0]["reclaimable"], 8192);
+        assert_eq!(groups[0]["copies"].as_array().expect("copies").len(), 2);
+        assert_eq!(groups[0]["copies"][0]["allocated"], 4096);
+        assert_eq!(value["reclaimable"], 8192);
+    }
+
+    /// Whatever the report shows, the document says — including the one thing a
+    /// reader has to know to judge the choice.
+    #[test]
+    fn the_keeper_carries_its_date_and_whether_the_rule_held() {
+        let value = parsed(render_dup_plan(&dup_plan()).expect("serialize"));
+
+        assert_eq!(value["groups"][0]["keeper"]["date"], 1_700_000_000);
+        assert_eq!(value["groups"][0]["keeper"]["fell_back"], false);
+    }
+
+    /// `below_rule_minimum` is absent because no rule is in play; the other two
+    /// narrowings are, and spelled as `CleanPlan` spells them.
+    #[test]
+    fn the_narrowings_keep_the_spelling_the_other_document_uses() {
+        let mut plan = dup_plan();
+        plan.filtered_out = 2;
+        plan.too_small = 3;
+
+        let value = parsed(render_dup_plan(&plan).expect("serialize"));
+
+        assert_eq!(value["filtered_out"], 2);
+        assert_eq!(value["too_small"], 3);
+        assert!(value.get("below_rule_minimum").is_none());
+    }
+
+    /// `-d` and `--sort` lay a report out for a person. A machine-readable
+    /// document quietly shortened by one of them says nothing about having been.
+    #[test]
+    fn the_duplicate_document_is_whole_whatever_the_display_flags_said() {
+        let value = parsed(render_dup_plan(&dup_plan()).expect("serialize"));
+        assert_eq!(
+            value["groups"][0]["copies"]
+                .as_array()
+                .expect("copies")
+                .len(),
+            2,
+            "both copies, at any --depth"
+        );
+    }
 
     fn a_plan() -> CleanPlan {
         CleanPlan {

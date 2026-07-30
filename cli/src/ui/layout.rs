@@ -16,6 +16,7 @@
 
 use super::listing::Entry;
 use super::sort::Order;
+use crate::render::age;
 use crate::render::tree::{fit, format_size};
 use std::time::SystemTime;
 use unicode_width::UnicodeWidthStr;
@@ -245,33 +246,6 @@ fn spinner(now: SystemTime) -> char {
         .map(|since| since.as_millis())
         .unwrap_or(0);
     FRAMES[(millis / 100) as usize % FRAMES.len()]
-}
-
-/// How long ago, in one unit and at most four columns.
-///
-/// A timestamp in the future is a clock that disagrees with the filesystem's,
-/// not a fact about the file — "now" is the honest reading of it, and a negative
-/// age would be worse.
-fn age(now: SystemTime, then: Option<SystemTime>) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
-
-    let Some(then) = then else {
-        return String::new();
-    };
-    let Ok(elapsed) = now.duration_since(then) else {
-        return "now".to_owned();
-    };
-
-    match elapsed.as_secs() {
-        secs if secs < MINUTE => "now".to_owned(),
-        secs if secs < HOUR => format!("{}m", secs / MINUTE),
-        secs if secs < DAY => format!("{}h", secs / HOUR),
-        secs if secs < 30 * DAY => format!("{}d", secs / DAY),
-        secs if secs < 365 * DAY => format!("{}mo", secs / (30 * DAY)),
-        secs => format!("{}y", secs / (365 * DAY)),
-    }
 }
 
 #[cfg(test)]
