@@ -509,6 +509,7 @@ mod tests {
             rule: "node-modules".into(),
             tier: Tier::Trash,
             purge: false,
+            duplicate_of: None,
             allocated: 4096,
             shared,
         }

@@ -73,6 +73,18 @@ pub struct Candidate {
     /// [`Self::shared`] asks.
     pub allocated: u64,
 
+    /// The copy kept instead of this one, when this candidate is a duplicate.
+    ///
+    /// `None` for everything a rule claimed — the two sources of a candidate,
+    /// told apart by the one fact that only one of them has.
+    ///
+    /// Carried on the candidate rather than in a table beside the plan so that
+    /// [`CleanPlan::merge`] stays a concatenation: group indices would have to
+    /// be renumbered per plan, and the second root is where that goes wrong.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub duplicate_of: Option<PathBuf>,
+
     /// This holds content reachable from outside it, so `allocated` is an upper
     /// bound rather than a promise.
     ///
@@ -334,6 +346,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
             // that the plan says what will happen and `apply` needs no second
             // input to work it out.
             purge: tier == Tier::Purge || options.purge_all,
+            duplicate_of: None,
             allocated: detection.allocated,
             shared,
         });
@@ -355,6 +368,109 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
         filtered_out,
         too_small,
         below_rule_minimum,
+    }
+}
+
+/// The name every duplicate candidate carries where a rule-claimed one carries
+/// the rule that claimed it.
+///
+/// Reserved in the config file, so a report naming it can only ever mean this.
+pub const DUPLICATE_RULE: &str = "duplicate";
+
+/// Decide which redundant copies may go, and what that would free.
+///
+/// The counterpart to [`plan`] for the other source of candidates, producing the
+/// **same** [`CleanPlan`] — so `preview` and `clean` keep speaking about one
+/// thing and `apply` needs no idea that duplicates exist.
+///
+/// What it keeps from [`plan`], because these are properties of removing
+/// anything at all rather than of rules:
+///
+/// - the **denylist**, unconditional and reported;
+/// - `--safe`, `--purge` and `--min-size`, counted the same way;
+/// - `shared`, so a copy whose inode has another name is not sold as free bytes.
+///
+/// What it drops: the git guard, which asks whether build output would rebuild
+/// identically from committed source — a question that says nothing about a
+/// photograph. `below_rule_minimum` stays 0 for the same reason: there is no
+/// rule here to have a minimum.
+///
+/// **Writes nothing**, like everything else in this module. The tree is needed
+/// only to answer the `shared` question, which is about inodes rather than
+/// content.
+#[cfg(feature = "duplicates")]
+pub fn plan_duplicates(
+    tree: &ScanTree,
+    found: &crate::duplicates::Duplicates,
+    options: &CleanOptions,
+) -> CleanPlan {
+    let denied = denylist(&options.user_dirs);
+    let groups = link_groups_by_path(tree);
+    let nodes = nodes_by_path(tree);
+
+    let mut candidates = Vec::new();
+    let mut excluded = Vec::new();
+    let mut filtered_out = 0;
+    let mut too_small = 0;
+
+    for group in &found.groups {
+        for copy in &group.copies {
+            if is_denied(&copy.path, &denied) {
+                excluded.push(Excluded {
+                    path: copy.path.clone(),
+                    reason: ExcludeReason::Denylisted,
+                });
+                continue;
+            }
+
+            if copy.allocated < options.min_size {
+                too_small += 1;
+                continue;
+            }
+
+            // Every duplicate is confirm-tier: the concept's own rule, that a
+            // duplicate is never removed without being looked at. So `--safe`,
+            // which means "drop what needs confirming", drops all of them —
+            // and it is asked here, before `--purge`, exactly as in `plan`.
+            if options.safe_only {
+                filtered_out += 1;
+                continue;
+            }
+
+            let shared = nodes
+                .get(copy.path.as_path())
+                .is_some_and(|node| holds_shared_content(node, &copy.path, &groups));
+
+            candidates.push(Candidate {
+                path: copy.path.clone(),
+                rule: DUPLICATE_RULE.to_string(),
+                tier: Tier::Confirm,
+                // `--purge` decides the destination and nothing else; the tier
+                // above stays what it is, so the confirmation it demands cannot
+                // be cancelled by a flag about where files go.
+                purge: options.purge_all,
+                duplicate_of: Some(group.keeper.clone()),
+                allocated: copy.allocated,
+                shared,
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+    excluded.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+
+    // Each candidate is one file and no file is in two groups, so nothing here
+    // nests and no byte is summed twice — the property `plan` gets from `detect`
+    // never descending into a match.
+    let reclaimable = candidates.iter().map(|c| c.allocated).sum();
+
+    CleanPlan {
+        candidates,
+        reclaimable,
+        excluded,
+        filtered_out,
+        too_small,
+        below_rule_minimum: 0,
     }
 }
 
@@ -1878,5 +1994,243 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    // ---- duplicates ------------------------------------------------------
+    //
+    // Hand-built `Duplicates` values: the pass that produces them is tested in
+    // its own module, and what belongs here is only what the plan adds to it.
+
+    #[cfg(feature = "duplicates")]
+    mod duplicates {
+        use super::*;
+        use crate::duplicates::{DuplicateGroup, Duplicates};
+
+        fn copy(path: &str, allocated: u64) -> crate::duplicates::Copy {
+            crate::duplicates::Copy {
+                path: PathBuf::from(path),
+                allocated,
+            }
+        }
+
+        fn group(keeper: &str, copies: Vec<crate::duplicates::Copy>) -> DuplicateGroup {
+            DuplicateGroup {
+                apparent: 4096,
+                keeper: PathBuf::from(keeper),
+                keeper_fell_back: false,
+                reclaimable: copies.iter().map(|c| c.allocated).sum(),
+                copies,
+            }
+        }
+
+        fn found(groups: Vec<DuplicateGroup>) -> Duplicates {
+            Duplicates {
+                groups,
+                ..Duplicates::default()
+            }
+        }
+
+        /// A tree holding every path named, so the `shared` lookup has nodes to
+        /// find — which is all the plan needs a tree for.
+        fn tree_of(paths: &[&str]) -> ScanTree {
+            tree(dir("/p", paths.iter().map(|p| file(p, 4096)).collect()))
+        }
+
+        #[test]
+        fn every_copy_but_the_keeper_becomes_a_candidate() {
+            let tree = tree_of(&["/p/a.bin", "/p/b.bin", "/p/c.bin"]);
+            let found = found(vec![group(
+                "/p/a.bin",
+                vec![copy("/p/b.bin", 4096), copy("/p/c.bin", 4096)],
+            )]);
+
+            let plan = plan_duplicates(&tree, &found, &opts());
+
+            assert_eq!(plan.candidates.len(), 2);
+            assert!(
+                plan.candidates
+                    .iter()
+                    .all(|c| c.path != Path::new("/p/a.bin")),
+                "the keeper is never in the plan"
+            );
+            assert_eq!(plan.reclaimable, 8192);
+            for candidate in &plan.candidates {
+                assert_eq!(
+                    candidate.tier,
+                    Tier::Confirm,
+                    "a duplicate is always looked at"
+                );
+                assert_eq!(candidate.duplicate_of, Some(PathBuf::from("/p/a.bin")));
+                assert_eq!(candidate.rule, DUPLICATE_RULE);
+                assert!(!candidate.purge, "the trash, unless asked otherwise");
+            }
+        }
+
+        #[test]
+        fn a_denylisted_copy_is_refused_and_reported() {
+            let denied = "/home/me/Library/Application Support/thing.bin";
+            let tree = tree_of(&["/p/a.bin", denied]);
+            let found = found(vec![group("/p/a.bin", vec![copy(denied, 4096)])]);
+
+            let plan = plan_duplicates(&tree, &found, &with_home("/home/me"));
+
+            assert!(plan.candidates.is_empty(), "{:?}", plan.candidates);
+            assert_eq!(
+                plan.excluded,
+                vec![Excluded {
+                    path: PathBuf::from(denied),
+                    reason: ExcludeReason::Denylisted,
+                }]
+            );
+            assert_eq!(plan.reclaimable, 0, "a refusal frees nothing");
+        }
+
+        /// `--purge` moves the destination and nothing else. Rewriting the tier
+        /// would let a flag about where files go cancel the confirmation that
+        /// keeps a duplicate from being removed unseen.
+        #[test]
+        fn purge_changes_the_destination_not_the_tier() {
+            let tree = tree_of(&["/p/a.bin", "/p/b.bin"]);
+            let found = found(vec![group("/p/a.bin", vec![copy("/p/b.bin", 4096)])]);
+            let options = CleanOptions {
+                purge_all: true,
+                ..opts()
+            };
+
+            let plan = plan_duplicates(&tree, &found, &options);
+
+            assert!(plan.candidates[0].purge);
+            assert_eq!(plan.candidates[0].tier, Tier::Confirm);
+        }
+
+        /// `--safe` admits only what needs no confirming, and no duplicate does.
+        #[test]
+        fn safe_plans_no_duplicates_at_all() {
+            let tree = tree_of(&["/p/a.bin", "/p/b.bin", "/p/c.bin"]);
+            let found = found(vec![group(
+                "/p/a.bin",
+                vec![copy("/p/b.bin", 4096), copy("/p/c.bin", 4096)],
+            )]);
+            let options = CleanOptions {
+                safe_only: true,
+                ..opts()
+            };
+
+            let plan = plan_duplicates(&tree, &found, &options);
+
+            assert!(plan.candidates.is_empty());
+            assert_eq!(plan.filtered_out, 2, "counted, so the report can say so");
+            assert_eq!(plan.reclaimable, 0);
+        }
+
+        #[test]
+        fn min_size_is_counted_apart_from_everything_else() {
+            let tree = tree_of(&["/p/a.bin", "/p/b.bin"]);
+            let found = found(vec![group("/p/a.bin", vec![copy("/p/b.bin", 4096)])]);
+            let options = CleanOptions {
+                min_size: 8192,
+                ..opts()
+            };
+
+            let plan = plan_duplicates(&tree, &found, &options);
+
+            assert!(plan.candidates.is_empty());
+            assert_eq!(plan.too_small, 1);
+            assert_eq!(
+                plan.below_rule_minimum, 0,
+                "there is no rule here to have a minimum of its own"
+            );
+        }
+
+        /// Removing a name of a hardlinked inode frees nothing while another
+        /// name survives — so its bytes are an upper bound, and the plan says so.
+        #[test]
+        fn a_copy_whose_inode_has_another_name_is_shared() {
+            let mut tree = tree_of(&["/p/a.bin", "/p/b.bin", "/p/elsewhere.bin"]);
+            tree.link_groups = vec![vec![
+                PathBuf::from("/p/b.bin"),
+                PathBuf::from("/p/elsewhere.bin"),
+            ]];
+            let found = found(vec![group("/p/a.bin", vec![copy("/p/b.bin", 4096)])]);
+
+            let plan = plan_duplicates(&tree, &found, &opts());
+
+            assert!(plan.candidates[0].shared);
+        }
+
+        #[test]
+        fn an_ordinary_copy_is_not_shared() {
+            let tree = tree_of(&["/p/a.bin", "/p/b.bin"]);
+            let found = found(vec![group("/p/a.bin", vec![copy("/p/b.bin", 4096)])]);
+
+            assert!(!plan_duplicates(&tree, &found, &opts()).candidates[0].shared);
+        }
+
+        /// Merging is what a multi-root run does, and the keeper has to survive
+        /// it — the reason it rides on the candidate rather than in a table.
+        #[test]
+        fn merging_keeps_each_candidate_pointing_at_its_keeper() {
+            let one = plan_duplicates(
+                &tree_of(&["/p/a.bin", "/p/b.bin"]),
+                &found(vec![group("/p/a.bin", vec![copy("/p/b.bin", 4096)])]),
+                &opts(),
+            );
+            let two = plan_duplicates(
+                &tree_of(&["/q/x.bin", "/q/y.bin"]),
+                &found(vec![group("/q/x.bin", vec![copy("/q/y.bin", 2048)])]),
+                &opts(),
+            );
+
+            let merged = CleanPlan::merge(vec![one, two]);
+
+            assert_eq!(merged.reclaimable, 6144);
+            assert_eq!(
+                merged
+                    .candidates
+                    .iter()
+                    .map(|c| c.duplicate_of.clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    Some(PathBuf::from("/p/a.bin")),
+                    Some(PathBuf::from("/q/x.bin")),
+                ]
+            );
+        }
+
+        /// The plan reads a tree and a set of groups and touches nothing — the
+        /// same promise `plan` makes, and the one that lets every rule above be
+        /// tested without a filesystem.
+        #[test]
+        fn plan_duplicates_writes_nothing() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            let keeper = root.join("a.bin");
+            let copy_path = root.join("b.bin");
+            std::fs::write(&keeper, b"x").expect("write");
+            std::fs::write(&copy_path, b"x").expect("write");
+
+            let tree = crate::scan(&crate::ScanOptions {
+                root: root.to_path_buf(),
+                ..crate::ScanOptions::default()
+            });
+            let found = found(vec![DuplicateGroup {
+                apparent: 1,
+                keeper: keeper.clone(),
+                keeper_fell_back: false,
+                reclaimable: 1,
+                copies: vec![crate::duplicates::Copy {
+                    path: copy_path.clone(),
+                    allocated: 1,
+                }],
+            }]);
+
+            let plan = plan_duplicates(&tree, &found, &opts());
+
+            assert_eq!(plan.candidates.len(), 1);
+            assert!(
+                keeper.exists() && copy_path.exists(),
+                "both files still there"
+            );
+        }
     }
 }

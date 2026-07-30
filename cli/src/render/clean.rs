@@ -514,6 +514,7 @@ mod tests {
             rule: rule.into(),
             tier,
             purge: tier == Tier::Purge,
+            duplicate_of: None,
             allocated,
             shared: false,
         }
@@ -1173,6 +1174,7 @@ mod intent_tests {
                 rule: "node-modules".into(),
                 tier: Tier::Trash,
                 purge: false,
+                duplicate_of: None,
                 allocated: 2048,
                 shared: false,
             }],
@@ -1293,6 +1295,7 @@ mod min_size_tests {
                 rule: "node-modules".into(),
                 tier: Tier::Trash,
                 purge: false,
+                duplicate_of: None,
                 allocated: 2_000_000,
                 shared: false,
             }],
