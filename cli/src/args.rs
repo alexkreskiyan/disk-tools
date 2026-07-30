@@ -261,6 +261,48 @@ pub struct Report {
     pub json: bool,
 }
 
+/// Everything `preview` and `clean` resolved to.
+///
+/// One value rather than six parameters threaded through two functions. These
+/// are the fields of a single decision — where to look, what to claim there,
+/// what to do with it and how to show it — and a call site that lists them
+/// separately is a call site that can pass two booleans the wrong way round.
+#[derive(Debug)]
+pub struct Cleanup {
+    /// What to walk: the path if one was given, otherwise the roots of the
+    /// enabled rules, already merged so none contains another.
+    ///
+    /// **Empty means there is nothing to examine** — every rule unrooted,
+    /// disabled, or dropped. The caller says so; an empty plan would read as
+    /// "nothing to clean", which is a different statement.
+    pub roots: Vec<PathBuf>,
+
+    /// Whether those roots came from the rules rather than the command line.
+    ///
+    /// Only then are they worth announcing: a user who named a path knows where
+    /// they pointed, and one who did not is entitled to be told before a walk of
+    /// their whole home directory begins.
+    pub roots_from_rules: bool,
+
+    /// How the plan is **chosen** — the rules, the clock, and the flags that
+    /// narrow it.
+    pub options: CleanOptions,
+
+    /// Which verb this was. The only thing that differs between them.
+    pub intent: Intent,
+
+    /// May the removal take candidates that need confirming?
+    ///
+    /// `--yes`, or a config that turned `require-confirmation` off. Resolved to
+    /// one boolean because the decision is made once — leaving both inputs to be
+    /// re-combined at the point of deletion is how they come to disagree.
+    pub confirm_tier_allowed: bool,
+
+    /// How the plan is **shown**. Never how it is chosen: nothing in here can
+    /// keep a candidate out of the removal, only out of the printout.
+    pub report: Report,
+}
+
 /// What the parsed arguments actually asked for.
 #[derive(Debug)]
 pub enum Mode {
@@ -270,41 +312,10 @@ pub enum Mode {
         number: Option<usize>,
         json: bool,
     },
-    Clean {
-        /// What to walk: the path if one was given, otherwise the roots of the
-        /// enabled rules, already merged so none contains another.
-        ///
-        /// **Empty means there is nothing to examine** — every rule unrooted,
-        /// disabled, or dropped. The caller says so; an empty plan would read as
-        /// "nothing to clean", which is a different statement.
-        roots: Vec<PathBuf>,
-
-        /// May the removal take candidates that are not regenerable?
-        ///
-        /// `--yes`, or a config that turned `require-confirmation` off. Resolved
-        /// to one boolean because the decision is made once — leaving both
-        /// inputs to be re-combined at the point of deletion is how they come to
-        /// disagree.
-        confirm_tier_allowed: bool,
-
-        /// Whether those roots came from the rules rather than the command line.
-        ///
-        /// Only then are they worth announcing: a user who named a path knows
-        /// where they pointed, and one who did not is entitled to be told before
-        /// a walk of their whole home directory begins.
-        roots_from_rules: bool,
-        /// Boxed: the compiled rule set carries two glob automata, and without
-        /// the indirection every `Mode::Scan` — which needs none of it — would
-        /// pay for the space anyway.
-        clean: Box<CleanOptions>,
-
-        /// Which verb this was. The only thing that differs between them.
-        intent: Intent,
-
-        /// How to show the plan. Never how to choose it: nothing in here can
-        /// keep a candidate out of the removal, only out of the printout.
-        report: Report,
-    },
+    /// Boxed: the compiled rule set inside carries two glob automata, and
+    /// without the indirection every `Mode::Scan` — which needs none of it —
+    /// would pay for the space anyway.
+    Clean(Box<Cleanup>),
     /// Write the default configuration to `target`.
     ConfigInit { target: PathBuf, force: bool },
 
@@ -456,22 +467,22 @@ impl Args {
             None => rules.scan_roots(),
         };
 
-        Ok(Mode::Clean {
+        Ok(Mode::Clean(Box::new(Cleanup {
             roots,
-            // **True** when nothing says otherwise. The concept asks for
-            // confirmation on this tier, and the asymmetry the denylist already
-            // states applies: refusing too readily costs a user one extra flag,
-            // refusing too rarely costs them data.
-            confirm_tier_allowed: clean.yes || !clean_settings.require_confirmation.unwrap_or(true),
             roots_from_rules,
-            clean: Box::new(CleanOptions {
+            options: CleanOptions {
                 detect: DetectOptions { rules, now },
                 user_dirs,
                 safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
                 purge_all: clean.purge,
                 min_size: clean.min_size.unwrap_or(0),
-            }),
+            },
             intent,
+            // **True** when nothing says otherwise. The concept asks for
+            // confirmation on this tier, and the asymmetry the denylist already
+            // states applies: refusing too readily costs a user one extra flag,
+            // refusing too rarely costs them data.
+            confirm_tier_allowed: clean.yes || !clean_settings.require_confirmation.unwrap_or(true),
             report: Report {
                 // Grouped by rule unless asked for more. The overview is what
                 // the question "what would this take" wants first; the list is
@@ -480,7 +491,7 @@ impl Args {
                 sort: clean.sort.unwrap_or(Sort::Name),
                 json: clean.json,
             },
-        })
+        })))
     }
 }
 
@@ -807,7 +818,7 @@ mod tests {
     #[test]
     fn the_file_can_only_make_a_cleanup_more_cautious() {
         let clean = |toml: &str, args: &[&str]| match against(toml, args) {
-            Mode::Clean { clean, .. } => *clean,
+            Mode::Clean(cleanup) => cleanup.options,
             other => panic!("expected a clean, got {other:?}"),
         };
 
@@ -846,7 +857,7 @@ mod tests {
     /// What a `clean` invocation will walk.
     fn clean_roots(args: &[&str]) -> Vec<PathBuf> {
         match resolved(args).expect("resolve") {
-            Mode::Clean { roots, .. } => roots,
+            Mode::Clean(cleanup) => cleanup.roots,
             other => panic!("expected a clean, got {other:?}"),
         }
     }
@@ -1070,7 +1081,7 @@ mod tests {
 
     fn clean_options(args: &[&str]) -> CleanOptions {
         match resolved(args).expect("resolve") {
-            Mode::Clean { clean, .. } => *clean,
+            Mode::Clean(cleanup) => cleanup.options,
             other => panic!("expected the clean subcommand, got {other:?}"),
         }
     }
@@ -1078,7 +1089,7 @@ mod tests {
     /// What the verb resolved to, and how far it may go.
     fn intent_of(args: &[&str]) -> Intent {
         match resolved(args).expect("resolve") {
-            Mode::Clean { intent, .. } => intent,
+            Mode::Clean(cleanup) => cleanup.intent,
             other => panic!("expected a cleanup, got {other:?}"),
         }
     }
@@ -1088,13 +1099,13 @@ mod tests {
         for verb in ["preview", "clean"] {
             let mode = resolved(&[verb, "/x", "--safe", "--older-than", "90d"]).expect("parse");
 
-            let Mode::Clean { roots, clean, .. } = mode else {
+            let Mode::Clean(cleanup) = mode else {
                 panic!("{verb} must resolve to a cleanup");
             };
-            assert_eq!(roots, vec![PathBuf::from("/x")]);
-            assert!(clean.safe_only);
+            assert_eq!(cleanup.roots, vec![PathBuf::from("/x")]);
+            assert!(cleanup.options.safe_only);
             assert_eq!(
-                older_than_of(&clean),
+                older_than_of(&cleanup.options),
                 Some(Duration::from_secs(90 * 24 * 60 * 60))
             );
         }
@@ -1109,22 +1120,15 @@ mod tests {
             let mut args = vec![verb];
             args.extend_from_slice(&flags);
             match resolved(&args).expect("resolve") {
-                Mode::Clean {
-                    roots,
-                    confirm_tier_allowed,
-                    roots_from_rules,
-                    clean,
-                    intent,
-                    report: _,
-                } => (
-                    intent,
+                Mode::Clean(cleanup) => (
+                    cleanup.intent,
                     (
-                        roots,
-                        confirm_tier_allowed,
-                        roots_from_rules,
-                        clean.purge_all,
-                        clean.safe_only,
-                        clean.min_size,
+                        cleanup.roots,
+                        cleanup.confirm_tier_allowed,
+                        cleanup.roots_from_rules,
+                        cleanup.options.purge_all,
+                        cleanup.options.safe_only,
+                        cleanup.options.min_size,
                     ),
                 ),
                 other => panic!("expected a cleanup, got {other:?}"),
@@ -1181,11 +1185,11 @@ mod tests {
             })
             .expect("resolve");
 
-        let Mode::Clean { clean, .. } = mode else {
+        let Mode::Clean(cleanup) = mode else {
             panic!("expected the clean subcommand");
         };
-        assert_eq!(clean.user_dirs, dirs);
-        assert_eq!(clean.detect.now, now);
+        assert_eq!(cleanup.options.user_dirs, dirs);
+        assert_eq!(cleanup.options.detect.now, now);
     }
 
     /// The bare form must be untouched by the subcommand's arrival — this is the
@@ -1212,14 +1216,10 @@ mod tests {
     fn yes_needs_no_companion_flag() {
         for verb in ["preview", "clean"] {
             let mode = resolved(&[verb, "/x", "--yes"]).expect("resolve");
-            let Mode::Clean {
-                confirm_tier_allowed,
-                ..
-            } = mode
-            else {
+            let Mode::Clean(cleanup) = mode else {
                 panic!("expected a cleanup");
             };
-            assert!(confirm_tier_allowed, "{verb}");
+            assert!(cleanup.confirm_tier_allowed, "{verb}");
         }
     }
 
@@ -1336,19 +1336,14 @@ mod tests {
             .resolve(env(config))
             .expect("resolve");
 
-        let Mode::Clean {
-            roots,
-            roots_from_rules,
-            ..
-        } = mode
-        else {
+        let Mode::Clean(cleanup) = mode else {
             panic!("expected a clean");
         };
         assert_eq!(
-            roots,
+            cleanup.roots,
             vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
         );
-        assert!(roots_from_rules, "so the caller can announce them");
+        assert!(cleanup.roots_from_rules, "so the caller can announce them");
     }
 
     /// A path narrows the walk to itself. The rules still apply within it — one
@@ -1363,17 +1358,12 @@ mod tests {
             .resolve(env(config))
             .expect("resolve");
 
-        let Mode::Clean {
-            roots,
-            roots_from_rules,
-            ..
-        } = mode
-        else {
+        let Mode::Clean(cleanup) = mode else {
             panic!("expected a clean");
         };
-        assert_eq!(roots, vec![PathBuf::from("/elsewhere")]);
+        assert_eq!(cleanup.roots, vec![PathBuf::from("/elsewhere")]);
         assert!(
-            !roots_from_rules,
+            !cleanup.roots_from_rules,
             "a user who named a path knows where they pointed"
         );
     }

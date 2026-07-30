@@ -10,10 +10,10 @@ mod env;
 mod render;
 mod ui;
 
-use args::{Args, Environment, Intent, Mode, Report, validate_root};
+use args::{Args, Cleanup, Environment, Intent, Mode, Report, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOptions, CleanOutcome, CleanPlan, ScanOptions, ScanTree, SkippedEntry, apply, plan, scan,
+    CleanOutcome, CleanPlan, ScanOptions, ScanTree, SkippedEntry, apply, plan, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{render_clean, render_outcome};
@@ -21,7 +21,6 @@ use render::json::{render_json, render_outcome_json, render_plan};
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
@@ -76,22 +75,7 @@ fn main() -> ExitCode {
             number,
             json,
         } => run_scan(options, number, json, verbose),
-        Mode::Clean {
-            roots,
-            confirm_tier_allowed,
-            roots_from_rules,
-            clean,
-            intent,
-            report,
-        } => run_clean(
-            &roots,
-            roots_from_rules,
-            *clean,
-            intent,
-            confirm_tier_allowed,
-            report,
-            verbose,
-        ),
+        Mode::Clean(cleanup) => run_clean(*cleanup, verbose),
         Mode::ConfigInit { target, force } => run_config_init(&target, force),
         Mode::Ui {
             root,
@@ -173,15 +157,19 @@ fn run_scan(options: ScanOptions, number: Option<usize>, json: bool, verbose: bo
     emit(&report, &tree.skipped, verbose)
 }
 
-fn run_clean(
-    roots: &[PathBuf],
-    roots_from_rules: bool,
-    clean: CleanOptions,
-    intent: Intent,
-    confirm_tier_allowed: bool,
-    report: Report,
-    verbose: bool,
-) -> ExitCode {
+fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
+    // Borrowed apart for readability, not to change anything: `cleanup` itself
+    // travels on to `remove`, which needs the two fields not named here.
+    let Cleanup {
+        roots,
+        roots_from_rules,
+        options,
+        intent,
+        report,
+        ..
+    } = &cleanup;
+    let (roots_from_rules, intent, report) = (*roots_from_rules, *intent, *report);
+
     if roots.is_empty() {
         // Not an error and not an empty plan. "Nothing to clean" would be a
         // claim about the disk; this is a statement about the configuration, and
@@ -228,7 +216,9 @@ fn run_clean(
     let unfolding = report.depth >= 2;
     let mut trees = Vec::new();
     for root in roots {
-        let options = ScanOptions {
+        // Named apart from the cleanup's own `options`, which is the
+        // `CleanOptions` this walk is about to be planned against.
+        let walk = ScanOptions {
             root: root.clone(),
             ..ScanOptions::default()
         };
@@ -236,8 +226,8 @@ fn run_clean(
         // this function is reached; a root that came from a rule is a
         // description that may have gone stale, and one missing directory is no
         // reason to leave the others uncleaned. `scan` reports it as a skip.
-        let mut tree = scan_with_spinner(&options, "Scanning…");
-        plans.push(plan(&tree, &clean));
+        let mut tree = scan_with_spinner(&walk, "Scanning…");
+        plans.push(plan(&tree, options));
         skipped.extend(std::mem::take(&mut tree.skipped));
         if unfolding {
             trees.push(tree);
@@ -247,14 +237,7 @@ fn run_clean(
     let planned = CleanPlan::merge(plans);
 
     if intent == Intent::Removing {
-        return remove(
-            &planned,
-            confirm_tier_allowed,
-            report,
-            &trees,
-            &skipped,
-            verbose,
-        );
+        return remove(&planned, &cleanup, &trees, &skipped, verbose);
     }
 
     // The count of what `--safe` hid comes back with the plan. It used to come
@@ -262,7 +245,7 @@ fn run_clean(
     // of the git guard — measured at ~23 ms per repository, so `--safe` was the
     // slowest mode of the three despite being the cautious one. It also meant
     // subtracting two independently-measured numbers, which could disagree.
-    let hidden = clean.safe_only.then_some(planned.filtered_out);
+    let hidden = options.safe_only.then_some(planned.filtered_out);
 
     if report.json {
         // `hidden` is a sentence for a human about a flag they passed. A
@@ -309,12 +292,12 @@ fn json_failed(err: serde_json::Error) -> ExitCode {
 /// a dry run would have given them.
 fn remove(
     planned: &CleanPlan,
-    confirm_tier_allowed: bool,
-    report: Report,
+    cleanup: &Cleanup,
     inside: &[ScanTree],
     skipped: &[SkippedEntry],
     verbose: bool,
 ) -> ExitCode {
+    let report = cleanup.report;
     if planned.candidates.is_empty() {
         // Nothing to remove, so this is the same "Nothing to clean." a preview
         // prints — and it goes through `render` so that `--json` gets a
@@ -339,7 +322,7 @@ fn remove(
     //
     // `--safe` needs no case of its own: it keeps confirm-tier candidates out of
     // the plan, so the count is zero and there is nothing to refuse.
-    if confirm > 0 && !confirm_tier_allowed {
+    if confirm > 0 && !cleanup.confirm_tier_allowed {
         // Nothing happened, so what there is to report is the plan — the same
         // document `preview` would have produced. A consumer tells the two
         // apart by the exit code, which is the thing it has to read anyway.
@@ -518,6 +501,7 @@ fn terminal_width() -> usize {
 mod tests {
     use super::*;
     use disk_tools_core::{Candidate, Reclaimed, Tier, TrashFailure};
+    use std::path::PathBuf;
 
     fn candidate(path: &str, shared: bool) -> Candidate {
         Candidate {
