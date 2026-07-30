@@ -667,6 +667,11 @@ still produces a plan, and still says that it is not the plan you asked for.
 - **Symlinks, empty files**, and anything that changed size between the scan and
   the hash.
 
+`--older-than` is refused here rather than accepted. It works by adding a rule,
+and rules only prune under `--dup` — so it would have meant *exclude everything
+older than this from the search*, which is the opposite of what it says
+everywhere else.
+
 ### How it decides two files are identical
 
 Files are bucketed by size — a unique size is proof of unique content, and it
@@ -833,7 +838,7 @@ optional**; without it the roots of your configured rules are walked, see
 | `--keep-in <PATH>` | Prefer to keep copies under this path; repeatable, earlier wins, beats `--keep`. Requires `--dup` | the plan |
 | `--safe` | Drop everything that needs confirming. Keeps `purge` and `trash` — it is about confirmation, not about destinations | the plan |
 | `--min-size <SIZE>` | Ignore anything smaller. **Narrows the plan, not just the printout** — unlike `scan`'s flag of the same name, what is shown is what `clean` removes. Defaults to 0, or to **1 MiB under `--dup`**, where it decides how much is read | the plan |
-| `--older-than <DURATION>` | Also offer anything untouched for this long: `90d`, `2w`, `6m`, `1y`. A bare number is rejected — `90` could mean seconds as easily as days. `m` is 30 days, `y` is 365 | the plan |
+| `--older-than <DURATION>` | Also offer anything untouched for this long: `90d`, `2w`, `6m`, `1y`. A bare number is rejected — `90` could mean seconds as easily as days. `m` is 30 days, `y` is 365. **Refused with `--dup`**, where it would mean the opposite: it works by adding a rule, and under `--dup` the rules only prune | the plan |
 | `--purge` | Send the **whole plan** past the trash. Nothing can be put back. Per rule this is `tier = "purge"`; neither cancels the confirmation | the plan |
 | `--yes` | Also remove what needs confirming. Without it `clean` refuses while any `confirm`-tier candidate remains, and exits 2 | the plan |
 | `-d`, `--depth <N>` | `0` groups by rule (default), `1` lists candidates, `2`+ unfolds inside them. Under `--dup`: `0` is one line per group, `1`+ names every path, and there is nothing to unfold past that | the display |

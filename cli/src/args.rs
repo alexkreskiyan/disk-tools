@@ -225,7 +225,16 @@ pub struct CleanArgs {
     pub min_size: Option<u64>,
 
     /// Also offer anything untouched for this long: 90d, 6m, 1y.
-    #[arg(long = "older-than", value_parser = parse_duration, value_name = "DURATION")]
+    ///
+    /// Refused with --dup, where it would mean the opposite. It works by adding
+    /// a rule, and under --dup the rules only prune — so it would *exclude*
+    /// everything older than the threshold from the search rather than offer it.
+    #[arg(
+        long = "older-than",
+        value_parser = parse_duration,
+        value_name = "DURATION",
+        conflicts_with = "dup"
+    )]
     pub older_than: Option<Duration>,
 
     // Neither carries a clap `default_value`, for the reason the whole file
@@ -1106,6 +1115,24 @@ mod tests {
             Sort::Name,
             "the flag still wins, as everywhere"
         );
+    }
+
+    /// The flag adds a rule, and under `--dup` the rules only prune — so it
+    /// would have quietly meant the opposite of what it says: not "also offer
+    /// what is old" but "exclude everything older than this from the search".
+    /// A flag whose sense inverts with another flag is refused rather than
+    /// documented.
+    #[test]
+    fn older_than_is_refused_with_dup() {
+        let path = rooted("x");
+        let err = parse(&["preview", &path, "--dup", "--older-than", "90d"])
+            .expect_err("the two cannot both apply");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // And each of them alone still parses.
+        assert!(parse(&["preview", &path, "--dup"]).is_ok());
+        assert!(parse(&["preview", &path, "--older-than", "90d"]).is_ok());
     }
 
     // ---- precedence: flag > file > default -------------------------------
