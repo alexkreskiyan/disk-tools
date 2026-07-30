@@ -249,7 +249,15 @@ Invariants worth keeping in mind:
 - **`in scope` is a state of its own.** "My rule does not cover this" and "my
   rule is not running" are different problems, and folding them together leaves
   the user unable to tell which they have.
-- **Anything that really deletes is `#[ignore]`d** and run by `just smoke-trash`.
+- **Anything that really deletes is `#[ignore]`d** and run by `just smoke-trash`
+  — with **no name filter**. One used to be there and stopped matching when the
+  test it named was renamed, so the recipe ran zero tests and reported success.
+- **`just lint-windows` compiles for Windows; it does not run there.** Anything
+  about the *shape* of a path is invisible to the local gate: `/x` is absolute on
+  Unix and drive-relative on Windows, and `canonicalize` returns a verbatim
+  `\\?\C:\…` there and a plain path here. Both reached `main` green and were
+  caught only by the CI matrix. A test that hard-codes a path literal, or that
+  canonicalises a fixture, needs a thought about the other two platforms.
 
 ## Configuration
 
