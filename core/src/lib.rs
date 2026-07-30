@@ -56,7 +56,7 @@ pub use measure::{Claim, Finished, Measured, measure};
 pub use options::ScanOptions;
 pub use rules::{
     AnySibling, Facts, NameTest, Rule, RuleError, Rules, State, Tier, UserDirs, age_rule,
-    builtin_rules,
+    builtin_rules, user_path,
 };
 pub use size::allocated_size;
 #[cfg(feature = "trash")]

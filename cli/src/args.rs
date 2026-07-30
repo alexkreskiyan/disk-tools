@@ -8,10 +8,18 @@
 use crate::config::Config;
 use clap::{Parser, Subcommand};
 use disk_tools_core::{
-    CleanOptions, DetectOptions, RuleError, Rules, ScanOptions, UserDirs, age_rule,
+    CleanOptions, DetectOptions, Keep, RuleError, Rules, ScanOptions, UserDirs, age_rule, user_path,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+/// The floor `--dup` applies when nothing else says otherwise.
+///
+/// A default rather than 0 because this flag decides how much is *read*: below
+/// it a file is never opened. Small files are also where duplicates are least
+/// worth acting on — a thousand identical 4 KiB icons are 4 MiB and a very long
+/// report.
+const MIN_DUPLICATE_SIZE: u64 = 1 << 20;
 
 /// disk-tools — find what's eating your disk.
 #[derive(Parser, Debug)]
@@ -152,6 +160,34 @@ pub struct CleanArgs {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
+    /// Look for duplicate files instead of what the rules claim.
+    ///
+    /// The rules still prune: nothing inside something they claim is offered as
+    /// a duplicate, because such a directory goes wholesale and removing one
+    /// file out of it breaks the rest. Every duplicate needs confirming, so
+    /// `clean --dup` refuses without --yes.
+    ///
+    /// There is no config key for this: a file that switched what `clean`
+    /// removes would do it invisibly, the same reason --yes and --purge are
+    /// absent from it.
+    #[arg(long)]
+    pub dup: bool,
+
+    /// Which copy of a duplicate group to keep. Default: oldest-created.
+    ///
+    /// A date the platform did not record never wins; where no copy in a group
+    /// has it, the other date decides and the report says so.
+    #[arg(long, value_enum, value_name = "RULE", requires = "dup")]
+    pub keep: Option<KeepArg>,
+
+    /// Prefer to keep copies under this path. Repeatable; earlier wins.
+    ///
+    /// Beats --keep outright, which then only chooses among the copies inside.
+    /// Given on the command line it replaces the configured list rather than
+    /// adding to it.
+    #[arg(long = "keep-in", value_name = "PATH", requires = "dup")]
+    pub keep_in: Vec<PathBuf>,
+
     /// Drop everything that needs per-item confirmation.
     ///
     /// Keeps both of the other tiers: purge is a stronger claim that something
@@ -213,6 +249,55 @@ pub struct CleanArgs {
     /// The whole plan, or the whole outcome — `-d` and `--sort` do not reach it.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `--keep`, as clap spells it.
+///
+/// A mirror of the core's [`Keep`] rather than the type itself: the core takes
+/// no dependency on clap, and a `ValueEnum` derive there would be one. The two
+/// are kept in step by `every_keep_rule_maps_to_the_core`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum KeepArg {
+    /// The byte-lexicographically first path — the only rule that reads no
+    /// metadata and so can never degrade.
+    First,
+    /// The earliest creation time: the copy that existed first.
+    OldestCreated,
+    /// The latest creation time.
+    NewestCreated,
+    /// The earliest modification time.
+    OldestModified,
+    /// The latest modification time.
+    NewestModified,
+}
+
+impl From<KeepArg> for Keep {
+    fn from(arg: KeepArg) -> Keep {
+        match arg {
+            KeepArg::First => Keep::First,
+            KeepArg::OldestCreated => Keep::OldestCreated,
+            KeepArg::NewestCreated => Keep::NewestCreated,
+            KeepArg::OldestModified => Keep::OldestModified,
+            KeepArg::NewestModified => Keep::NewestModified,
+        }
+    }
+}
+
+/// What a `--dup` run searches for, once the flags and the file are merged.
+///
+/// Its presence **is** the switch: `Some` means the candidates come from file
+/// contents and not from the rules. A boolean beside the settings could be true
+/// with nothing to search by, and would have to be checked everywhere the
+/// settings are read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Duplicating {
+    /// Below this, a file is not even hashed. Defaults to 1 MiB — reading
+    /// megabytes of dotfiles to reclaim kilobytes is the wrong trade for a disk
+    /// tool, and this is the one flag that decides how much is read at all.
+    pub min_size: u64,
+    pub keep: Keep,
+    /// Absolute, like every path this tool acts on.
+    pub keep_in: Vec<PathBuf>,
 }
 
 /// What the report is ordered by.
@@ -287,6 +372,13 @@ pub struct Cleanup {
     /// How the plan is **chosen** — the rules, the clock, and the flags that
     /// narrow it.
     pub options: CleanOptions,
+
+    /// `Some` when `--dup` was passed: what to search for, instead of the rules.
+    ///
+    /// The two sources are never mixed. Rules yield tiered directories and
+    /// duplicates yield groups of files with a keeper, and a report holding both
+    /// would have no common unit to be about.
+    pub duplicates: Option<Duplicating>,
 
     /// Which verb this was. The only thing that differs between them.
     pub intent: Intent,
@@ -461,11 +553,54 @@ impl Args {
         // and one rooted elsewhere simply matches nothing — `Rules::prunes` sees
         // to that. With no path, the rules say where to look, which is what
         // `root` is required for.
+        // A duplicate is a relation between files, so the question needs a scope
+        // to hold both of them. The rule roots are not one: they answer "where
+        // does this rule apply", and a `--dup` run applies no rule.
+        if clean.dup && clean.path.is_none() {
+            return Err(ResolveError::DuplicatesNeedPath);
+        }
+
         let roots_from_rules = clean.path.is_none();
         let roots = match clean.path {
             Some(path) => vec![absolute(path)],
             None => rules.scan_roots(),
         };
+
+        // Flag, then file, then a default that depends on the mode: hashing has
+        // a floor worth having and rule-claimed directories do not.
+        let min_size = clean
+            .min_size
+            .or(clean.dup.then_some(config.duplicates.min_size).flatten())
+            .unwrap_or(if clean.dup { MIN_DUPLICATE_SIZE } else { 0 });
+
+        let duplicates = clean.dup.then(|| Duplicating {
+            min_size,
+            keep: clean
+                .keep
+                .map(Keep::from)
+                .or(config.duplicates.keep)
+                .unwrap_or_default(),
+            // The flag **replaces** the file's list rather than extending it:
+            // these are ordered preferences, and a command line that could only
+            // ever add to them could not say "not the usual place, this one".
+            //
+            // A root the file writes with a token this build cannot resolve
+            // drops out, exactly as an unresolvable rule root does: unknown
+            // reads as nowhere, never as anywhere.
+            keep_in: if clean.keep_in.is_empty() {
+                config
+                    .duplicates
+                    .keep_in
+                    .iter()
+                    .filter_map(|text| user_path(text, &user_dirs))
+                    .collect()
+            } else {
+                clean.keep_in
+            }
+            .into_iter()
+            .map(absolute)
+            .collect(),
+        });
 
         Ok(Mode::Clean(Box::new(Cleanup {
             roots,
@@ -475,8 +610,9 @@ impl Args {
                 user_dirs,
                 safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
                 purge_all: clean.purge,
-                min_size: clean.min_size.unwrap_or(0),
+                min_size,
             },
+            duplicates,
             intent,
             // **True** when nothing says otherwise. The concept asks for
             // confirmation on this tier, and the asymmetry the denylist already
@@ -504,6 +640,25 @@ pub enum ResolveError {
     /// `%APPDATA%`, no `XDG_CONFIG_HOME`. Guessing would put a file somewhere
     /// the user would never look for it.
     NoConfigPath,
+    /// `--dup` with no path. Not a clap `required_if_eq`, because the reason is
+    /// worth a sentence: the rule roots exist to answer a question this mode
+    /// does not ask.
+    DuplicatesNeedPath,
+}
+
+impl ResolveError {
+    /// What the message is *about*, for the caller's prefix.
+    ///
+    /// Two of these are complaints about the configuration file and one is
+    /// about the command line. `disk-tools: config: --dup needs a PATH` sends a
+    /// user to edit a file that has nothing to do with it — v0.5 shipped exactly
+    /// that mistake for `--apply`, and it is worth one method not to repeat it.
+    pub fn about(&self) -> Option<&'static str> {
+        match self {
+            ResolveError::Rule(_) | ResolveError::NoConfigPath => Some("config"),
+            ResolveError::DuplicatesNeedPath => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ResolveError {
@@ -513,6 +668,10 @@ impl std::fmt::Display for ResolveError {
             ResolveError::NoConfigPath => write!(
                 f,
                 "cannot tell where your config directory is; pass --config with a path"
+            ),
+            ResolveError::DuplicatesNeedPath => write!(
+                f,
+                "--dup needs a PATH: duplicates are found within one scope, and the roots of your rules are not one"
             ),
         }
     }
@@ -701,6 +860,220 @@ mod tests {
         Ok(parse(args)?
             .resolve(env(Config::default()))
             .expect("the built-in rules compile"))
+    }
+
+    // ---- duplicates ------------------------------------------------------
+
+    /// The `Duplicating` a `--dup` run resolved to, or `None` without the flag.
+    fn duplicating(toml: &str, args: &[&str]) -> Option<Duplicating> {
+        match against(toml, args) {
+            Mode::Clean(cleanup) => cleanup.duplicates,
+            other => panic!("expected a cleanup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dup_switches_the_source_and_nothing_else_does() {
+        let path = rooted("x");
+        assert!(duplicating("", &["preview", &path]).is_none());
+        assert!(duplicating("", &["preview", &path, "--dup"]).is_some());
+        assert!(
+            duplicating("", &["clean", &path, "--dup"]).is_some(),
+            "both verbs, or the preview could not be acted on by retyping it"
+        );
+    }
+
+    /// A duplicate is a relation between files, so the question needs a scope
+    /// holding both. The rule roots answer a different question.
+    #[test]
+    fn dup_without_a_path_says_why_it_cannot_run() {
+        let err = parse(&["preview", "--dup"])
+            .expect("parse")
+            .resolve(env(Config::default()))
+            .expect_err("no scope to search");
+
+        assert!(matches!(err, ResolveError::DuplicatesNeedPath));
+        assert!(err.to_string().contains("PATH"));
+        assert_eq!(
+            err.about(),
+            None,
+            "this is about the command line; `config:` would send them to edit a file"
+        );
+    }
+
+    /// Silently ignoring a flag that cannot apply is how a user comes to believe
+    /// a keeper rule is in force when nothing read it.
+    #[test]
+    fn the_keeper_flags_need_the_mode_they_belong_to() {
+        let path = rooted("x");
+        for args in [
+            vec!["preview", &path, "--keep", "first"],
+            vec!["preview", &path, "--keep-in", &path],
+        ] {
+            let err = parse(&args).expect_err("--dup is required");
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn min_size_takes_the_flag_then_the_file_then_a_default_that_knows_the_mode() {
+        let path = rooted("x");
+        let file = "[duplicates]\nmin-size = \"4M\"\n";
+
+        assert_eq!(
+            duplicating("", &["preview", &path, "--dup"])
+                .expect("dup")
+                .min_size,
+            1 << 20,
+            "the floor exists because this flag decides how much is read"
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup"])
+                .expect("dup")
+                .min_size,
+            4 << 20
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup", "--min-size", "2M"])
+                .expect("dup")
+                .min_size,
+            2 << 20
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup", "--min-size", "0"])
+                .expect("dup")
+                .min_size,
+            0,
+            "an explicit zero beats the file, which is why no flag here has a clap default"
+        );
+    }
+
+    /// The rule-claimed source keeps its own default of 0: a directory is
+    /// claimed whole, and nothing is read to decide it.
+    #[test]
+    fn the_duplicate_floor_does_not_leak_into_an_ordinary_run() {
+        let path = rooted("x");
+        assert_eq!(clean_options(&["preview", &path]).min_size, 0);
+        assert_eq!(
+            clean_options(&["preview", &path, "--dup"]).min_size,
+            1 << 20,
+            "and the plan is narrowed by the same number the search was"
+        );
+    }
+
+    #[test]
+    fn keep_takes_the_flag_then_the_file_then_the_original() {
+        let path = rooted("x");
+        let file = "[duplicates]\nkeep = \"newest-modified\"\n";
+
+        assert_eq!(
+            duplicating("", &["preview", &path, "--dup"])
+                .expect("dup")
+                .keep,
+            Keep::OldestCreated
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup"])
+                .expect("dup")
+                .keep,
+            Keep::NewestModified
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup", "--keep", "first"])
+                .expect("dup")
+                .keep,
+            Keep::First
+        );
+    }
+
+    /// Every value clap offers has to reach the core, or a flag parses and then
+    /// means something else.
+    #[test]
+    fn every_keep_rule_maps_to_the_core() {
+        let path = rooted("x");
+        for (word, expected) in [
+            ("first", Keep::First),
+            ("oldest-created", Keep::OldestCreated),
+            ("newest-created", Keep::NewestCreated),
+            ("oldest-modified", Keep::OldestModified),
+            ("newest-modified", Keep::NewestModified),
+        ] {
+            assert_eq!(
+                duplicating("", &["preview", &path, "--dup", "--keep", word])
+                    .expect("dup")
+                    .keep,
+                expected,
+                "--keep {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_in_is_made_absolute_and_the_flag_replaces_the_file() {
+        let path = rooted("x");
+        let file = "[duplicates]\nkeep-in = [\"/from/file\"]\n";
+
+        let from_file = duplicating(file, &["preview", &path, "--dup"]).expect("dup");
+        assert_eq!(from_file.keep_in, vec![PathBuf::from(rooted("from/file"))]);
+
+        let flagged = duplicating(
+            file,
+            &["preview", &path, "--dup", "--keep-in", &rooted("named")],
+        )
+        .expect("dup");
+        assert_eq!(
+            flagged.keep_in,
+            vec![PathBuf::from(rooted("named"))],
+            "ordered preferences: the command line replaces them, it does not append"
+        );
+
+        let relative =
+            duplicating("", &["preview", &path, "--dup", "--keep-in", "here"]).expect("dup");
+        assert!(
+            relative.keep_in[0].is_absolute(),
+            "every path this tool acts on is absolute: {:?}",
+            relative.keep_in[0]
+        );
+    }
+
+    /// `~` means the same thing wherever a user may write a path, because one
+    /// function in the core decides what it means.
+    #[test]
+    fn a_configured_keep_in_expands_the_same_tokens_a_rule_root_does() {
+        let path = rooted("x");
+        let config = crate::config::parse_for_test("[duplicates]\nkeep-in = [\"~/Photos\"]\n");
+        let home = PathBuf::from(rooted("home/me"));
+        let mode = parse(&["preview", &path, "--dup"])
+            .expect("parse")
+            .resolve(Environment {
+                user_dirs: UserDirs {
+                    home: Some(home.clone()),
+                    ..UserDirs::default()
+                },
+                ..env(config)
+            })
+            .expect("resolve");
+
+        let Mode::Clean(cleanup) = mode else {
+            panic!("expected a cleanup")
+        };
+        assert_eq!(
+            cleanup.duplicates.expect("dup").keep_in,
+            vec![home.join("Photos")]
+        );
+    }
+
+    /// An unresolvable token claims nothing rather than everything — the rule
+    /// the whole project follows for a path it cannot work out.
+    #[test]
+    fn a_keep_in_root_with_no_home_drops_out() {
+        let path = rooted("x");
+        let found = duplicating(
+            "[duplicates]\nkeep-in = [\"~/Photos\"]\n",
+            &["preview", &path, "--dup"],
+        )
+        .expect("dup");
+        assert!(found.keep_in.is_empty());
     }
 
     // ---- precedence: flag > file > default -------------------------------

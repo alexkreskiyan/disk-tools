@@ -22,7 +22,7 @@
 pub mod write;
 
 use crate::args::{parse_duration, parse_size};
-use disk_tools_core::{Rule, Tier, UserDirs, builtin_rules};
+use disk_tools_core::{Keep, Rule, Tier, UserDirs, builtin_rules};
 use serde::Deserialize;
 use std::fmt;
 use std::io;
@@ -67,8 +67,37 @@ min-size = "0"
 apparent = false
 
 [clean]
-require-confirmation = true     # --apply refuses while confirm-tier remains
+require-confirmation = true     # clean refuses while confirm-tier remains
 safe                 = false    # as if --safe were always passed
+
+# `preview --dup <PATH>` / `clean --dup <PATH>`. This section says *how* that
+# searches, never whether it runs: there is no key here that turns duplicates
+# on, for the same reason `--purge` and `--yes` are absent from this file.
+#
+# `min-size` is the one that decides how much is read — below it a file is never
+# opened. `keep` chooses which copy of a group stays:
+#
+#   oldest-created   the copy that existed first. The default, because copying
+#                    makes a new inode with a new creation time, while `cp -p`,
+#                    rsync and unpacking an archive all carry the *modification*
+#                    time onto the copy.
+#   newest-created
+#   oldest-modified
+#   newest-modified
+#   first            the first path in byte order. Reads no metadata, so it is
+#                    the only one that cannot degrade.
+#
+# A date the platform did not record never wins. Where no copy in a group has
+# the date asked for, the other date decides and the report says so — Linux
+# without statx birth times is where that happens.
+#
+# `keep-in` beats `keep` outright: a group with a copy under one of these roots
+# keeps that copy, and `keep` then only chooses among them. Tried in order.
+# `~` and `%APPDATA%` expand as in a rule's `root`.
+[duplicates]
+min-size = "1M"
+keep     = "oldest-created"
+# keep-in  = ["~/Photos", "~/Documents"]
 
 # Rules. List order is precedence: the first match claims the node, and a
 # claimed node is never descended into.
@@ -150,6 +179,7 @@ pub struct Config {
     pub scan: ScanSettings,
     pub report: ReportSettings,
     pub clean: CleanSettings,
+    pub duplicates: DuplicateSettings,
 
     /// Unknown keys, by their dotted path. The caller prints them; this module
     /// neither logs nor decides where diagnostics go.
@@ -163,6 +193,7 @@ impl Default for Config {
             scan: ScanSettings::default(),
             report: ReportSettings::default(),
             clean: CleanSettings::default(),
+            duplicates: DuplicateSettings::default(),
             warnings: Vec::new(),
         }
     }
@@ -193,6 +224,23 @@ pub struct ReportSettings {
 pub struct CleanSettings {
     pub require_confirmation: Option<bool>,
     pub safe: Option<bool>,
+}
+
+/// `[duplicates]` — how a `--dup` run searches, never **whether** it does.
+///
+/// The mode itself has no key here, deliberately, and the same way `--yes` and
+/// `--purge` have none: a file that changed what `clean` removes would change it
+/// invisibly. What is here only refines a search the command line asked for.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DuplicateSettings {
+    pub min_size: Option<u64>,
+    pub keep: Option<Keep>,
+    /// Preferred roots, in order, exactly as written.
+    ///
+    /// Left unexpanded because `~` needs the user's directories, which this
+    /// module deliberately does not have — the same reason a rule's `root` is a
+    /// string here and a path only once `Rules::new` sees it.
+    pub keep_in: Vec<String>,
 }
 
 /// Why the configuration could not be used.
@@ -366,6 +414,25 @@ fn parse(path: &Path, text: &str) -> Result<Config, ConfigError> {
             require_confirmation: file.clean.require_confirmation,
             safe: file.clean.safe,
         },
+        duplicates: DuplicateSettings {
+            min_size: file
+                .duplicates
+                .min_size
+                .map(|value| size(&value, "[duplicates] min-size"))
+                .transpose()
+                .map_err(invalid)?,
+            keep: file
+                .duplicates
+                .keep
+                .map(|word| keep(&word, "[duplicates] keep"))
+                .transpose()
+                .map_err(invalid)?,
+            keep_in: file
+                .duplicates
+                .keep_in
+                .map(Strings::into_vec)
+                .unwrap_or_default(),
+        },
         warnings,
     })
 }
@@ -400,6 +467,17 @@ fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
             ));
         }
         let where_ = format!("rule `{name}`");
+
+        // The report prints this name in every candidate's row, and a duplicate
+        // candidate carries the fixed one below. Letting a rule take it would
+        // make one line of a plan mean two different things — and they differ in
+        // exactly the way that matters, since a rule may say `tier = "purge"`
+        // while every duplicate needs confirming.
+        if name == disk_tools_core::DUPLICATE_RULE {
+            return Err(format!(
+                "{where_}: `{name}` is reserved — it is the name the report gives to a copy found by `--dup`"
+            ));
+        }
 
         if rules.iter().any(|rule| rule.name == name) {
             return Err(format!(
@@ -458,6 +536,30 @@ fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
     Ok(rules)
 }
 
+/// The keeper rule, by the word the file uses.
+///
+/// A plain string rather than a serde enum for the same reason as [`tier`]: the
+/// message can then name every value, which matters most for the two that read
+/// a date and can therefore degrade.
+fn keep(word: &str, where_: &str) -> Result<Keep, String> {
+    match word {
+        "first" => Ok(Keep::First),
+        "oldest-created" => Ok(Keep::OldestCreated),
+        "newest-created" => Ok(Keep::NewestCreated),
+        "oldest-modified" => Ok(Keep::OldestModified),
+        "newest-modified" => Ok(Keep::NewestModified),
+        // Named because "oldest" is the obvious thing to write and cannot mean
+        // one thing: `cp -p` carries an mtime onto a copy and a creation time
+        // never travels, so the two dates disagree exactly where it matters.
+        "oldest" | "newest" => Err(format!(
+            "{where_}: `{word}` does not say which date; write `{word}-created` or `{word}-modified`"
+        )),
+        other => Err(format!(
+            "{where_}: unknown value `{other}`; expected first, oldest-created, newest-created, oldest-modified or newest-modified"
+        )),
+    }
+}
+
 /// One `parse_size` for the flag and the file both. Two would drift, and this
 /// one decides how much a deletion rule is allowed to skip.
 fn size(value: &str, where_: &str) -> Result<u64, String> {
@@ -475,6 +577,8 @@ struct FileConfig {
     report: RawReport,
     #[serde(default)]
     clean: RawClean,
+    #[serde(default)]
+    duplicates: RawDuplicates,
     rules: Option<Vec<RuleEntry>>,
 }
 
@@ -499,6 +603,16 @@ struct RawReport {
 struct RawClean {
     require_confirmation: Option<bool>,
     safe: Option<bool>,
+}
+
+/// `[duplicates]`. No key here can switch the mode on — `--dup` is the only way
+/// to ask for it, so an unfamiliar key trying to is a warning like any other.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct RawDuplicates {
+    min_size: Option<String>,
+    keep: Option<String>,
+    keep_in: Option<Strings>,
 }
 
 /// A rule as the file spells it.
@@ -784,6 +898,81 @@ mod tests {
             ));
             assert_eq!(rules[0].tier, expected, "`{word}`");
         }
+    }
+
+    // ---- [duplicates] ----------------------------------------------------
+
+    #[test]
+    fn the_duplicates_section_is_read() {
+        let config = at("[duplicates]\nmin-size = \"4M\"\nkeep = \"newest-created\"\nkeep-in = [\"~/Photos\", \"/other\"]\n")
+            .expect("parse");
+
+        assert_eq!(
+            config.duplicates,
+            DuplicateSettings {
+                min_size: Some(4 << 20),
+                keep: Some(Keep::NewestCreated),
+                keep_in: vec!["~/Photos".into(), "/other".into()],
+            },
+            "left unexpanded: `~` needs the user's directories, which this module does not have"
+        );
+    }
+
+    #[test]
+    fn an_absent_duplicates_section_settles_nothing() {
+        assert_eq!(
+            at("").expect("parse").duplicates,
+            DuplicateSettings::default()
+        );
+    }
+
+    /// `keep = "oldest"` is the obvious thing to write and cannot be answered:
+    /// the two dates disagree exactly where it matters, since copying carries an
+    /// mtime and never carries a creation time.
+    #[test]
+    fn a_keeper_rule_without_a_date_is_refused_by_name() {
+        let message = message("[duplicates]\nkeep = \"oldest\"\n");
+        assert!(message.contains("oldest-created"), "{message}");
+        assert!(message.contains("oldest-modified"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_keeper_rule_names_all_five() {
+        let message = message("[duplicates]\nkeep = \"whichever\"\n");
+        for word in [
+            "first",
+            "oldest-created",
+            "newest-created",
+            "oldest-modified",
+            "newest-modified",
+        ] {
+            assert!(message.contains(word), "{word} missing from {message}");
+        }
+    }
+
+    /// The mode is not a setting. A key that tried to switch it on is unknown
+    /// like any other, so it warns and is ignored rather than turning `clean`
+    /// into a different command than the one typed.
+    #[test]
+    fn no_key_here_can_switch_the_mode_on() {
+        let config = at("[duplicates]\ndup = true\nenabled = true\n").expect("parse");
+
+        assert_eq!(
+            config.warnings,
+            vec!["duplicates.dup", "duplicates.enabled"]
+        );
+        assert_eq!(config.duplicates, DuplicateSettings::default());
+    }
+
+    /// One line of a plan must not be able to mean two things — and they differ
+    /// where it matters: a rule may say `tier = "purge"`, a duplicate never can.
+    #[test]
+    fn a_rule_may_not_take_the_name_the_report_gives_a_duplicate() {
+        let message =
+            message("[[rules]]\nname = \"duplicate\"\nroot = \"*\"\nincludes = [\"x\"]\n");
+
+        assert!(message.contains("reserved"), "{message}");
+        assert!(message.contains("--dup"), "{message}");
     }
 
     /// Not an alias. An alias lives for ever; an error costs one edit and stops

@@ -685,6 +685,17 @@ pub fn builtin_rules() -> Vec<Rule> {
     ]
 }
 
+/// Expand the tokens a user may write at the head of a path: `~`,
+/// `%APPDATA%`, `%LOCALAPPDATA%`.
+///
+/// The same expansion a rule's `root` gets, exported so that every other place a
+/// user writes a path — `keep-in`, so far — means the same thing by `~`. `None`
+/// when the token names a directory this frontend could not find, which is the
+/// project's usual reading of unknown: not everywhere, but nowhere.
+pub fn user_path(text: &str, dirs: &UserDirs) -> Option<PathBuf> {
+    resolve_root(Some(text), dirs).flatten()
+}
+
 /// `Some(None)` for an unrooted rule, `Some(Some(path))` for a resolved one, and
 /// `None` when a token names a directory this frontend could not find.
 ///

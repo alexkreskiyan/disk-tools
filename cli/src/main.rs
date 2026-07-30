@@ -13,7 +13,8 @@ mod ui;
 use args::{Args, Cleanup, Environment, Intent, Mode, Report, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOutcome, CleanPlan, ScanOptions, ScanTree, SkippedEntry, apply, plan, scan,
+    CleanOutcome, CleanPlan, DuplicateOptions, Duplicates, ScanOptions, ScanTree, SkippedEntry,
+    apply, duplicates, plan, plan_duplicates, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{render_clean, render_outcome};
@@ -64,7 +65,10 @@ fn main() -> ExitCode {
     }) {
         Ok(mode) => mode,
         Err(err) => {
-            eprintln!("disk-tools: config: {err}");
+            match err.about() {
+                Some(subject) => eprintln!("disk-tools: {subject}: {err}"),
+                None => eprintln!("disk-tools: {err}"),
+            }
             return ExitCode::from(2);
         }
     };
@@ -227,7 +231,17 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
         // description that may have gone stale, and one missing directory is no
         // reason to leave the others uncleaned. `scan` reports it as a skip.
         let mut tree = scan_with_spinner(&walk, "Scanning…");
-        plans.push(plan(&tree, options));
+        plans.push(match &cleanup.duplicates {
+            // The two sources of a candidate, and the one place either is
+            // chosen. Both produce the same plan, so everything after this line
+            // — the refusal, the report, the removal — is unaware of which ran.
+            Some(duplicating) => {
+                let found = search_with_spinner(&tree, duplicating, options);
+                skipped.extend(found.skipped.iter().cloned());
+                plan_duplicates(&tree, &found, options)
+            }
+            None => plan(&tree, options),
+        });
         skipped.extend(std::mem::take(&mut tree.skipped));
         if unfolding {
             trees.push(tree);
@@ -433,6 +447,45 @@ fn scan_with_spinner(options: &ScanOptions, message: &'static str) -> ScanTree {
     spinner.finish_and_clear();
 
     tree
+}
+
+/// Hash what needs hashing, saying how much of it there is.
+///
+/// The only phase in this tool bounded by disk throughput rather than metadata
+/// calls, so its spinner carries a running total rather than one word: a scan
+/// takes a second and this can take minutes on a large tree.
+///
+/// The message is rebuilt per file, which is far more often than the 100 ms
+/// tick redraws — cheap next to the read that produced it.
+fn search_with_spinner(
+    tree: &ScanTree,
+    duplicating: &args::Duplicating,
+    options: &disk_tools_core::CleanOptions,
+) -> Duplicates {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_message("Comparing…");
+    spinner.enable_steady_tick(Duration::from_millis(100));
+
+    let found = duplicates(
+        tree,
+        &DuplicateOptions {
+            // The rules prune and claim nothing: this is the same detection the
+            // other source would have run, put to the opposite use.
+            detect: options.detect.clone(),
+            min_size: duplicating.min_size,
+            keep: duplicating.keep,
+            keep_in: duplicating.keep_in.clone(),
+        },
+        &|hashed| {
+            spinner.set_message(format!(
+                "Comparing… {} read",
+                render::tree::format_size(hashed.running_total)
+            ));
+        },
+    );
+
+    spinner.finish_and_clear();
+    found
 }
 
 /// Report to stdout, skips to stderr.
