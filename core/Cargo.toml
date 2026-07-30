@@ -16,6 +16,17 @@ serde = { version = "1", features = ["derive"], optional = true }
 # acceptable failure mode for a cleanup tool. Pulls only `objc2` on macOS and
 # `windows` on Windows; no dbus or portal, so headless CI works.
 trash = { version = "5.2", optional = true }
+# The two halves of the duplicate pipeline's hashing. xxh3 is not cryptographic
+# and is never trusted alone: it only splits a same-size bucket by its first
+# 16 KiB so that blake3 — which *is* what "identical" finally means here — runs
+# on the few files that survive. Both are pure Rust with no C toolchain.
+xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
+# `pure` keeps blake3 out of `cc`: its default build assembles x86 sources, and
+# on Windows that needs `ml64.exe` — which `just lint-windows` cannot have on a
+# Unix host, so the local half of the gate would simply stop running. The Rust
+# SIMD paths remain; only the hand-written assembly goes, and this tool is bound
+# by the disk it is reading, not by the hash.
+blake3 = { version = "1.5", features = ["pure"], optional = true }
 
 # `serde`: opt-in serialization of the scan model, enabled by the CLI for `--json`.
 #
@@ -24,11 +35,17 @@ trash = { version = "5.2", optional = true }
 # `plan()` — deciding what to delete needs nothing from the backend — and stops
 # compiling `objc2` / `windows` for a capability it never calls.
 #
+# `duplicates`: the content-identity pass. On by default for the same reason as
+# `trash`, and separable for a stronger one — it is the only thing here that
+# reads file *contents*, so a consumer that only sizes a tree can drop two
+# hashers it never calls.
+#
 # `just check-minimal` keeps that promise honest; nothing else exercises this
 # configuration.
 [features]
-default = ["trash"]
+default = ["trash", "duplicates"]
 trash = ["dep:trash"]
+duplicates = ["dep:blake3", "dep:xxhash-rust"]
 serde = ["dep:serde"]
 
 # Windows hides allocated size from `std::fs::Metadata`; `GetCompressedFileSizeW`

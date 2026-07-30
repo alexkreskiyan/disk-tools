@@ -29,6 +29,8 @@
 mod clean;
 mod dedup;
 mod detect;
+#[cfg(feature = "duplicates")]
+mod duplicates;
 mod git;
 mod measure;
 mod options;
@@ -44,6 +46,10 @@ mod windows_dir;
 
 pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, plan};
 pub use detect::{DetectOptions, Detection, detect};
+#[cfg(feature = "duplicates")]
+pub use duplicates::{
+    Copy, DuplicateGroup, DuplicateOptions, Duplicates, Hashed, Keep, duplicates,
+};
 pub use measure::{Claim, Finished, Measured, measure};
 pub use options::ScanOptions;
 pub use rules::{

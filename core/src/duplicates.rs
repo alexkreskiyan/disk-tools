@@ -1,0 +1,986 @@
+//! Files whose **contents** are identical.
+//!
+//! Every other pass in this crate answers a question about a path: is this a
+//! `target/`, is it old, how big is it. A duplicate is not a property of a file
+//! at all — it is a property of a *set*, and the answer is never "remove these"
+//! but "keep exactly one of these". That is why this module returns groups with
+//! a keeper rather than a list of candidates.
+//!
+//! The pipeline is staged so the expensive stage runs on almost nothing:
+//!
+//! | Stage | Cost |
+//! |---|---|
+//! | eligible files, bucketed by apparent size | none — the scan already has it |
+//! | one `symlink_metadata` per survivor | one stat per file in a same-size bucket |
+//! | xxh3-128 of the first 16 KiB | one short read |
+//! | blake3 over the whole file | the only stage bounded by disk throughput |
+//!
+//! **Hardlinks cost nothing to collapse.** `dedup::attribute` has
+//! already zeroed every name but one of each inode, and a zeroed entry is not
+//! eligible — which is exactly right, since removing one name of a hardlinked
+//! file frees no bytes at all. The concept's "hardlink-collapse" stage is a
+//! stage this module never had to write.
+//!
+//! Like the rest of the core it reads no clock and no environment, prints
+//! nothing, and returns its failures as data.
+
+use crate::detect::{DetectOptions, detect};
+use crate::tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
+use crate::walk::skip_reason;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
+
+/// How much of a file the cheap hash looks at.
+///
+/// Two files that differ at all usually differ early — a header, a magic
+/// number, a first frame. 16 KiB is enough to separate almost every real
+/// same-size bucket while reading one block per file.
+const PREFIX: u64 = 16 * 1024;
+
+/// Read buffer for the full hash. Fixed, so memory never scales with a file:
+/// a 40 GiB disk image must not become a 40 GiB allocation.
+const CHUNK: usize = 128 * 1024;
+
+/// Which copy survives when several are identical.
+///
+/// The default is [`Keep::First`] — the byte-lexicographically first path, the
+/// same rule `dedup::attribute` uses to pick which name of a hardlink
+/// owns its bytes, and for the same reason: two runs over one tree must agree,
+/// and the rule has to be explainable in one line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum Keep {
+    /// The byte-lexicographically first path.
+    #[default]
+    First,
+    /// The earliest mtime. An unknown time never wins.
+    Oldest,
+    /// The latest mtime. An unknown time never wins.
+    Newest,
+    /// The shortest path, ties broken by [`Keep::First`].
+    Shortest,
+}
+
+/// Everything the pass needs, all of it explicit.
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateOptions {
+    /// Which rules claim subtrees this pass must not look **inside**.
+    ///
+    /// The rules never produce a candidate here — they only prune. A
+    /// `node_modules` is a duplicate farm, and removing one file out of one is
+    /// how a tree that should have gone wholesale gets broken instead.
+    pub detect: DetectOptions,
+
+    /// Apparent bytes. A file smaller than this is not considered, whatever its
+    /// content; a zero-length one never is, at any setting.
+    pub min_size: u64,
+
+    pub keep: Keep,
+
+    /// Preferred roots, in order.
+    ///
+    /// A group with a member under one of these keeps that member, whatever
+    /// [`Self::keep`] says — "keep whatever is in ~/Photos, remove the copies
+    /// elsewhere" is the thing users actually want. `keep` then only breaks
+    /// ties inside the winning root.
+    pub keep_in: Vec<PathBuf>,
+}
+
+/// One redundant copy: what would go, and what that frees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Copy {
+    pub path: PathBuf,
+    pub allocated: u64,
+}
+
+/// A set of files with identical contents, and the one that stays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DuplicateGroup {
+    /// One copy's logical length — the identity this group was bucketed on.
+    pub apparent: u64,
+
+    pub keeper: PathBuf,
+
+    /// The redundant copies, ordered by path bytes. Never empty.
+    pub copies: Vec<Copy>,
+
+    /// The sum of `copies`' allocated bytes.
+    ///
+    /// A sum rather than `apparent * copies.len()`: two byte-identical files
+    /// can occupy different amounts of disk — different volumes, different
+    /// block sizes, one of them sparse or compressed.
+    pub reclaimable: u64,
+}
+
+/// What the pass found, and what it could not read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Duplicates {
+    /// Ordered by `reclaimable` descending, then by keeper path bytes.
+    pub groups: Vec<DuplicateGroup>,
+
+    /// Anything unreadable, vanished, or changed under us between the scan and
+    /// the hash — as data, never printed.
+    pub skipped: Vec<SkippedEntry>,
+
+    pub files_hashed: usize,
+    pub bytes_read: u64,
+}
+
+/// One file finished hashing.
+///
+/// Mirrors [`crate::Finished`]: the core reports progress and the frontend
+/// decides whether a human ever sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct Hashed<'a> {
+    pub path: &'a Path,
+    /// Bytes read for this file, at this stage.
+    pub bytes: u64,
+    /// Bytes read by the whole pass so far, this file included.
+    pub running_total: u64,
+}
+
+/// One file on its way through the pipeline.
+#[derive(Debug, Clone)]
+struct Member {
+    path: PathBuf,
+    allocated: u64,
+    apparent: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Everything the parallel stages share.
+struct Progress<'a> {
+    skipped: Mutex<Vec<SkippedEntry>>,
+    files_hashed: AtomicU64,
+    bytes_read: AtomicU64,
+    report: &'a (dyn Fn(Hashed<'_>) + Sync),
+}
+
+impl Progress<'_> {
+    fn skip(&self, path: &Path, reason: SkipReason) {
+        self.skipped.lock().expect("skip list").push(SkippedEntry {
+            path: path.to_path_buf(),
+            reason,
+        });
+    }
+
+    fn hashed(&self, path: &Path, bytes: u64) {
+        self.files_hashed.fetch_add(1, Ordering::Relaxed);
+        let running_total = self.bytes_read.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        (self.report)(Hashed {
+            path,
+            bytes,
+            running_total,
+        });
+    }
+}
+
+/// Find every set of files with identical contents under `tree`.
+///
+/// Reads file contents — the only thing in this crate that does — but writes
+/// nothing and never fails: a file that vanishes, refuses to open or changes
+/// size mid-pass leaves a [`SkippedEntry`] and drops out of its group. A group
+/// left with fewer than two members disappears with it, so **no copy is ever
+/// proposed for removal against content that could not be read**.
+pub fn duplicates(
+    tree: &ScanTree,
+    options: &DuplicateOptions,
+    report: &(dyn Fn(Hashed<'_>) + Sync),
+) -> Duplicates {
+    let claimed: HashSet<PathBuf> = detect(tree, &options.detect)
+        .into_iter()
+        .map(|found| found.path)
+        .collect();
+
+    let mut eligible = Vec::new();
+    collect(&tree.root, &claimed, options.min_size, &mut eligible);
+
+    // Bucketing by size costs nothing — the scan measured every one of these —
+    // and it is what makes the whole pass affordable: a unique size is proof of
+    // a unique file, and most files have one.
+    let mut buckets: HashMap<u64, Vec<Member>> = HashMap::new();
+    for member in eligible {
+        buckets.entry(member.apparent).or_default().push(member);
+    }
+    let contested: Vec<(u64, Vec<Member>)> = buckets
+        .into_iter()
+        .filter(|(_, members)| members.len() > 1)
+        .collect();
+
+    let progress = Progress {
+        skipped: Mutex::new(Vec::new()),
+        files_hashed: AtomicU64::new(0),
+        bytes_read: AtomicU64::new(0),
+        report,
+    };
+
+    let mut groups: Vec<DuplicateGroup> = contested
+        .into_par_iter()
+        .flat_map_iter(|(size, members)| resolve(size, members, options, &progress))
+        .collect();
+
+    // The buckets came out of a `HashMap` and the work ran in parallel, so
+    // nothing above is ordered. Everything a caller sees is ordered here.
+    groups.sort_by(|a, b| {
+        b.reclaimable
+            .cmp(&a.reclaimable)
+            .then_with(|| a.keeper.as_os_str().cmp(b.keeper.as_os_str()))
+    });
+    let mut skipped = progress.skipped.into_inner().expect("skip list");
+    skipped.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+
+    Duplicates {
+        groups,
+        skipped,
+        files_hashed: progress.files_hashed.load(Ordering::Relaxed) as usize,
+        bytes_read: progress.bytes_read.load(Ordering::Relaxed),
+    }
+}
+
+/// Every file that could still be a duplicate, from the scanned tree.
+///
+/// A hardlink's non-keeper names were zeroed by attribution and fail the
+/// `apparent > 0` test, which is the hardlink collapse. Directories are not
+/// files; a claimed subtree is not entered.
+fn collect(node: &ScanNode, claimed: &HashSet<PathBuf>, min_size: u64, out: &mut Vec<Member>) {
+    if claimed.contains(&node.path) {
+        return;
+    }
+    if node.is_dir {
+        for child in &node.children {
+            collect(child, claimed, min_size, out);
+        }
+        return;
+    }
+    if node.apparent == 0 || node.apparent < min_size {
+        return;
+    }
+    out.push(Member {
+        path: node.path.clone(),
+        allocated: node.allocated,
+        apparent: node.apparent,
+        modified: node.modified,
+    });
+}
+
+/// Take one same-size bucket down to the groups that are genuinely identical.
+fn resolve(
+    size: u64,
+    members: Vec<Member>,
+    options: &DuplicateOptions,
+    progress: &Progress<'_>,
+) -> Vec<DuplicateGroup> {
+    let members = still_there(members, size, progress);
+    if members.len() < 2 {
+        return Vec::new();
+    }
+
+    // Below the prefix length the cheap hash would read the whole file, which
+    // the full hash is about to do anyway — so it would cost a second read to
+    // learn something already implied.
+    let buckets = if size > PREFIX {
+        split(
+            members,
+            |member| {
+                let (digest, read) = hash_prefix(&member.path)?;
+                progress.hashed(&member.path, read);
+                Ok(digest.to_le_bytes().to_vec())
+            },
+            progress,
+        )
+    } else {
+        vec![members]
+    };
+
+    buckets
+        .into_iter()
+        .flat_map(|bucket| {
+            split(
+                bucket,
+                |member| {
+                    let (digest, read) = hash_full(&member.path)?;
+                    progress.hashed(&member.path, read);
+                    Ok(digest.as_bytes().to_vec())
+                },
+                progress,
+            )
+        })
+        .filter_map(|identical| group(size, identical, options))
+        .collect()
+}
+
+/// Confirm each member is still the regular file of that size the scan saw.
+///
+/// One `symlink_metadata` per file in a contested bucket — cheap beside the
+/// reads to come, and it is what keeps three things out of a removal plan: a
+/// symlink (its content is a path, not the file it names), a file that changed
+/// under us, and one that is already gone.
+fn still_there(members: Vec<Member>, size: u64, progress: &Progress<'_>) -> Vec<Member> {
+    members
+        .into_iter()
+        .filter(|member| match std::fs::symlink_metadata(&member.path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == size => true,
+            Ok(metadata) if metadata.is_file() => {
+                progress.skip(
+                    &member.path,
+                    SkipReason::Other(format!(
+                        "size changed since the scan: {size} bytes then, {} now",
+                        metadata.len()
+                    )),
+                );
+                false
+            }
+            // A symlink or a device node is silently not a duplicate — nothing
+            // went wrong, it was simply never a candidate.
+            Ok(_) => false,
+            Err(err) => {
+                progress.skip(&member.path, skip_reason(&err));
+                false
+            }
+        })
+        .collect()
+}
+
+/// Sub-divide a bucket by a digest, dropping whatever ends up alone.
+///
+/// A member whose digest cannot be read is dropped **and reported**: an
+/// unreadable file is not evidence of anything, least of all that some other
+/// file is a redundant copy of it.
+fn split<K, F>(members: Vec<Member>, digest: F, progress: &Progress<'_>) -> Vec<Vec<Member>>
+where
+    K: std::hash::Hash + Eq + Ord,
+    F: Fn(&Member) -> io::Result<K>,
+{
+    let mut by_digest: HashMap<K, Vec<Member>> = HashMap::new();
+    for member in members {
+        match digest(&member) {
+            Ok(key) => by_digest.entry(key).or_default().push(member),
+            Err(err) => progress.skip(&member.path, skip_reason(&err)),
+        }
+    }
+    let mut buckets: Vec<(K, Vec<Member>)> = by_digest
+        .into_iter()
+        .filter(|(_, members)| members.len() > 1)
+        .collect();
+    // Ordered by digest so the pass is reproducible before the final sort, not
+    // only after it.
+    buckets.sort_by(|a, b| a.0.cmp(&b.0));
+    buckets.into_iter().map(|(_, members)| members).collect()
+}
+
+/// Turn a set of confirmed-identical files into a group with one keeper.
+fn group(
+    apparent: u64,
+    mut members: Vec<Member>,
+    options: &DuplicateOptions,
+) -> Option<DuplicateGroup> {
+    if members.len() < 2 {
+        return None;
+    }
+    members.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+
+    let keeper = choose_keeper(&members, options);
+    let keeper_path = members[keeper].path.clone();
+    let copies: Vec<Copy> = members
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| *index != keeper)
+        .map(|(_, member)| Copy {
+            path: member.path,
+            allocated: member.allocated,
+        })
+        .collect();
+
+    Some(DuplicateGroup {
+        apparent,
+        keeper: keeper_path,
+        reclaimable: copies.iter().map(|copy| copy.allocated).sum(),
+        copies,
+    })
+}
+
+/// Which member stays. `members` is already sorted by path bytes, so every
+/// "first" below is the byte-lexicographic one and every tie breaks that way.
+fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> usize {
+    // A preferred root beats the policy outright; the policy then only chooses
+    // among the members inside it.
+    let inside: Vec<usize> = options
+        .keep_in
+        .iter()
+        .find_map(|root| {
+            let matching: Vec<usize> = members
+                .iter()
+                .enumerate()
+                .filter(|(_, member)| member.path.starts_with(root))
+                .map(|(index, _)| index)
+                .collect();
+            (!matching.is_empty()).then_some(matching)
+        })
+        .unwrap_or_else(|| (0..members.len()).collect());
+
+    let by_time = |pick: fn(&SystemTime, &SystemTime) -> bool| {
+        // An unknown mtime never wins: `None` is "we do not know", and treating
+        // it as the epoch would hand the keeper to whichever file the platform
+        // happened to be quiet about.
+        let mut best: Option<(usize, SystemTime)> = None;
+        for &index in &inside {
+            let Some(time) = members[index].modified else {
+                continue;
+            };
+            match best {
+                Some((_, current)) if !pick(&time, &current) => {}
+                _ => best = Some((index, time)),
+            }
+        }
+        best.map(|(index, _)| index)
+    };
+
+    match options.keep {
+        Keep::First => inside[0],
+        Keep::Shortest => *inside
+            .iter()
+            .min_by_key(|&&index| members[index].path.as_os_str().len())
+            .expect("a group is never empty"),
+        // Every member unknown falls back to the path rule rather than to an
+        // arbitrary member.
+        Keep::Oldest => by_time(|new, current| new < current).unwrap_or(inside[0]),
+        Keep::Newest => by_time(|new, current| new > current).unwrap_or(inside[0]),
+    }
+}
+
+/// xxh3-128 of the first [`PREFIX`] bytes, and how many were read.
+///
+/// Never the last word on identity: it is not a cryptographic hash, and nothing
+/// is removed on its word alone. All it does is keep [`hash_full`] off files
+/// that already differ.
+fn hash_prefix(path: &Path) -> io::Result<(u128, u64)> {
+    use xxhash_rust::xxh3::Xxh3;
+
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0u8; PREFIX as usize];
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    let mut hasher = Xxh3::new();
+    hasher.update(&buffer[..filled]);
+    Ok((hasher.digest128(), filled as u64))
+}
+
+/// blake3 over the whole file, and how many bytes that took.
+///
+/// What "identical" finally means here.
+///
+/// A 256-bit digest from a cryptographic hash: two different files sharing one
+/// is not a thing that happens, which is why there is no byte-for-byte pass
+/// after it. Doubling every read to defend against that would be a real cost
+/// against an unreachable one.
+fn hash_full(path: &Path) -> io::Result<(blake3::Hash, u64)> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; CHUNK];
+    let mut total = 0;
+    loop {
+        match file.read(&mut buffer)? {
+            0 => break,
+            read => {
+                hasher.update(&buffer[..read]);
+                total += read as u64;
+            }
+        }
+    }
+    Ok((hasher.finalize(), total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ScanOptions, scan};
+    use std::fs;
+    use std::time::Duration;
+
+    fn write(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).expect("write file");
+    }
+
+    /// Content of `len` bytes that differs per `seed` — so two files are
+    /// identical only when both arguments match.
+    fn content(seed: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+    }
+
+    fn found(root: &Path, options: &DuplicateOptions) -> Duplicates {
+        let tree = scan(&ScanOptions {
+            root: root.to_path_buf(),
+            ..ScanOptions::default()
+        });
+        duplicates(&tree, options, &|_| {})
+    }
+
+    fn plain(root: &Path) -> Duplicates {
+        found(root, &DuplicateOptions::default())
+    }
+
+    /// Create a hard link, or report that this filesystem cannot — the same
+    /// degradation `dedup.rs` uses, for the same reason.
+    fn try_hard_link(original: &Path, link: &Path) -> bool {
+        match fs::hard_link(original, link) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("skipping: this filesystem has no hard links ({err})");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn identical_files_form_one_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("a.bin"), &content(1, 8192));
+        write(&root.join("b.bin"), &content(1, 8192));
+
+        let found = plain(root);
+
+        assert_eq!(found.groups.len(), 1, "{:?}", found.groups);
+        let group = &found.groups[0];
+        assert_eq!(group.keeper, root.join("a.bin"), "byte-first path stays");
+        assert_eq!(group.copies.len(), 1);
+        assert_eq!(group.copies[0].path, root.join("b.bin"));
+        assert_eq!(
+            group.reclaimable, group.copies[0].allocated,
+            "reclaimable is the sum of what goes, not of the whole group"
+        );
+        assert!(group.reclaimable > 0);
+    }
+
+    #[test]
+    fn same_size_different_content_is_not_a_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("a.bin"), &content(1, 8192));
+        write(&root.join("b.bin"), &content(2, 8192));
+
+        assert!(
+            plain(root).groups.is_empty(),
+            "same size is not same content"
+        );
+    }
+
+    /// The whole point of the second stage: the prefix hash agrees and must not
+    /// be the last word. The fixture is deliberately larger than `PREFIX`, or it
+    /// would never reach that stage and would prove nothing.
+    #[test]
+    fn a_difference_past_the_prefix_is_still_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let len = (PREFIX as usize) * 2;
+        let mut first = content(3, len);
+        let mut second = first.clone();
+        *second.last_mut().expect("non-empty") ^= 0xff;
+        first.truncate(len);
+
+        write(&root.join("a.bin"), &first);
+        write(&root.join("b.bin"), &second);
+
+        assert!(
+            plain(root).groups.is_empty(),
+            "files sharing their first 16 KiB are not duplicates"
+        );
+
+        // …and the same fixture with the tail restored *is* a group, so the
+        // assertion above cannot pass by never reaching the full hash at all.
+        write(&root.join("b.bin"), &first);
+        assert_eq!(plain(root).groups.len(), 1);
+    }
+
+    #[test]
+    fn hardlinked_names_are_not_duplicates_of_each_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("a.bin"), &content(4, 8192));
+        if !try_hard_link(&root.join("a.bin"), &root.join("b.bin")) {
+            return;
+        }
+
+        assert!(
+            plain(root).groups.is_empty(),
+            "removing one name of an inode frees nothing, so it is no candidate"
+        );
+    }
+
+    #[test]
+    fn a_separate_copy_of_a_hardlinked_file_is_a_duplicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let bytes = content(5, 8192);
+        write(&root.join("a.bin"), &bytes);
+        if !try_hard_link(&root.join("a.bin"), &root.join("b.bin")) {
+            return;
+        }
+        write(&root.join("c.bin"), &bytes); // its own inode
+
+        let found = plain(root);
+
+        assert_eq!(found.groups.len(), 1, "{:?}", found.groups);
+        let group = &found.groups[0];
+        assert_eq!(group.keeper, root.join("a.bin"));
+        assert_eq!(
+            group.copies.iter().map(|c| &c.path).collect::<Vec<_>>(),
+            vec![&root.join("c.bin")],
+            "the zeroed second name of the inode is not a copy; the separate file is"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_never_a_member() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // Two symlinks with identical targets have identical *link* contents and
+        // identical sizes — the pair a size bucket would otherwise offer up.
+        write(&root.join("target.bin"), &content(6, 8192));
+        std::os::unix::fs::symlink(root.join("target.bin"), root.join("one.link"))
+            .expect("symlink");
+        std::os::unix::fs::symlink(root.join("target.bin"), root.join("two.link"))
+            .expect("symlink");
+
+        let found = plain(root);
+
+        assert!(found.groups.is_empty(), "{:?}", found.groups);
+        assert!(
+            found.skipped.is_empty(),
+            "a symlink is not a failure, it was simply never a candidate"
+        );
+    }
+
+    #[test]
+    fn a_vanished_file_is_skipped_and_its_group_survives_without_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let bytes = content(7, 8192);
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            write(&root.join(name), &bytes);
+        }
+
+        let tree = scan(&ScanOptions {
+            root: root.to_path_buf(),
+            ..ScanOptions::default()
+        });
+        fs::remove_file(root.join("c.bin")).expect("remove");
+        let found = duplicates(&tree, &DuplicateOptions::default(), &|_| {});
+
+        assert_eq!(found.groups.len(), 1);
+        assert_eq!(found.groups[0].copies.len(), 1, "two of three remain");
+        assert_eq!(
+            found.skipped,
+            vec![SkippedEntry {
+                path: root.join("c.bin"),
+                reason: SkipReason::NotFound,
+            }]
+        );
+    }
+
+    /// A copy is never proposed against content that could not be read.
+    #[test]
+    fn a_group_that_loses_its_partner_disappears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let bytes = content(8, 8192);
+        write(&root.join("a.bin"), &bytes);
+        write(&root.join("b.bin"), &bytes);
+
+        let tree = scan(&ScanOptions {
+            root: root.to_path_buf(),
+            ..ScanOptions::default()
+        });
+        fs::remove_file(root.join("b.bin")).expect("remove");
+        let found = duplicates(&tree, &DuplicateOptions::default(), &|_| {});
+
+        assert!(found.groups.is_empty(), "{:?}", found.groups);
+        assert_eq!(found.skipped.len(), 1);
+    }
+
+    #[test]
+    fn empty_files_are_never_members() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("a.bin"), b"");
+        write(&root.join("b.bin"), b"");
+
+        assert!(
+            plain(root).groups.is_empty(),
+            "every empty file is identical to every other and removing one frees nothing"
+        );
+    }
+
+    #[test]
+    fn min_size_keeps_small_files_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("a.bin"), &content(9, 1024));
+        write(&root.join("b.bin"), &content(9, 1024));
+
+        let options = DuplicateOptions {
+            min_size: 4096,
+            ..DuplicateOptions::default()
+        };
+        assert!(found(root, &options).groups.is_empty());
+        assert_eq!(plain(root).groups.len(), 1, "and they are a group below it");
+    }
+
+    #[test]
+    fn a_claimed_subtree_is_never_looked_inside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let bytes = content(10, 8192);
+        fs::create_dir(root.join("node_modules")).expect("mkdir");
+        write(&root.join("node_modules/a.bin"), &bytes);
+        write(&root.join("node_modules/b.bin"), &bytes);
+
+        assert!(
+            plain(root).groups.is_empty(),
+            "a directory that goes wholesale is not a place to remove single files from"
+        );
+
+        // The same two files outside it are a group, so the rule above is what
+        // suppressed them rather than the fixture.
+        write(&root.join("a.bin"), &bytes);
+        write(&root.join("b.bin"), &bytes);
+        assert_eq!(plain(root).groups.len(), 1);
+    }
+
+    #[test]
+    fn groups_are_deterministic_across_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for (seed, len) in [(11u8, 4096), (12, 8192), (13, 20480)] {
+            for name in ["one", "two", "three"] {
+                write(
+                    &root.join(format!("{seed}-{name}.bin")),
+                    &content(seed, len),
+                );
+            }
+        }
+
+        let first = plain(root);
+        assert_eq!(first.groups.len(), 3);
+        assert_eq!(first.groups, plain(root).groups, "order and content both");
+    }
+
+    #[test]
+    fn groups_are_ordered_by_what_they_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("small-a.bin"), &content(14, 4096));
+        write(&root.join("small-b.bin"), &content(14, 4096));
+        write(&root.join("big-a.bin"), &content(15, 65536));
+        write(&root.join("big-b.bin"), &content(15, 65536));
+
+        let found = plain(root);
+
+        assert_eq!(found.groups.len(), 2);
+        assert!(
+            found.groups[0].reclaimable > found.groups[1].reclaimable,
+            "the biggest reclaim comes first, not the first path"
+        );
+        assert_eq!(found.groups[0].keeper, root.join("big-a.bin"));
+    }
+
+    #[test]
+    fn keep_in_beats_the_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let bytes = content(16, 8192);
+        fs::create_dir(root.join("keep")).expect("mkdir");
+        fs::create_dir(root.join("elsewhere")).expect("mkdir");
+        // "elsewhere/…" sorts first, so the default policy would keep it.
+        write(&root.join("elsewhere/a.bin"), &bytes);
+        write(&root.join("keep/z.bin"), &bytes);
+
+        assert_eq!(
+            plain(root).groups[0].keeper,
+            root.join("elsewhere/a.bin"),
+            "without a preferred root the byte-first path wins"
+        );
+
+        let options = DuplicateOptions {
+            keep_in: vec![root.join("keep")],
+            ..DuplicateOptions::default()
+        };
+        let found = found(root, &options);
+        assert_eq!(found.groups[0].keeper, root.join("keep/z.bin"));
+        assert_eq!(found.groups[0].copies[0].path, root.join("elsewhere/a.bin"));
+    }
+
+    #[test]
+    fn progress_reports_every_file_it_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("a.bin"), &content(17, 8192));
+        write(&root.join("b.bin"), &content(17, 8192));
+
+        let seen = Mutex::new(Vec::new());
+        let tree = scan(&ScanOptions {
+            root: root.to_path_buf(),
+            ..ScanOptions::default()
+        });
+        let found = duplicates(&tree, &DuplicateOptions::default(), &|hashed| {
+            seen.lock().expect("seen").push(hashed.running_total);
+        });
+
+        let seen = seen.into_inner().expect("seen");
+        assert_eq!(seen.len(), 2, "one report per file hashed");
+        assert_eq!(found.files_hashed, 2);
+        assert_eq!(found.bytes_read, 2 * 8192);
+        assert_eq!(
+            *seen.iter().max().expect("reports"),
+            found.bytes_read,
+            "the running total ends where the pass does"
+        );
+    }
+
+    /// Files no larger than the prefix are read once, not twice: the cheap hash
+    /// would read the whole file only to be superseded by the full one.
+    #[test]
+    fn small_files_skip_the_prefix_stage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let len = PREFIX as usize;
+        write(&root.join("a.bin"), &content(18, len));
+        write(&root.join("b.bin"), &content(18, len));
+
+        let found = plain(root);
+
+        assert_eq!(found.groups.len(), 1);
+        assert_eq!(found.files_hashed, 2, "two files, one read each");
+        assert_eq!(found.bytes_read, 2 * PREFIX);
+    }
+
+    // ---- the keeper rules, as a pure function -----------------------------
+
+    fn member(path: &str, modified: Option<SystemTime>) -> Member {
+        Member {
+            path: PathBuf::from(path),
+            allocated: 4096,
+            apparent: 4096,
+            modified,
+        }
+    }
+
+    fn at(secs: u64) -> Option<SystemTime> {
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    /// `choose_keeper` is documented as taking its input already sorted by path
+    /// bytes — the same order `group` puts it in.
+    fn sorted(mut members: Vec<Member>) -> Vec<Member> {
+        members.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+        members
+    }
+
+    fn keeper(members: &[Member], keep: Keep, keep_in: Vec<PathBuf>) -> &Path {
+        let options = DuplicateOptions {
+            keep,
+            keep_in,
+            ..DuplicateOptions::default()
+        };
+        &members[choose_keeper(members, &options)].path
+    }
+
+    #[test]
+    fn keep_first_takes_the_byte_first_path() {
+        let members = sorted(vec![
+            member("/z/early.bin", at(10)),
+            member("/a/late.bin", at(99)),
+        ]);
+        assert_eq!(
+            keeper(&members, Keep::First, vec![]),
+            Path::new("/a/late.bin")
+        );
+    }
+
+    #[test]
+    fn keep_shortest_breaks_ties_by_path() {
+        let members = sorted(vec![
+            member("/aaa/deep/nested.bin", None),
+            member("/b.bin", None),
+            member("/c.bin", None),
+        ]);
+        assert_eq!(
+            keeper(&members, Keep::Shortest, vec![]),
+            Path::new("/b.bin"),
+            "two equally short paths are settled by the byte-first rule"
+        );
+    }
+
+    #[test]
+    fn keep_oldest_and_newest_pick_opposite_ends() {
+        let members = sorted(vec![
+            member("/a.bin", at(300)),
+            member("/b.bin", at(100)),
+            member("/c.bin", at(200)),
+        ]);
+        assert_eq!(keeper(&members, Keep::Oldest, vec![]), Path::new("/b.bin"));
+        assert_eq!(keeper(&members, Keep::Newest, vec![]), Path::new("/a.bin"));
+    }
+
+    /// An unknown mtime is "we do not know", not "the epoch" — reading it as a
+    /// time would hand the keeper to whichever file the platform was quiet about.
+    #[test]
+    fn an_unknown_mtime_never_wins() {
+        let members = sorted(vec![member("/a.bin", None), member("/b.bin", at(500))]);
+        assert_eq!(keeper(&members, Keep::Oldest, vec![]), Path::new("/b.bin"));
+        assert_eq!(keeper(&members, Keep::Newest, vec![]), Path::new("/b.bin"));
+    }
+
+    #[test]
+    fn every_mtime_unknown_falls_back_to_the_path() {
+        let members = sorted(vec![member("/z.bin", None), member("/a.bin", None)]);
+        assert_eq!(keeper(&members, Keep::Oldest, vec![]), Path::new("/a.bin"));
+    }
+
+    #[test]
+    fn keep_in_tries_its_roots_in_order() {
+        let members = sorted(vec![
+            member("/first/a.bin", at(10)),
+            member("/second/b.bin", at(20)),
+        ]);
+        assert_eq!(
+            keeper(
+                &members,
+                Keep::Newest,
+                vec![PathBuf::from("/nowhere"), PathBuf::from("/first")],
+            ),
+            Path::new("/first/a.bin"),
+            "a root no member lies under is passed over, not fatal"
+        );
+    }
+
+    /// The policy still chooses *within* the winning root.
+    #[test]
+    fn keep_in_narrows_and_the_policy_decides() {
+        let members = sorted(vec![
+            member("/keep/a.bin", at(10)),
+            member("/keep/b.bin", at(90)),
+            member("/other/c.bin", at(99)),
+        ]);
+        assert_eq!(
+            keeper(&members, Keep::Newest, vec![PathBuf::from("/keep")]),
+            Path::new("/keep/b.bin")
+        );
+    }
+}
