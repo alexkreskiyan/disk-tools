@@ -48,8 +48,9 @@ pub fn run(root: &Path, rules: Rules, reload: Reload, now: SystemTime) -> io::Re
         // Read once per frame rather than held on the `App`: ages are relative,
         // so a browser left open overnight would otherwise still say "2m".
         let now = SystemTime::now();
-        // The list band: everything but the path, the header and the key line.
-        app.set_page((terminal.size()?.height as usize).saturating_sub(3));
+        // The list band: everything but the path, the header, the current
+        // directory and the key line.
+        app.set_page((terminal.size()?.height as usize).saturating_sub(4));
         app.absorb_sizes();
         terminal.draw(|frame| draw(frame, &app, now))?;
 
@@ -181,17 +182,23 @@ fn filtering(app: &mut App, code: KeyCode) {
     }
 }
 
-/// Four bands: where we are, the column labels, the rows, the keys.
+/// Five bands: where we are, the column labels, the current directory, the rows,
+/// the keys — plus the legend when there is something to explain.
 ///
 /// The labels are their own line — the first version of this screen carried the
 /// sort order as `[name↑]` on the path line, and it was not findable. Columns
 /// are borderless so the labels sit directly over their cells; a box would inset
 /// the rows by one and nothing would line up.
+///
+/// The current directory gets a row of its own, in the same columns, because
+/// everything on this screen was about its contents and nothing was about it.
+/// `..` is the way out of here, not a description of here.
 fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
     // The legend costs a row, so it is only there when the colours it explains
     // are. A directory no rule reaches has nothing to explain.
     let legend_rows = u16::from(app.any_rule_applies());
     let bands = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
@@ -203,11 +210,23 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
     frame.render_widget(Paragraph::new(where_we_are(app)), bands[0]);
 
     let applied = app.applied();
-    let cols = layout::columns(bands[2].width as usize);
+    let cols = layout::columns(bands[3].width as usize);
     frame.render_widget(
         Paragraph::new(layout::header(&cols, applied.order, app.reverse()))
             .style(Style::default().add_modifier(Modifier::REVERSED)),
         bands[1],
+    );
+
+    // Against its own total, so the bar reads full: this row *is* the hundred
+    // per cent the rows below it are shares of.
+    let here = app.here();
+    frame.render_widget(
+        Paragraph::new(layout::row(here, now, here.size.unwrap_or(0), &cols)).style(
+            colour(here.state)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::DIM),
+        ),
+        bands[2],
     );
 
     // The denominator for every percentage on screen: what is known right now.
@@ -220,7 +239,7 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
         .filter_map(|entry| entry.size)
         .sum();
 
-    let rows_visible = bands[2].height as usize;
+    let rows_visible = bands[3].height as usize;
     let rows: Vec<ListItem<'_>> = app
         .entries()
         .iter()
@@ -229,7 +248,7 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
         })
         .collect();
     if legend_rows > 0 {
-        frame.render_widget(Line::from(legend()), bands[3]);
+        frame.render_widget(Line::from(legend()), bands[4]);
     }
 
     let list = List::new(rows)
@@ -238,11 +257,11 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
         // last row shows only where you have been, never where you are going.
         .scroll_padding(rows_visible / 2);
     let mut state = ListState::default().with_selected(Some(app.cursor()));
-    frame.render_stateful_widget(list, bands[2], &mut state);
+    frame.render_stateful_widget(list, bands[3], &mut state);
 
     frame.render_widget(
         Paragraph::new(keys(app)).style(Style::default().add_modifier(Modifier::DIM)),
-        bands[4],
+        bands[5],
     );
 
     // Last, and over everything: a dialog that shared the screen with the
@@ -676,9 +695,12 @@ mod tests {
         let dir = fixture();
         std::fs::write(dir.path().join("sub/inner.bin"), vec![b'x'; 8192]).expect("write");
 
-        let lines = painted_settled(dir.path(), 70, 12);
+        let lines = painted_settled(dir.path(), 80, 12);
         let total: u32 = lines
             .iter()
+            // Past the path, the labels and the current directory — that last
+            // one is the hundred per cent these are shares of, not one of them.
+            .skip(3)
             .filter_map(|line| line.rsplit_once('\u{2502}'))
             // The cell is a bar and then a number, so take the digits off the
             // end rather than trying to parse past the blocks.

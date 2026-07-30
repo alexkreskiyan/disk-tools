@@ -43,6 +43,14 @@ pub struct Entry {
     /// directory and knows nothing of them.
     pub state: State,
 
+    /// What `clean` would take from here, under the rules in force.
+    ///
+    /// `None` means *not known yet*, never *nothing*: a directory whose walk has
+    /// not finished cannot say what is inside it, and printing a zero there
+    /// would read as "there is nothing to clean here" — the opposite of the
+    /// truth often enough to matter.
+    pub reclaimable: Option<u64>,
+
     /// A size is being computed for this row right now.
     ///
     /// Distinct from `size.is_none()`: a directory part-way through a walk has a
@@ -79,9 +87,10 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
                 .and_then(|metadata| allocated_size(&path, metadata).ok()),
             modified: metadata.as_ref().and_then(|m| m.modified().ok()),
             created: metadata.as_ref().and_then(|m| m.created().ok()),
-            // Both set by the browser: one directory listed on its own has no
+            // All set by the browser: one directory listed on its own has no
             // rules to consult and starts no work.
             state: State::Untracked,
+            reclaimable: None,
             measuring: false,
         });
     }

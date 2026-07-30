@@ -136,7 +136,7 @@ fn claim(node: &ScanNode, siblings: &[ScanNode], options: &DetectOptions) -> Opt
         is_dir: node.is_dir,
         modified: node.modified,
         now: options.now,
-        has_sibling: &|name| has_sibling(siblings, name),
+        any_sibling: &|wanted| any_sibling(siblings, wanted),
     };
 
     for index in options.rules.matching(&candidate, node.is_dir) {
@@ -153,10 +153,11 @@ fn claim(node: &ScanNode, siblings: &[ScanNode], options: &DetectOptions) -> Opt
     None
 }
 
-fn has_sibling(siblings: &[ScanNode], name: &str) -> bool {
+/// Is any name in this level accepted by `wanted`?
+fn any_sibling(siblings: &[ScanNode], wanted: &dyn Fn(&std::ffi::OsStr) -> bool) -> bool {
     siblings
         .iter()
-        .any(|sibling| sibling.path.file_name().is_some_and(|n| n == name))
+        .any(|sibling| sibling.path.file_name().is_some_and(wanted))
 }
 
 #[cfg(test)]
@@ -652,6 +653,49 @@ mod tests {
         assert_eq!(rules_of(&found), vec!["old"]);
     }
 
+    /// The whole point of `requires_sibling` being a glob: outside Cargo there
+    /// is no fixed name to write, and an exact comparison against `*.csproj`
+    /// silently claimed nothing.
+    #[test]
+    fn a_required_sibling_matches_by_glob() {
+        let rules = vec![Rule {
+            name: "csharp-bin".into(),
+            includes: vec!["**/bin/".into(), "**/obj/".into()],
+            requires_sibling: vec!["*.csproj".into()],
+            tier: Tier::Trash,
+            ..Rule::default()
+        }];
+
+        let found = detect(
+            &tree(dir(
+                "/p",
+                vec![
+                    dir(
+                        "/p/app",
+                        vec![
+                            file("/p/app/App.csproj"),
+                            dir("/p/app/bin", vec![]),
+                            dir("/p/app/obj", vec![]),
+                        ],
+                    ),
+                    // No project file here, so these two are ordinary
+                    // directories that happen to share a name.
+                    dir(
+                        "/p/notes",
+                        vec![file("/p/notes/README.md"), dir("/p/notes/bin", vec![])],
+                    ),
+                ],
+            )),
+            &compiled(rules, &UserDirs::default()),
+        );
+
+        let claimed: Vec<String> = found
+            .iter()
+            .map(|found| found.path.display().to_string())
+            .collect();
+        assert_eq!(claimed, ["/p/app/bin", "/p/app/obj"]);
+    }
+
     /// A rule that matches by glob but fails a later predicate must hand the node
     /// on rather than swallow it. Otherwise `rust-target`'s missing manifest
     /// would shadow every rule written beneath it.
@@ -662,7 +706,7 @@ mod tests {
                 name: "needs-marker".into(),
                 includes: vec!["**/target/".into()],
                 requires_sibling: vec!["Cargo.toml".into()],
-                tier: Tier::Auto,
+                tier: Tier::Trash,
                 ..Rule::default()
             },
             Rule {
@@ -689,7 +733,7 @@ mod tests {
                 name: "narrow".into(),
                 includes: vec!["**/node_modules/".into()],
                 excludes: vec!["**/vendor/**".into()],
-                tier: Tier::Auto,
+                tier: Tier::Trash,
                 ..Rule::default()
             },
             Rule {
@@ -726,7 +770,7 @@ mod tests {
             name: "small".into(),
             includes: vec!["**/__pycache__/".into()],
             min_size: 1_048_576,
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         }];
 
@@ -753,7 +797,7 @@ mod tests {
             name: "scoped".into(),
             root: Some("/home/me/Projects".into()),
             includes: vec!["**/node_modules/".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         }];
 

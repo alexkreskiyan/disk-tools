@@ -34,18 +34,25 @@
 //! directory — thousands a second on a warm cache — and this throttles that to
 //! something a screen can use, because the core reads no clock and should not.
 
-use disk_tools_core::{Finished, measure};
+use disk_tools_core::{Claim, Finished, Rules, measure};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How often a running total may reach the screen. Below this it is a blur, and
 /// above it the figure looks stuck.
 const TICK: Duration = Duration::from_millis(80);
+
+/// What a subtree comes to, and what of it `clean` would take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizes {
+    pub allocated: u64,
+    pub reclaimable: u64,
+}
 
 /// What one walk has to say, batched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,24 +64,41 @@ pub struct Update {
     /// Whether the walk of `root` has finished.
     pub complete: bool,
 
+    /// Which rule set this was measured against.
+    ///
+    /// Not the generation counter v0.4 removed. That one asked "is this answer
+    /// about the row I am looking at", and the answer was to key results on the
+    /// path instead. This asks "is this answer to the question I am now
+    /// asking" — and when the rules change it genuinely is not, because
+    /// `reclaimable` was worked out against rules that no longer exist.
+    pub epoch: u64,
+
     /// Directories whose subtrees are done, `root` included once it is.
     ///
     /// Every one of these is final, even if the walk is later cut short: that
     /// subtree finished, whatever happened to its neighbours.
-    pub directories: Vec<(PathBuf, u64)>,
+    pub directories: Vec<(PathBuf, Sizes)>,
 }
 
 /// What the worker and the browser share.
 struct Work {
     /// Newest first: the directory being looked at is measured before whatever
-    /// is left over from the last one.
-    queue: VecDeque<PathBuf>,
+    /// is left over from the last one. The flag says a rule already claims that
+    /// directory, so everything in it goes with it.
+    queue: VecDeque<(PathBuf, bool)>,
 
     /// Whether a worker is alive to take from the queue.
     ///
     /// Under the same lock as `queue`, so a worker deciding to stop and a
     /// request arriving cannot both conclude that the other will handle it.
     working: bool,
+
+    /// What the walk measures against, read when a job is taken rather than
+    /// when the worker started — a rule edited mid-walk applies to the next
+    /// directory rather than to the whole session.
+    rules: Arc<Rules>,
+    now: SystemTime,
+    epoch: u64,
 }
 
 /// The background sizing of the directories that have been asked about.
@@ -87,20 +111,27 @@ pub struct Sizer {
 
     /// Every total computed this session, by absolute path.
     ///
-    /// Grows with the directories visited and is never evicted: a path and a
-    /// `u64` against a walk of the subtree is not a trade worth thinking about,
+    /// Grows with the directories visited and is never evicted: a path and two
+    /// `u64`s against a walk of the subtree is not a trade worth thinking about,
     /// and a browser is closed long before the map is interesting.
-    known: HashMap<PathBuf, u64>,
+    known: HashMap<PathBuf, Sizes>,
 
     /// Figures still climbing. Shown, but never treated as totals.
+    ///
+    /// Bytes only: what a rule claims is known when the subtree it is in
+    /// finishes, and a reclaimable figure that climbed would be describing a
+    /// plan that does not exist yet.
     running: HashMap<PathBuf, u64>,
 
     /// Queued or being walked.
     pending: HashSet<PathBuf>,
+
+    /// The rule set every figure above was measured against.
+    epoch: u64,
 }
 
 impl Sizer {
-    pub fn new() -> Self {
+    pub fn new(rules: Arc<Rules>, now: SystemTime) -> Self {
         let (post, updates) = channel();
         Sizer {
             updates,
@@ -108,21 +139,52 @@ impl Sizer {
             work: Arc::new(Mutex::new(Work {
                 queue: VecDeque::new(),
                 working: false,
+                rules,
+                now,
+                epoch: 0,
             })),
             cancel: Arc::new(AtomicBool::new(false)),
             worker: None,
             known: HashMap::new(),
             running: HashMap::new(),
             pending: HashSet::new(),
+            epoch: 0,
         }
+    }
+
+    /// Measure against a different rule set from now on.
+    ///
+    /// Everything known is dropped, because every reclaimable figure in it
+    /// answers a question that is no longer being asked. The bytes would still
+    /// be true, but keeping them would mean a row showing a size from the old
+    /// rules beside a claim from the new ones, and half a repaint is worse than
+    /// a whole one.
+    pub fn retarget(&mut self, rules: Arc<Rules>) {
+        self.epoch += 1;
+        self.known.clear();
+        self.running.clear();
+        self.pending.clear();
+
+        let mut work = self.work.lock().expect("no panics under this lock");
+        work.queue.clear();
+        work.rules = rules;
+        work.epoch = self.epoch;
     }
 
     /// The best figure for `path`: its total, or how far a walk has got.
     pub fn size_of(&self, path: &Path) -> Option<u64> {
         self.known
             .get(path)
-            .or_else(|| self.running.get(path))
-            .copied()
+            .map(|sizes| sizes.allocated)
+            .or_else(|| self.running.get(path).copied())
+    }
+
+    /// What `clean` would take from `path`, once its walk has finished.
+    ///
+    /// `None` while it is still running: a claim is only known when the subtree
+    /// carrying it is done.
+    pub fn reclaimable_of(&self, path: &Path) -> Option<u64> {
+        self.known.get(path).map(|sizes| sizes.reclaimable)
     }
 
     /// Whether a walk that will produce `path` is queued or under way.
@@ -144,10 +206,10 @@ impl Sizer {
     /// for.
     ///
     /// Nothing is cancelled: a walk in flight is a walk that will be wanted.
-    pub fn request(&mut self, paths: Vec<PathBuf>) {
-        let wanted: Vec<PathBuf> = paths
+    pub fn request(&mut self, paths: Vec<(PathBuf, bool)>) {
+        let wanted: Vec<(PathBuf, bool)> = paths
             .into_iter()
-            .filter(|path| {
+            .filter(|(path, _)| {
                 !self.known.contains_key(path)
                     && !self.pending.contains(path)
                     // A walk already under way above here will measure this on
@@ -163,15 +225,16 @@ impl Sizer {
         {
             let mut work = self.work.lock().expect("no panics under this lock");
             // Reversed, so the front of the queue ends up in listing order.
-            for path in wanted.iter().rev() {
-                work.queue.push_front(path.clone());
+            for job in wanted.iter().rev() {
+                work.queue.push_front(job.clone());
             }
             if !work.working {
                 work.working = true;
                 spawn = true;
             }
         }
-        self.pending.extend(wanted);
+        self.pending
+            .extend(wanted.into_iter().map(|(path, _)| path));
 
         if spawn {
             // Any previous worker has already stopped taking from the queue, so
@@ -188,10 +251,12 @@ impl Sizer {
 
         std::thread::spawn(move || {
             loop {
-                let next = {
+                let (next, claimed, rules, now, epoch) = {
                     let mut work = work.lock().expect("no panics under this lock");
                     match work.queue.pop_front() {
-                        Some(path) if !cancel.load(Ordering::Relaxed) => path,
+                        Some((path, claimed)) if !cancel.load(Ordering::Relaxed) => {
+                            (path, claimed, Arc::clone(&work.rules), work.now, work.epoch)
+                        }
                         // Decided under the lock a request would have to take to
                         // add work, so nothing is left queued with no one to
                         // take it.
@@ -212,7 +277,13 @@ impl Sizer {
                 let measured = {
                     let report = |done: Finished<'_>| {
                         let mut batch = batch.lock().expect("no panics under this lock");
-                        batch.1.push((done.path.to_path_buf(), done.allocated));
+                        batch.1.push((
+                            done.path.to_path_buf(),
+                            Sizes {
+                                allocated: done.allocated,
+                                reclaimable: done.reclaimable,
+                            },
+                        ));
                         batch.2 = done.running_total;
 
                         if batch.0.elapsed() < TICK {
@@ -223,10 +294,16 @@ impl Sizer {
                             root: next.clone(),
                             running_total: batch.2,
                             complete: false,
+                            epoch,
                             directories: std::mem::take(&mut batch.1),
                         });
                     };
-                    measure(&next, &cancel, &report)
+                    let claim = Claim {
+                        rules: &rules,
+                        now,
+                        claimed,
+                    };
+                    measure(&next, &claim, &cancel, &report)
                 };
 
                 // Whatever the tick did not carry, plus the verdict. Sent even
@@ -238,6 +315,7 @@ impl Sizer {
                     root: next,
                     running_total: measured.allocated,
                     complete: measured.complete,
+                    epoch,
                     directories: leftover,
                 });
             }
@@ -256,12 +334,18 @@ impl Sizer {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return completed,
             };
 
+            // Measured against rules that are no longer in force, so its claim
+            // describes a plan nobody would get.
+            if update.epoch != self.epoch {
+                continue;
+            }
+
             // Each of these is a subtree that finished, whatever became of the
             // walk carrying it — so they are totals even when `complete` is not.
-            for (path, allocated) in update.directories {
+            for (path, sizes) in update.directories {
                 self.running.remove(&path);
                 self.pending.remove(&path);
-                self.known.insert(path, allocated);
+                self.known.insert(path, sizes);
                 completed = true;
             }
 
@@ -302,6 +386,21 @@ impl Drop for Sizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use disk_tools_core::{Rule, UserDirs};
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_750_000_000)
+    }
+
+    /// A sizer no rule reaches, which is what every test about bytes wants.
+    fn sizer() -> Sizer {
+        Sizer::new(Arc::new(Rules::default()), now())
+    }
+
+    /// Ask for paths nothing claims — the ordinary case.
+    fn ask(sizer: &mut Sizer, paths: &[PathBuf]) {
+        sizer.request(paths.iter().map(|path| (path.clone(), false)).collect());
+    }
 
     /// Wait until every path asked about has a total.
     ///
@@ -346,10 +445,10 @@ mod tests {
     fn a_directory_is_sized_and_then_known() {
         let dir = fixture();
         let alpha = dir.path().join("alpha");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
         assert!(sizer.size_of(&alpha).is_none());
-        sizer.request(vec![alpha.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&alpha));
         assert!(sizer.is_measuring(&alpha), "and says it is working on it");
 
         settle(&mut sizer, std::slice::from_ref(&alpha));
@@ -362,9 +461,9 @@ mod tests {
     fn every_requested_directory_is_sized() {
         let dir = fixture();
         let paths = vec![dir.path().join("alpha"), dir.path().join("beta")];
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(paths.clone());
+        ask(&mut sizer, &paths);
         settle(&mut sizer, &paths);
 
         assert!(paths.iter().all(|path| sizer.size_of(path).is_some()));
@@ -376,11 +475,11 @@ mod tests {
     fn a_walk_in_flight_survives_the_screen_moving_on() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tree = big(dir.path(), "tree");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![tree.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&tree));
         // Whatever the user does next, it is not a reason to stop.
-        sizer.request(vec![dir.path().join("elsewhere")]);
+        ask(&mut sizer, &[dir.path().join("elsewhere")]);
         settle(&mut sizer, std::slice::from_ref(&tree));
 
         assert!(sizer.size_of(&tree).is_some_and(|size| size >= 800 * 4096));
@@ -391,11 +490,11 @@ mod tests {
     fn asking_twice_walks_once() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tree = big(dir.path(), "tree");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![tree.clone()]);
-        sizer.request(vec![tree.clone()]);
-        sizer.request(vec![tree]);
+        ask(&mut sizer, std::slice::from_ref(&tree));
+        ask(&mut sizer, std::slice::from_ref(&tree));
+        ask(&mut sizer, &[tree]);
 
         let queued = sizer.work.lock().expect("lock").queue.len();
         assert!(queued <= 1, "{queued} copies queued");
@@ -406,12 +505,12 @@ mod tests {
     fn asking_for_a_known_size_starts_nothing() {
         let dir = fixture();
         let alpha = dir.path().join("alpha");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![alpha.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&alpha));
         settle(&mut sizer, std::slice::from_ref(&alpha));
 
-        sizer.request(vec![alpha.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&alpha));
 
         assert!(!sizer.is_measuring(&alpha));
         assert!(sizer.work.lock().expect("lock").queue.is_empty());
@@ -422,11 +521,11 @@ mod tests {
     fn requesting_never_waits_for_what_is_running() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tree = big(dir.path(), "tree");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![tree]);
+        ask(&mut sizer, &[tree]);
         let started = Instant::now();
-        sizer.request(vec![dir.path().join("elsewhere")]);
+        ask(&mut sizer, &[dir.path().join("elsewhere")]);
         let waited = started.elapsed();
 
         // Generous on purpose: the point is that it did not wait for a walk of
@@ -441,14 +540,14 @@ mod tests {
     fn forgetting_lets_a_directory_be_walked_again() {
         let dir = fixture();
         let alpha = dir.path().join("alpha");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![alpha.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&alpha));
         settle(&mut sizer, std::slice::from_ref(&alpha));
         sizer.forget(&alpha);
         assert!(sizer.size_of(&alpha).is_none());
 
-        sizer.request(vec![alpha.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&alpha));
         settle(&mut sizer, std::slice::from_ref(&alpha));
 
         assert!(sizer.size_of(&alpha).is_some());
@@ -461,12 +560,12 @@ mod tests {
         let dir = fixture();
         let alpha = dir.path().join("alpha");
         let beta = dir.path().join("beta");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![alpha.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&alpha));
         settle(&mut sizer, &[alpha]);
         // By now the worker has run out of work and stopped, or is about to.
-        sizer.request(vec![beta.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&beta));
         settle(&mut sizer, std::slice::from_ref(&beta));
 
         assert!(sizer.size_of(&beta).is_some());
@@ -476,9 +575,9 @@ mod tests {
     fn stopping_waits_for_the_worker() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tree = big(dir.path(), "tree");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![tree]);
+        ask(&mut sizer, &[tree]);
         sizer.stop();
 
         assert!(sizer.worker.is_none(), "waited for, and gone");
@@ -489,9 +588,9 @@ mod tests {
     fn a_cancelled_walk_never_becomes_a_total() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tree = big(dir.path(), "tree");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![tree.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&tree));
         sizer.stop();
         sizer.absorb();
 
@@ -508,12 +607,12 @@ mod tests {
     fn a_walk_already_running_above_is_not_asked_for_again() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tree = big(dir.path(), "tree");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![tree.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&tree));
         // What entering it looks like: every child asked about at once.
         let children: Vec<PathBuf> = (0..800).map(|n| tree.join(format!("sub{n}"))).collect();
-        sizer.request(children.clone());
+        ask(&mut sizer, &children);
 
         assert!(
             sizer.work.lock().expect("lock").queue.len() <= 1,
@@ -538,15 +637,121 @@ mod tests {
     fn subtrees_become_known_without_being_asked_for() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tree = big(dir.path(), "tree");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![tree.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&tree));
         settle(&mut sizer, std::slice::from_ref(&tree));
 
         assert!(
             (0..800).all(|n| sizer.size_of(&tree.join(format!("sub{n}"))).is_some()),
             "every child is known, and none of them was requested"
         );
+    }
+
+    // ---- what the rules claim --------------------------------------------
+
+    /// A sizer that claims `node_modules` wherever it finds one.
+    fn watching() -> Sizer {
+        let rules = Rules::new(
+            vec![Rule {
+                name: "node-modules".into(),
+                includes: vec!["**/node_modules/".into()],
+                ..Rule::default()
+            }],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+        Sizer::new(Arc::new(rules), now())
+    }
+
+    /// A tree with junk in it, under `alpha`.
+    fn littered() -> tempfile::TempDir {
+        let dir = fixture();
+        let modules = dir.path().join("alpha/node_modules");
+        std::fs::create_dir_all(&modules).expect("mkdir");
+        std::fs::write(modules.join("dep.bin"), vec![b'x'; 16_384]).expect("write");
+        dir
+    }
+
+    #[test]
+    fn a_walk_reports_what_the_rules_would_take_from_it() {
+        let dir = littered();
+        let alpha = dir.path().join("alpha");
+        let mut sizer = watching();
+
+        ask(&mut sizer, std::slice::from_ref(&alpha));
+        settle(&mut sizer, std::slice::from_ref(&alpha));
+
+        assert!(
+            sizer
+                .reclaimable_of(&alpha)
+                .is_some_and(|bytes| bytes >= 16_384)
+        );
+        assert!(
+            sizer.reclaimable_of(&alpha) < sizer.size_of(&alpha),
+            "the file beside the junk is not junk"
+        );
+    }
+
+    /// The browser sizing a row it has already coloured as junk. Nothing inside
+    /// a `node_modules` matches `**/node_modules/`, so without the flag this
+    /// walk would come back saying there is nothing to clean in it.
+    #[test]
+    fn a_directory_already_claimed_is_reclaimable_in_full() {
+        let dir = littered();
+        let modules = dir.path().join("alpha/node_modules");
+        let mut sizer = watching();
+
+        sizer.request(vec![(modules.clone(), true)]);
+        settle(&mut sizer, std::slice::from_ref(&modules));
+
+        assert_eq!(sizer.reclaimable_of(&modules), sizer.size_of(&modules));
+        assert!(sizer.size_of(&modules).is_some_and(|bytes| bytes >= 16_384));
+    }
+
+    /// A claim worked out against rules that have been replaced describes a plan
+    /// nobody would get, so it goes.
+    #[test]
+    fn changing_the_rules_drops_what_was_measured_against_the_old_ones() {
+        let dir = littered();
+        let alpha = dir.path().join("alpha");
+        let mut sizer = watching();
+        ask(&mut sizer, std::slice::from_ref(&alpha));
+        settle(&mut sizer, std::slice::from_ref(&alpha));
+
+        sizer.retarget(Arc::new(Rules::default()));
+
+        assert_eq!(sizer.size_of(&alpha), None);
+        assert_eq!(sizer.reclaimable_of(&alpha), None);
+
+        ask(&mut sizer, std::slice::from_ref(&alpha));
+        settle(&mut sizer, std::slice::from_ref(&alpha));
+        assert_eq!(
+            sizer.reclaimable_of(&alpha),
+            Some(0),
+            "and it is measured again, against rules that claim nothing"
+        );
+    }
+
+    /// A walk that was already running when the rules changed must not land: its
+    /// answer is to the previous question.
+    #[test]
+    fn an_answer_from_the_previous_rules_is_not_taken_in() {
+        let dir = littered();
+        let alpha = dir.path().join("alpha");
+        let mut sizer = watching();
+        ask(&mut sizer, std::slice::from_ref(&alpha));
+
+        // Whatever the worker posts is stamped with the epoch it was asked
+        // under, and this is no longer that epoch.
+        sizer.retarget(Arc::new(Rules::default()));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            sizer.absorb();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(sizer.known.is_empty(), "{:?}", sizer.known);
     }
 
     /// The walk of one directory visits everything beneath it, and says so.
@@ -556,9 +761,9 @@ mod tests {
         let alpha = dir.path().join("alpha");
         std::fs::create_dir(alpha.join("inner")).expect("mkdir");
         std::fs::write(alpha.join("inner/f.bin"), vec![b'x'; 4096]).expect("write");
-        let mut sizer = Sizer::new();
+        let mut sizer = sizer();
 
-        sizer.request(vec![alpha.clone()]);
+        ask(&mut sizer, std::slice::from_ref(&alpha));
         settle(&mut sizer, std::slice::from_ref(&alpha));
 
         assert!(

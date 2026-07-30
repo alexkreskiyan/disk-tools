@@ -26,6 +26,7 @@
 
 use crate::paths::is_within;
 use globset::{Candidate, GlobBuilder, GlobSet, GlobSetBuilder};
+use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -52,21 +53,53 @@ pub struct UserDirs {
     pub app_data: Option<PathBuf>,
 }
 
-/// How eligible a candidate is.
+/// What `clean` does with what this rule claims.
+///
+/// Three answers to **one** question, which is why they are one field. v0.5
+/// renamed them from `purge` / `auto` / `confirm`: `purge` named a destination
+/// while `auto` named a ceremony, so the contrast between the two resolved on no
+/// axis at all.
+///
+/// [`Tier::Purge`] is [`Tier::Trash`] plus "no undo" — the same claim of
+/// regenerability, made harder. As a separate `purge = true` key beside a tier
+/// it would be writable against `confirm`, a combination that has to be
+/// rejected; as a third value it cannot be written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// Lowercase, so the word in `--json` is the word in the config file. A consumer
+// reading `"Trash"` and writing `tier = "Trash"` back would find it refused.
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum Tier {
-    /// Regenerable, so removable without per-item confirmation.
-    Auto,
-    /// Needs the user to say yes to this specific path.
+    /// Deleted outright, no confirmation and no trash.
+    ///
+    /// For what a command regenerates: the trash does not free space until it
+    /// is emptied, so moving 20 GB of `node_modules` into it leaves a full disk
+    /// full and adds a second, manual step.
+    Purge,
+    /// Moved to the OS trash, without per-item confirmation.
+    Trash,
+    /// Nothing, until the user says so.
     Confirm,
+}
+
+impl Tier {
+    /// Does this need the user to agree to each path?
+    ///
+    /// The one question `--safe` and the `clean` refusal both ask, named rather
+    /// than written as `== Tier::Confirm` at each site — so that a fourth tier
+    /// could be added without hunting for the comparisons that would then be
+    /// wrong.
+    pub fn needs_confirming(self) -> bool {
+        self == Tier::Confirm
+    }
 }
 
 impl Default for Tier {
     /// **Confirm**, so a rule that forgets to say gets the cautious answer.
     ///
-    /// v0.3 lets a user mark their own rule `auto`, which is a claim the tool
-    /// cannot check. Making the *unstated* case ask is the least this can do.
+    /// v0.3 lets a user mark their own rule as needing no confirmation, which is
+    /// a claim the tool cannot check. Making the *unstated* case ask is the
+    /// least this can do.
     fn default() -> Self {
         Tier::Confirm
     }
@@ -99,11 +132,16 @@ pub struct Rule {
     /// exclusion, which v0.3 deliberately does not have.
     pub excludes: Vec<String>,
 
-    /// Names that must **all** be present beside a match.
+    /// Globs that must **each** match something beside a match.
     ///
     /// This is the whole of `rust-target`'s safety: `target/` is an ordinary
     /// directory name, and the `Cargo.toml` next to it is the only evidence that
     /// this particular one is build output.
+    ///
+    /// Matched against the sibling's **file name alone**, and globs rather than
+    /// names because most build systems do not offer a fixed one: the file that
+    /// proves a `bin/` is .NET output is `Whatever.csproj`. A pattern with no
+    /// metacharacters matches itself, so `Cargo.toml` still means `Cargo.toml`.
     pub requires_sibling: Vec<String>,
 
     /// Skip a match whose enclosing repository has uncommitted work.
@@ -197,6 +235,16 @@ pub struct Rules {
 
     excludes: GlobSet,
     exclude_owner: Vec<usize>,
+
+    /// Each rule's `requires_sibling`, compiled, positionally.
+    ///
+    /// Separate matchers rather than one [`GlobSet`], because these are `all`
+    /// and not `any`: two required siblings are two questions, and a set would
+    /// only be able to say that *something* matched.
+    ///
+    /// Nested and usually empty, which costs one `Vec` header per rule — the
+    /// rules are compiled once and there are a handful of them.
+    siblings: Vec<Vec<globset::GlobMatcher>>,
 }
 
 /// Names only — the compiled sets have no useful `Debug`, and a rule list
@@ -257,6 +305,15 @@ impl Rules {
                 compiled.exclude_owner.push(index);
             }
 
+            // No root prefix: these are matched against a bare file name, not
+            // against a path. `*` therefore cannot reach past the name either,
+            // which is what makes `*.csproj` mean "beside", not "anywhere under".
+            let mut siblings = Vec::with_capacity(rule.requires_sibling.len());
+            for pattern in &rule.requires_sibling {
+                siblings.push(compile(&rule.name, pattern, None, pattern)?.compile_matcher());
+            }
+
+            compiled.siblings.push(siblings);
             compiled.roots.push(root);
             compiled.rules.push(rule);
         }
@@ -396,18 +453,26 @@ impl Rules {
     /// whether `clean` will act on the claim, and answering it costs a git
     /// probe per repository.
     pub(crate) fn predicates_hold(&self, index: usize, facts: &Facts<'_>) -> bool {
-        let rule = &self.rules[index];
-
-        if !rule
-            .requires_sibling
+        // `all`, so two required siblings are two questions: each pattern has to
+        // find something of its own.
+        if !self.siblings[index]
             .iter()
-            .all(|name| (facts.has_sibling)(name))
+            .all(|wanted| (facts.any_sibling)(&|name| wanted.is_match(name)))
         {
             return false;
         }
-        !rule
+        !self.rules[index]
             .older_than
             .is_some_and(|older_than| !is_older(facts.modified, older_than, facts.now))
+    }
+
+    /// Does any rule in force ask about the names beside a path?
+    ///
+    /// For callers that would have to read a directory to answer — most rule
+    /// sets never ask, and a listing read to answer a question nobody posed is
+    /// a listing read for nothing.
+    pub fn wants_siblings(&self) -> bool {
+        self.siblings.iter().any(|wanted| !wanted.is_empty())
     }
 
     /// What the rules say about one path, for showing rather than for deciding.
@@ -473,8 +538,8 @@ impl Rules {
     }
 }
 
-/// What the caller already knows about a path, for the predicates that are not
-/// globs.
+/// What the caller already knows about a path, for the predicates that need
+/// more than the path itself.
 ///
 /// A borrowed closure for the siblings rather than a list: `detect` has
 /// [`ScanNode`](crate::ScanNode)s and the browser has its own rows, and neither
@@ -484,9 +549,20 @@ pub struct Facts<'a> {
     pub modified: Option<SystemTime>,
     /// Supplied by the caller — this crate reads no clock.
     pub now: SystemTime,
-    /// Is there an entry of this name beside the path?
-    pub has_sibling: &'a dyn Fn(&str) -> bool,
+
+    /// Is there an entry beside the path whose name this accepts?
+    ///
+    /// A predicate rather than a name, because `requires_sibling` is a glob and
+    /// only this crate has it compiled. The caller supplies the listing; the
+    /// rule supplies the question.
+    pub any_sibling: AnySibling<'a>,
 }
+
+/// One rule's question about one file name.
+pub type NameTest<'a> = &'a dyn Fn(&OsStr) -> bool;
+
+/// The caller's listing, asked a question it did not have to know in advance.
+pub type AnySibling<'a> = &'a dyn Fn(NameTest<'_>) -> bool;
 
 /// Has this been untouched for at least `older_than`?
 ///
@@ -568,19 +644,19 @@ pub fn builtin_rules() -> Vec<Rule> {
             // share a name with a build one.
             requires_sibling: vec!["Cargo.toml".into()],
             requires_clean_repo: true,
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
         Rule {
             name: "node-modules".into(),
             includes: vec!["**/node_modules/".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
         Rule {
             name: "pycache".into(),
             includes: vec!["**/__pycache__/".into(), "**/*.pyc".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
         // The tilde is the entire safety of this one: `~/Library/Caches` is
@@ -593,7 +669,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             name: "user-caches".into(),
             root: Some("~".into()),
             includes: vec![".cache/".into(), "Library/Caches/".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
         // Separate from `user-caches` because it has a different root, and one
@@ -603,7 +679,7 @@ pub fn builtin_rules() -> Vec<Rule> {
             name: "windows-temp".into(),
             root: Some("%LOCALAPPDATA%".into()),
             includes: vec!["Temp/".into()],
-            tier: Tier::Auto,
+            tier: Tier::Trash,
             ..Rule::default()
         },
     ]
@@ -726,7 +802,7 @@ mod tests {
                 is_dir,
                 modified: None,
                 now: now(),
-                has_sibling: &|_| false,
+                any_sibling: &|_| false,
             },
         )
     }
@@ -739,7 +815,11 @@ mod tests {
                 is_dir: true,
                 modified: None,
                 now: now(),
-                has_sibling: &|name| siblings.contains(&name),
+                any_sibling: &|wanted| {
+                    siblings
+                        .iter()
+                        .any(|name| wanted(std::ffi::OsStr::new(name)))
+                },
             },
         )
     }
@@ -1142,7 +1222,7 @@ mod tests {
         for name in ["rust-target", "node-modules", "pycache", "user-caches"] {
             assert_eq!(
                 rules.get(name).expect(name).tier,
-                Tier::Auto,
+                Tier::Trash,
                 "{name} is regenerable"
             );
         }
@@ -1518,6 +1598,117 @@ mod tests {
         );
     }
 
+    /// The defect: a `.csproj` has no fixed name, so an exact comparison made
+    /// the predicate unusable for every build system but Cargo's.
+    #[test]
+    fn a_required_sibling_is_a_glob() {
+        let rules = Rules::new(
+            vec![Rule {
+                requires_sibling: vec!["*.csproj".into()],
+                ..rooted("csharp-bin", "~/Projects", &["**/bin/", "**/obj/"])
+            }],
+            &dirs("/home/me"),
+        )
+        .expect("compiles");
+
+        assert_eq!(
+            state_beside(&rules, "/home/me/Projects/app/bin", &["App.csproj"]),
+            State::Included
+        );
+        assert_eq!(
+            state_beside(&rules, "/home/me/Projects/app/obj", &["App.csproj"]),
+            State::Included
+        );
+        assert_eq!(
+            state_beside(&rules, "/home/me/Projects/app/bin", &["README.md"]),
+            State::InScope,
+            "nothing beside it says this is build output"
+        );
+    }
+
+    /// A pattern with no metacharacters matches itself, so every rule written
+    /// before this went in still means what it meant.
+    #[test]
+    fn a_plain_name_still_means_that_name() {
+        let rules = Rules::new(
+            vec![Rule {
+                requires_sibling: vec!["Cargo.toml".into()],
+                ..rooted("rust-target", "~/Projects", &["**/target/"])
+            }],
+            &dirs("/home/me"),
+        )
+        .expect("compiles");
+        let beside =
+            |siblings: &[&str]| state_beside(&rules, "/home/me/Projects/a/target", siblings);
+
+        assert_eq!(beside(&["Cargo.toml"]), State::Included);
+        assert_eq!(
+            beside(&["NotCargo.toml"]),
+            State::InScope,
+            "a name is not a suffix"
+        );
+        assert_eq!(beside(&["Cargo.toml.bak"]), State::InScope);
+    }
+
+    /// Two required siblings are two questions. One pattern finding a match is
+    /// not the other one finding one.
+    #[test]
+    fn every_required_sibling_needs_a_match_of_its_own() {
+        let rules = Rules::new(
+            vec![Rule {
+                requires_sibling: vec!["*.csproj".into(), "*.sln".into()],
+                ..rooted("dotnet", "~/Projects", &["**/bin/"])
+            }],
+            &dirs("/home/me"),
+        )
+        .expect("compiles");
+        let beside = |siblings: &[&str]| state_beside(&rules, "/home/me/Projects/a/bin", siblings);
+
+        assert_eq!(beside(&["App.csproj", "App.sln"]), State::Included);
+        assert_eq!(beside(&["App.csproj"]), State::InScope);
+        assert_eq!(
+            beside(&["App.sln", "Other.sln"]),
+            State::InScope,
+            "two matches for one pattern is still one pattern answered"
+        );
+    }
+
+    /// The user's own text, so a broken one is reported rather than dropped —
+    /// the same treatment `includes` and `excludes` get.
+    #[test]
+    fn a_malformed_required_sibling_names_the_rule_and_the_pattern() {
+        let err = Rules::new(
+            vec![Rule {
+                requires_sibling: vec!["*.[cs".into()],
+                ..rule("broken", &["**/bin/"])
+            }],
+            &UserDirs::default(),
+        )
+        .expect_err("an unclosed class must not compile");
+
+        assert_eq!(err.rule, "broken");
+        assert_eq!(err.pattern, "*.[cs");
+    }
+
+    /// For callers that would have to read a directory to answer.
+    #[test]
+    fn a_rule_set_says_whether_anything_asks_about_siblings() {
+        let asking = Rules::new(
+            vec![Rule {
+                requires_sibling: vec!["*.csproj".into()],
+                ..rule("dotnet", &["**/bin/"])
+            }],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+        let quiet =
+            Rules::new(vec![rule("any", &["**/bin/"])], &UserDirs::default()).expect("compiles");
+
+        assert!(asking.wants_siblings());
+        assert!(!quiet.wants_siblings());
+        assert!(!Rules::default().wants_siblings());
+    }
+
     /// An age threshold is the other predicate, and it reads the entry's own
     /// mtime rather than the clock.
     #[test]
@@ -1539,7 +1730,7 @@ mod tests {
                     is_dir: false,
                     modified: Some(modified),
                     now: now(),
-                    has_sibling: &|_| false,
+                    any_sibling: &|_| false,
                 },
             )
         };

@@ -10,19 +10,17 @@ mod env;
 mod render;
 mod ui;
 
-use args::{Args, Environment, Mode, validate_root};
+use args::{Args, Cleanup, Environment, Intent, Mode, Report, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOptions, CleanOutcome, CleanPlan, Removal, ScanOptions, ScanTree, SkippedEntry, Tier,
-    apply, plan, scan,
+    CleanOutcome, CleanPlan, ScanOptions, ScanTree, SkippedEntry, apply, plan, scan,
 };
 use indicatif::ProgressBar;
-use render::clean::{Intent, render_clean, render_outcome};
-use render::json::render_json;
+use render::clean::{render_clean, render_outcome};
+use render::json::{render_json, render_outcome_json, render_plan};
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
@@ -77,24 +75,7 @@ fn main() -> ExitCode {
             number,
             json,
         } => run_scan(options, number, json, verbose),
-        Mode::Clean {
-            roots,
-            confirm_tier_allowed,
-            roots_from_rules,
-            clean,
-            apply,
-            removal,
-        } => run_clean(
-            &roots,
-            roots_from_rules,
-            *clean,
-            Removing {
-                apply,
-                removal,
-                confirm_tier_allowed,
-            },
-            verbose,
-        ),
+        Mode::Clean(cleanup) => run_clean(*cleanup, verbose),
         Mode::ConfigInit { target, force } => run_config_init(&target, force),
         Mode::Ui {
             root,
@@ -176,37 +157,19 @@ fn run_scan(options: ScanOptions, number: Option<usize>, json: bool, verbose: bo
     emit(&report, &tree.skipped, verbose)
 }
 
-/// What `--apply` was asked to do, and how far it is allowed to go.
-///
-/// Three booleans that only mean anything together: applying at all, whether the
-/// trash is bypassed, and whether the non-regenerable candidates may go. Passed
-/// as one value so no caller can supply two of the three.
-struct Removing {
-    apply: bool,
-    removal: Removal,
-    confirm_tier_allowed: bool,
-}
+fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
+    // Borrowed apart for readability, not to change anything: `cleanup` itself
+    // travels on to `remove`, which needs the two fields not named here.
+    let Cleanup {
+        roots,
+        roots_from_rules,
+        options,
+        intent,
+        report,
+        ..
+    } = &cleanup;
+    let (roots_from_rules, intent, report) = (*roots_from_rules, *intent, *report);
 
-impl Removing {
-    /// May the outcome describe what it removed as still retrievable?
-    ///
-    /// Only the trash makes that true. Named rather than written inline as
-    /// `!= Removal::Purge` because it guards the one sentence a user reads to
-    /// find out whether their data still exists — and because inline it was
-    /// untestable: that sentence prints only after a partial failure, which
-    /// cannot be provoked against the macOS trash.
-    fn recoverable(&self) -> bool {
-        self.removal == Removal::Trash
-    }
-}
-
-fn run_clean(
-    roots: &[PathBuf],
-    roots_from_rules: bool,
-    clean: CleanOptions,
-    removing: Removing,
-    verbose: bool,
-) -> ExitCode {
     if roots.is_empty() {
         // Not an error and not an empty plan. "Nothing to clean" would be a
         // claim about the disk; this is a statement about the configuration, and
@@ -221,8 +184,8 @@ fn run_clean(
     if roots_from_rules {
         // Announced only when the rules chose them. The default config roots
         // `user-caches` at the home directory, so a bare `disk-tools clean`
-        // walks all of it — slow rather than dangerous, the default still being
-        // a dry run, but no one should have to guess why it is taking a minute.
+        // walks all of it, and no one should have to guess why it is taking a
+        // minute — least of all now that the walk ends in a removal.
         let listed: Vec<String> = roots
             .iter()
             .map(|root| root.display().to_string())
@@ -245,8 +208,17 @@ fn run_clean(
     // projects spends real time after the walk finishes.
     let mut plans = Vec::with_capacity(roots.len());
     let mut skipped = Vec::new();
+    // Kept **only** when the report will unfold inside a candidate. A tree costs
+    // ~630 bytes per entry — 1.4 GB for a home directory — and holding every
+    // root's through the removal to satisfy a display flag nobody passed would
+    // be exactly the cost the lazy browser was built to avoid. Below `-d 2` the
+    // trees are dropped as they are planned, as before.
+    let unfolding = report.depth >= 2;
+    let mut trees = Vec::new();
     for root in roots {
-        let options = ScanOptions {
+        // Named apart from the cleanup's own `options`, which is the
+        // `CleanOptions` this walk is about to be planned against.
+        let walk = ScanOptions {
             root: root.clone(),
             ..ScanOptions::default()
         };
@@ -254,15 +226,18 @@ fn run_clean(
         // this function is reached; a root that came from a rule is a
         // description that may have gone stale, and one missing directory is no
         // reason to leave the others uncleaned. `scan` reports it as a skip.
-        let tree = scan_with_spinner(&options, "Scanning…");
-        plans.push(plan(&tree, &clean));
-        skipped.extend(tree.skipped);
+        let mut tree = scan_with_spinner(&walk, "Scanning…");
+        plans.push(plan(&tree, options));
+        skipped.extend(std::mem::take(&mut tree.skipped));
+        if unfolding {
+            trees.push(tree);
+        }
     }
 
     let planned = CleanPlan::merge(plans);
 
-    if removing.apply {
-        return remove(&planned, &removing, &skipped, verbose);
+    if intent == Intent::Removing {
+        return remove(&planned, &cleanup, &trees, &skipped, verbose);
     }
 
     // The count of what `--safe` hid comes back with the plan. It used to come
@@ -270,13 +245,44 @@ fn run_clean(
     // of the git guard — measured at ~23 ms per repository, so `--safe` was the
     // slowest mode of the three despite being the cautious one. It also meant
     // subtracting two independently-measured numbers, which could disagree.
-    let hidden = clean.safe_only.then_some(planned.filtered_out);
+    let hidden = options.safe_only.then_some(planned.filtered_out);
 
+    if report.json {
+        // `hidden` is a sentence for a human about a flag they passed. A
+        // consumer knows what it passed, and can count the plan.
+        return match render_plan(&planned) {
+            Ok(payload) => emit(&(payload + "\n"), &skipped, verbose),
+            Err(err) => json_failed(err),
+        };
+    }
     emit(
-        &render_clean(&planned, hidden, Intent::DryRun),
+        &render_clean(&planned, hidden, Intent::Preview, report, &trees),
         &skipped,
         verbose,
     )
+}
+
+/// The plan, in whichever shape was asked for.
+fn render(
+    planned: &CleanPlan,
+    report: Report,
+    intent: Intent,
+    inside: &[ScanTree],
+) -> serde_json::Result<String> {
+    if report.json {
+        return render_plan(planned).map(|payload| payload + "\n");
+    }
+    Ok(render_clean(planned, None, intent, report, inside))
+}
+
+/// A path that is not UTF-8 cannot be a JSON string.
+///
+/// An error and a non-zero exit rather than a document with a path silently
+/// missing from it — this output exists to be acted on by something that cannot
+/// notice the gap.
+fn json_failed(err: serde_json::Error) -> ExitCode {
+    eprintln!("disk-tools: cannot encode JSON: {err}");
+    ExitCode::FAILURE
 }
 
 /// The one path in this program that deletes anything.
@@ -286,22 +292,26 @@ fn run_clean(
 /// a dry run would have given them.
 fn remove(
     planned: &CleanPlan,
-    removing: &Removing,
+    cleanup: &Cleanup,
+    inside: &[ScanTree],
     skipped: &[SkippedEntry],
     verbose: bool,
 ) -> ExitCode {
+    let report = cleanup.report;
     if planned.candidates.is_empty() {
-        return emit(
-            &render_clean(planned, None, Intent::DryRun),
-            skipped,
-            verbose,
-        );
+        // Nothing to remove, so this is the same "Nothing to clean." a preview
+        // prints — and it goes through `render` so that `--json` gets a
+        // document rather than a sentence.
+        return match render(planned, report, Intent::Preview, inside) {
+            Ok(shown) => emit(&shown, skipped, verbose),
+            Err(err) => json_failed(err),
+        };
     }
 
     let confirm = planned
         .candidates
         .iter()
-        .filter(|c| c.tier == Tier::Confirm)
+        .filter(|c| c.tier.needs_confirming())
         .count();
 
     // Decided **before** anything is printed. The plan below goes out with an
@@ -312,12 +322,14 @@ fn remove(
     //
     // `--safe` needs no case of its own: it keeps confirm-tier candidates out of
     // the plan, so the count is zero and there is nothing to refuse.
-    if confirm > 0 && !removing.confirm_tier_allowed {
-        let code = emit(
-            &render_clean(planned, None, Intent::DryRun),
-            skipped,
-            verbose,
-        );
+    if confirm > 0 && !cleanup.confirm_tier_allowed {
+        // Nothing happened, so what there is to report is the plan — the same
+        // document `preview` would have produced. A consumer tells the two
+        // apart by the exit code, which is the thing it has to read anyway.
+        let code = match render(planned, report, Intent::Preview, inside) {
+            Ok(shown) => emit(&shown, skipped, verbose),
+            Err(err) => return json_failed(err),
+        };
         let (noun, verb) = if confirm == 1 {
             ("candidate", "is")
         } else {
@@ -336,20 +348,37 @@ fn remove(
         };
     }
 
-    // To stderr: this is context for the operation, not the report. It also
-    // keeps stdout to the outcome alone for anything reading it.
-    eprint!("{}", render_clean(planned, None, Intent::AboutToApply));
+    // To stderr: this is context for the operation, not the report, and it stays
+    // text even under `--json` — stdout is reserved for the one document, and a
+    // second JSON value on the way to it would make the stream unparseable.
+    eprint!(
+        "{}",
+        render_clean(planned, None, Intent::Removing, report, inside)
+    );
     if confirm > 0 {
         // Reached only with `--yes`, or with `require-confirmation` turned off.
         // Saying the number out loud is what keeps either from being a blind yes.
-        eprintln!("{confirm} of these are not regenerable — removing anyway, as asked.");
+        // The verb agrees with the count, as everywhere else in this report:
+        // "1 of these are" is the kind of slip that makes a reader doubt the
+        // number beside it, and this one is counting deletions.
+        let verb = if confirm == 1 { "is" } else { "are" };
+        eprintln!("{confirm} of these {verb} not regenerable — removing anyway, as asked.");
     }
 
-    if removing.removal == Removal::Purge {
-        // The last word before something becomes unrecoverable. `--purge` is a
-        // deliberate reversal of this tool's central promise, so it is said
-        // plainly rather than assumed understood.
-        eprintln!("Deleting outright — these will NOT go to the trash and cannot be put back.");
+    // The last word before something becomes unrecoverable, and counted from
+    // the plan rather than from a flag: after v0.5 a rule can carry `purge` on
+    // its own, so a run that destroys things need never have been asked to.
+    let destroying = planned.candidates.iter().filter(|c| c.purge).count();
+    if destroying > 0 {
+        let (noun, verb) = if destroying == 1 {
+            ("candidate", "is")
+        } else {
+            ("candidates", "are")
+        };
+        eprintln!(
+            "{destroying} {noun} {verb} being deleted outright — NOT to the trash, \
+             and cannot be put back."
+        );
     }
 
     // A spinner, not a bar. Trashing is **one** batched call: a bar would fill
@@ -360,18 +389,18 @@ fn remove(
     let spinner = ProgressBar::new_spinner();
     spinner.set_message(format!("Removing {} items…", planned.candidates.len()));
     spinner.enable_steady_tick(Duration::from_millis(100));
-    let outcome = apply(planned, removing.removal, |_| {});
+    let outcome = apply(planned, |_| {});
     spinner.finish_and_clear();
 
-    let code = emit(
-        &render_outcome(
-            &outcome,
-            shared_was_removed(planned, &outcome),
-            removing.recoverable(),
-        ),
-        skipped,
-        verbose,
-    );
+    let shown = if report.json {
+        match render_outcome_json(&outcome) {
+            Ok(payload) => payload + "\n",
+            Err(err) => return json_failed(err),
+        }
+    } else {
+        render_outcome(&outcome, shared_was_removed(planned, &outcome))
+    };
+    let code = emit(&shown, skipped, verbose);
     if !outcome.is_complete() {
         // A partial removal is not a success, whatever else went right.
         return ExitCode::FAILURE;
@@ -445,7 +474,7 @@ fn shared_was_removed(planned: &CleanPlan, outcome: &CleanOutcome) -> bool {
     planned
         .candidates
         .iter()
-        .any(|candidate| candidate.shared && outcome.removed.contains(&candidate.path))
+        .any(|candidate| candidate.shared && outcome.removed().any(|gone| *gone == candidate.path))
 }
 
 /// Write the finished report to stdout in one buffered pass.
@@ -471,13 +500,15 @@ fn terminal_width() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_tools_core::{Candidate, TrashFailure};
+    use disk_tools_core::{Candidate, Reclaimed, Tier, TrashFailure};
+    use std::path::PathBuf;
 
     fn candidate(path: &str, shared: bool) -> Candidate {
         Candidate {
             path: PathBuf::from(path),
             rule: "node-modules".into(),
-            tier: Tier::Auto,
+            tier: Tier::Trash,
+            purge: false,
             allocated: 4096,
             shared,
         }
@@ -493,7 +524,11 @@ mod tests {
 
     fn outcome(removed: &[&str], failed: &[&str]) -> CleanOutcome {
         CleanOutcome {
-            removed: removed.iter().map(PathBuf::from).collect(),
+            trashed: Reclaimed {
+                paths: removed.iter().map(PathBuf::from).collect(),
+                bytes: 0,
+            },
+            purged: Reclaimed::default(),
             failed: failed
                 .iter()
                 .map(|path| TrashFailure {
@@ -501,7 +536,6 @@ mod tests {
                     reason: "denied".into(),
                 })
                 .collect(),
-            reclaimed: 0,
         }
     }
 
@@ -558,30 +592,5 @@ mod tests {
             &CleanPlan::default(),
             &outcome(&[], &[])
         ));
-    }
-}
-
-#[cfg(test)]
-mod removing_tests {
-    use super::*;
-
-    /// The one sentence a user reads to find out whether their data still
-    /// exists. Inline as `removal == Removal::Purge` it was untestable — the
-    /// line prints only after a partial failure, which cannot be provoked
-    /// against the macOS trash — and mutation testing showed nothing caught it
-    /// being inverted.
-    #[test]
-    fn only_the_trash_is_recoverable() {
-        let removing = |removal| Removing {
-            apply: true,
-            removal,
-            confirm_tier_allowed: false,
-        };
-
-        assert!(removing(Removal::Trash).recoverable());
-        assert!(
-            !removing(Removal::Purge).recoverable(),
-            "there is nothing in the trash to put back"
-        );
     }
 }

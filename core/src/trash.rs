@@ -58,23 +58,37 @@ pub fn move_to_trash(path: &Path) -> Result<(), TrashFailure> {
     })
 }
 
+/// What went, one way or the other.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Reclaimed {
+    pub paths: Vec<PathBuf>,
+    /// Bytes freed by [`Self::paths`] — what really went, never what was hoped
+    /// for. A partial run reports the smaller, true number.
+    pub bytes: u64,
+}
+
 /// What a cleanup actually did.
 ///
 /// Not a `Result`, on purpose (D5). A run that removed four of five things
 /// succeeded four times and failed once, and collapsing that into one verdict
 /// would lose the only detail the user needs: **which** one is still there.
+///
+/// **Two halves, never added up here.** One run can trash some candidates and
+/// destroy others, and a single "freed" figure over the two would not say what
+/// can be brought back — which is the one thing a reader wants from it. Summing
+/// them is a decision, so it belongs to whoever is printing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CleanOutcome {
-    /// Paths now in the trash.
-    pub removed: Vec<PathBuf>,
+    /// Now in the OS trash, and retrievable from it.
+    pub trashed: Reclaimed,
+
+    /// Deleted outright. Nothing to put back.
+    pub purged: Reclaimed,
 
     /// Paths still where they were, each with what the OS said.
     pub failed: Vec<TrashFailure>,
-
-    /// Bytes freed by [`Self::removed`] — what really went, never what was
-    /// hoped for. A partial run reports the smaller, true number.
-    pub reclaimed: u64,
 }
 
 impl CleanOutcome {
@@ -82,37 +96,49 @@ impl CleanOutcome {
     pub fn is_complete(&self) -> bool {
         self.failed.is_empty()
     }
+
+    /// Every path that went, whichever way it went.
+    pub fn removed(&self) -> impl Iterator<Item = &PathBuf> {
+        self.trashed.paths.iter().chain(&self.purged.paths)
+    }
+
+    /// How many.
+    pub fn count(&self) -> usize {
+        self.trashed.paths.len() + self.purged.paths.len()
+    }
+
+    /// The two halves added up, for a caller that has decided the distinction
+    /// does not matter to what it is saying.
+    pub fn reclaimed(&self) -> u64 {
+        self.trashed.bytes + self.purged.bytes
+    }
 }
 
-/// How thoroughly to remove.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Removal {
-    /// To the OS trash, recoverable. The default, and what every other document
-    /// here describes.
-    #[default]
-    Trash,
-
-    /// Deleted outright. **Nothing to put back.**
-    ///
-    /// This exists because the trash is not free: on macOS it is an `osascript`
-    /// round-trip to Finder, measured at ~230 ms *per call*, which a tree of
-    /// many small `__pycache__` directories turns into minutes. Batching fixed
-    /// most of that; this is for the case where even a recoverable delete is
-    /// more ceremony than the content deserves.
-    ///
-    /// It is a deliberate reversal of the project's founding rule and the
-    /// frontend is expected to say so plainly — see `--purge`.
-    Purge,
-}
-
-/// Move every candidate in `plan` to the trash, or delete it outright.
+/// Remove every candidate in `plan`, each the way the plan says.
 ///
 /// **The only function in this project that removes anything.**
-pub fn apply(plan: &CleanPlan, removal: Removal, progress: impl FnMut(&Candidate)) -> CleanOutcome {
-    match removal {
-        Removal::Trash => apply_batched(plan, progress),
-        Removal::Purge => apply_with(plan, progress, purge),
-    }
+///
+/// It takes no `Removal`: where a candidate goes was decided by [`crate::plan`]
+/// from its rule's tier and `--purge` together, and is written on the candidate.
+/// That is what lets `preview` print exactly what this will do rather than a
+/// description of it kept in step by hand.
+///
+/// Trashing is batched — on macOS each backend call is an `osascript`
+/// round-trip to Finder, ~230 ms whatever the size — so the two groups are
+/// partitioned once and each removed its own way.
+pub fn apply(plan: &CleanPlan, mut progress: impl FnMut(&Candidate)) -> CleanOutcome {
+    let (purging, trashing): (Vec<&Candidate>, Vec<&Candidate>) = plan
+        .candidates
+        .iter()
+        .partition(|candidate| candidate.purge);
+
+    let mut outcome = CleanOutcome::default();
+    // Trashed first, so that the `already_gone` check below sees them. Nothing
+    // in a plan nests, but `apply` is public over public fields and this is the
+    // function that destroys things, so it checks rather than trusts.
+    trash_all(&trashing, &mut outcome, &mut progress);
+    purge_all(&purging, &mut outcome, &mut progress, purge);
+    outcome
 }
 
 /// Trash everything in one call, and only fall back to one-at-a-time to find out
@@ -128,31 +154,33 @@ pub fn apply(plan: &CleanPlan, removal: Removal, progress: impl FnMut(&Candidate
 /// [`CleanOutcome`]'s promise to name what survived. So the batch is the fast
 /// path and the per-item loop is the diagnostic one: it runs only when something
 /// went wrong, when being slow no longer matters and being precise does.
-fn apply_batched(plan: &CleanPlan, mut progress: impl FnMut(&Candidate)) -> CleanOutcome {
+fn trash_all(
+    candidates: &[&Candidate],
+    outcome: &mut CleanOutcome,
+    mut progress: impl FnMut(&Candidate),
+) {
     let mut attempting: Vec<&Candidate> = Vec::new();
-    for candidate in &plan.candidates {
+    for candidate in candidates {
         progress(candidate);
-        // Defensive, as in `apply_with`: a candidate inside one already accepted
+        // Defensive, as in `purge_all`: a candidate inside one already accepted
         // would go with its parent, and submitting both invites the backend to
         // report a failure for something that is in fact gone.
         let accepted: Vec<PathBuf> = attempting.iter().map(|c| c.path.clone()).collect();
-        if already_gone(&candidate.path, &accepted) {
+        if already_gone(&candidate.path, accepted.iter()) {
             continue;
         }
         attempting.push(candidate);
     }
 
     if attempting.is_empty() {
-        return CleanOutcome::default();
+        return;
     }
 
     let paths: Vec<&Path> = attempting.iter().map(|c| c.path.as_path()).collect();
     if trash::delete_all(&paths).is_ok() {
-        return CleanOutcome {
-            removed: attempting.iter().map(|c| c.path.clone()).collect(),
-            failed: Vec::new(),
-            reclaimed: attempting.iter().map(|c| c.allocated).sum(),
-        };
+        outcome.trashed.paths = attempting.iter().map(|c| c.path.clone()).collect();
+        outcome.trashed.bytes = attempting.iter().map(|c| c.allocated).sum();
+        return;
     }
 
     // Something in the batch failed and the backend will not say what. Ask again,
@@ -160,17 +188,15 @@ fn apply_batched(plan: &CleanPlan, mut progress: impl FnMut(&Candidate)) -> Clea
     // removed now answers "not found", which is a failure this loop records —
     // pessimistic, and the safe direction: it claims less was removed than may
     // have been, never more.
-    let mut outcome = CleanOutcome::default();
     for candidate in attempting {
         match move_to_trash(&candidate.path) {
             Ok(()) => {
-                outcome.removed.push(candidate.path.clone());
-                outcome.reclaimed += candidate.allocated;
+                outcome.trashed.paths.push(candidate.path.clone());
+                outcome.trashed.bytes += candidate.allocated;
             }
             Err(failure) => outcome.failed.push(failure),
         }
     }
-    outcome
 }
 
 /// Delete `path` outright, with no trash and no way back.
@@ -195,57 +221,71 @@ fn purge(path: &Path) -> Result<(), TrashFailure> {
     })
 }
 
-/// The body of [`apply`], with the removal itself as a parameter.
+/// One at a time, since there is no batch call to delete outright.
 ///
-/// The seam exists because the success arm — what lands in `removed`, and what
-/// is added to `reclaimed` — is otherwise reachable only by really trashing
-/// something, which every test here is `#[ignore]`d to avoid. That left the
-/// arithmetic of "how much did we free" verified solely by a test nobody runs by
-/// default. Passing the mover in lets it be checked without a backend, the same
-/// move `git::interpret` and `env::as_path` already make.
-fn apply_with(
-    plan: &CleanPlan,
+/// `mover` is a parameter because the success arm — what lands in `purged` and
+/// what is added to its byte count — is otherwise reachable only by really
+/// destroying something, which every test here is `#[ignore]`d to avoid. That
+/// left the arithmetic of "how much did we free" verified solely by a test
+/// nobody runs by default. Passing the mover in lets it be checked without a
+/// filesystem, the same move `git::interpret` and `env::as_path` already make.
+fn purge_all(
+    candidates: &[&Candidate],
+    outcome: &mut CleanOutcome,
     mut progress: impl FnMut(&Candidate),
     mut mover: impl FnMut(&Path) -> Result<(), TrashFailure>,
-) -> CleanOutcome {
-    let mut outcome = CleanOutcome::default();
-
-    for candidate in &plan.candidates {
+) {
+    for candidate in candidates {
         progress(candidate);
 
-        if already_gone(&candidate.path, &outcome.removed) {
+        if already_gone(&candidate.path, outcome.removed()) {
             continue;
         }
 
         match mover(&candidate.path) {
             Ok(()) => {
-                outcome.removed.push(candidate.path.clone());
-                outcome.reclaimed += candidate.allocated;
+                outcome.purged.paths.push(candidate.path.clone());
+                outcome.purged.bytes += candidate.allocated;
             }
             Err(failure) => outcome.failed.push(failure),
         }
     }
-
-    outcome
 }
 
 /// Did `path` already go with something removed before it?
 ///
-/// A candidate inside one already trashed is gone with its parent. Attempting it
+/// A candidate inside one already removed is gone with its parent. Attempting it
 /// again would fail with "not found" and be reported as **still on disk** — the
-/// report telling a user their data survived when it is in fact in the trash.
+/// report telling a user their data survived when it is in fact gone.
 ///
 /// `plan()` never builds such a pair: `detect` does not descend into a match, so
 /// no candidate contains another. But `apply` is public over a struct whose
 /// fields are all public, and it is the one function here that destroys
 /// anything, so it checks rather than trusts.
-fn already_gone(path: &Path, removed: &[PathBuf]) -> bool {
-    removed.iter().any(|gone| is_within(path, gone))
+fn already_gone<'a>(path: &Path, removed: impl Iterator<Item = &'a PathBuf>) -> bool {
+    removed.into_iter().any(|gone| is_within(path, gone))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `purge_all` over a whole plan, which is the shape the removal seam had
+    /// before the two destinations were split apart. The point of the seam is
+    /// unchanged: the success arm — what lands in the outcome, and what is added
+    /// to its byte count — is otherwise reachable only by really destroying
+    /// something.
+    fn purging(
+        plan: &CleanPlan,
+        progress: impl FnMut(&Candidate),
+        mover: impl FnMut(&Path) -> Result<(), TrashFailure>,
+    ) -> CleanOutcome {
+        let candidates: Vec<&Candidate> = plan.candidates.iter().collect();
+        let mut outcome = CleanOutcome::default();
+        purge_all(&candidates, &mut outcome, progress, mover);
+        outcome
+    }
+
     use std::path::Path;
     use std::time::Instant;
 
@@ -275,9 +315,20 @@ mod tests {
         Candidate {
             path: PathBuf::from(path),
             rule: "node-modules".into(),
-            tier: crate::Tier::Auto,
+            tier: crate::Tier::Trash,
+            purge: false,
             allocated,
             shared: false,
+        }
+    }
+
+    /// The same, but destined for outright deletion — which is what the tests
+    /// that really remove files use, since nothing may reach the trash.
+    fn doomed(path: &str, allocated: u64) -> Candidate {
+        Candidate {
+            tier: crate::Tier::Purge,
+            purge: true,
+            ..candidate(path, allocated)
         }
     }
 
@@ -297,8 +348,8 @@ mod tests {
     /// without a trash backend and without removing anything.
     fn doomed_plan(dir: &Path) -> CleanPlan {
         plan_of(vec![
-            candidate(dir.join("gone-one").to_str().expect("utf8"), 1024),
-            candidate(dir.join("gone-two").to_str().expect("utf8"), 2048),
+            doomed(dir.join("gone-one").to_str().expect("utf8"), 1024),
+            doomed(dir.join("gone-two").to_str().expect("utf8"), 2048),
         ])
     }
 
@@ -313,7 +364,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let plan = doomed_plan(dir.path());
 
-        let outcome = apply(&plan, Removal::Trash, |_| {});
+        let outcome = apply(&plan, |_| {});
 
         assert_eq!(
             outcome.failed.len(),
@@ -321,7 +372,7 @@ mod tests {
             "both failures must be reported, not just the first: {:?}",
             outcome.failed
         );
-        assert!(outcome.removed.is_empty());
+        assert_eq!(outcome.count(), 0);
         assert!(!outcome.is_complete(), "a failed run is not complete");
     }
 
@@ -332,7 +383,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let plan = doomed_plan(dir.path());
 
-        let outcome = apply(&plan, Removal::Trash, |_| {});
+        let outcome = apply(&plan, |_| {});
 
         let named: Vec<&PathBuf> = outcome.failed.iter().map(|f| &f.path).collect();
         assert_eq!(
@@ -356,10 +407,11 @@ mod tests {
         let plan = doomed_plan(dir.path());
         assert_eq!(plan.reclaimable, 3072, "the plan expected to free 3 KiB");
 
-        let outcome = apply(&plan, Removal::Trash, |_| {});
+        let outcome = apply(&plan, |_| {});
 
         assert_eq!(
-            outcome.reclaimed, 0,
+            outcome.reclaimed(),
+            0,
             "a run that removed nothing freed nothing"
         );
     }
@@ -373,9 +425,7 @@ mod tests {
         let plan = doomed_plan(dir.path());
         let mut seen = Vec::new();
 
-        apply(&plan, Removal::Trash, |candidate| {
-            seen.push(candidate.path.clone())
-        });
+        apply(&plan, |candidate| seen.push(candidate.path.clone()));
 
         assert_eq!(
             seen,
@@ -401,14 +451,14 @@ mod tests {
     fn a_successful_run_records_what_went_and_what_it_freed() {
         let plan = plan_of(vec![candidate("/p/a", 1024), candidate("/p/b", 2048)]);
 
-        let outcome = apply_with(&plan, |_| {}, always_works);
+        let outcome = purging(&plan, |_| {}, always_works);
 
         assert_eq!(
-            outcome.removed,
+            outcome.purged.paths,
             vec![PathBuf::from("/p/a"), PathBuf::from("/p/b")]
         );
         assert!(outcome.failed.is_empty());
-        assert_eq!(outcome.reclaimed, 3072, "the sum of what moved");
+        assert_eq!(outcome.purged.bytes, 3072, "the sum of what moved");
         assert!(outcome.is_complete());
     }
 
@@ -422,7 +472,7 @@ mod tests {
             candidate("/p/also-ok", 2048),
         ]);
 
-        let outcome = apply_with(
+        let outcome = purging(
             &plan,
             |_| {},
             |path| {
@@ -438,19 +488,19 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.removed,
+            outcome.purged.paths,
             vec![PathBuf::from("/p/ok"), PathBuf::from("/p/also-ok")],
             "the failure did not stop the one after it"
         );
         assert_eq!(outcome.failed.len(), 1);
         assert_eq!(
-            outcome.reclaimed, 3072,
+            outcome.purged.bytes, 3072,
             "the 8 KiB that stayed put is not counted as freed"
         );
         assert!(!outcome.is_complete());
     }
 
-    /// The guard, exercised through `apply_with` rather than by trashing a real
+    /// The guard, exercised through `purge_all` rather than by trashing a real
     /// directory: the child must be skipped once its parent has gone, and must
     /// not surface as a failure.
     #[test]
@@ -461,7 +511,7 @@ mod tests {
         ]);
         let mut attempted = 0;
 
-        let outcome = apply_with(
+        let outcome = purging(
             &plan,
             |_| {},
             |path| {
@@ -476,13 +526,13 @@ mod tests {
         );
 
         assert_eq!(attempted, 1, "only the parent was attempted");
-        assert_eq!(outcome.removed, vec![PathBuf::from("/p/outer")]);
+        assert_eq!(outcome.purged.paths, vec![PathBuf::from("/p/outer")]);
         assert!(
             outcome.failed.is_empty(),
             "and the child is not reported as still on disk"
         );
         assert_eq!(
-            outcome.reclaimed, 4096,
+            outcome.purged.bytes, 4096,
             "its bytes are already counted under the parent"
         );
     }
@@ -505,17 +555,17 @@ mod tests {
         std::fs::write(&keeper, b"source").expect("write");
 
         let plan = plan_of(vec![
-            candidate(doomed_dir.to_str().expect("utf8"), 4096),
-            candidate(doomed_file.to_str().expect("utf8"), 1024),
+            doomed(doomed_dir.to_str().expect("utf8"), 4096),
+            doomed(doomed_file.to_str().expect("utf8"), 1024),
         ]);
 
-        let outcome = apply(&plan, Removal::Purge, |_| {});
+        let outcome = apply(&plan, |_| {});
 
         assert!(outcome.is_complete(), "{:?}", outcome.failed);
         assert!(!doomed_dir.exists(), "a directory goes with its contents");
         assert!(!doomed_file.exists(), "and so does a file");
         assert!(keeper.exists(), "nothing outside the plan is touched");
-        assert_eq!(outcome.reclaimed, 5120);
+        assert_eq!(outcome.purged.bytes, 5120);
     }
 
     /// A purge that cannot happen is still reported as data, not a panic — the
@@ -525,11 +575,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let plan = doomed_plan(dir.path());
 
-        let outcome = apply(&plan, Removal::Purge, |_| {});
+        let outcome = apply(&plan, |_| {});
 
         assert_eq!(outcome.failed.len(), 2, "{:?}", outcome.failed);
-        assert!(outcome.removed.is_empty());
-        assert_eq!(outcome.reclaimed, 0);
+        assert_eq!(outcome.count(), 0);
+        assert_eq!(outcome.reclaimed(), 0);
     }
 
     /// A symlink is removed as a link, never followed — deleting what it points
@@ -545,8 +595,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
         let outcome = apply(
-            &plan_of(vec![candidate(link.to_str().expect("utf8"), 64)]),
-            Removal::Purge,
+            &plan_of(vec![doomed(link.to_str().expect("utf8"), 64)]),
             |_| {},
         );
 
@@ -566,26 +615,26 @@ mod tests {
     /// other real-trash test here is `#[ignore]`d to avoid.
     #[test]
     fn a_path_inside_something_already_removed_is_recognised() {
-        let removed = vec![PathBuf::from("/p/outer")];
+        let removed = [PathBuf::from("/p/outer")];
 
         assert!(
-            already_gone(Path::new("/p/outer/inner"), &removed),
+            already_gone(Path::new("/p/outer/inner"), removed.iter()),
             "a child of a removed directory went with it"
         );
         assert!(
-            already_gone(Path::new("/p/outer"), &removed),
+            already_gone(Path::new("/p/outer"), removed.iter()),
             "and so did the directory itself"
         );
         assert!(
-            !already_gone(Path::new("/p/outer-sibling"), &removed),
+            !already_gone(Path::new("/p/outer-sibling"), removed.iter()),
             "but a name that merely shares a prefix did not"
         );
         assert!(
-            !already_gone(Path::new("/p/other"), &removed),
+            !already_gone(Path::new("/p/other"), removed.iter()),
             "nor an unrelated path"
         );
         assert!(
-            !already_gone(Path::new("/p/outer/inner"), &[]),
+            !already_gone(Path::new("/p/outer/inner"), std::iter::empty()),
             "and nothing is gone before anything has been removed"
         );
     }
@@ -594,7 +643,7 @@ mod tests {
     fn an_empty_plan_removes_nothing_and_succeeds() {
         let mut fired = 0;
 
-        let outcome = apply(&plan_of(Vec::new()), Removal::Trash, |_| fired += 1);
+        let outcome = apply(&plan_of(Vec::new()), |_| fired += 1);
 
         assert_eq!(outcome, CleanOutcome::default());
         assert!(outcome.is_complete(), "nothing to do is not a failure");
@@ -620,7 +669,7 @@ mod tests {
             candidate(second.to_str().expect("utf8"), 8192),
         ]);
 
-        let outcome = apply(&plan, Removal::Trash, |_| {});
+        let outcome = apply(&plan, |_| {});
 
         if !outcome.is_complete() {
             eprintln!(
@@ -631,10 +680,15 @@ mod tests {
         }
         assert!(!first.exists(), "the original path must be gone");
         assert!(!second.exists());
-        assert_eq!(outcome.removed, vec![first, second]);
+        assert_eq!(outcome.trashed.paths, vec![first, second]);
         assert_eq!(
-            outcome.reclaimed, 12288,
+            outcome.trashed.bytes, 12288,
             "the freed total is the sum of what moved"
+        );
+        assert_eq!(
+            outcome.purged,
+            Reclaimed::default(),
+            "and nothing was destroyed, so that half stays empty"
         );
     }
 

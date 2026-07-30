@@ -44,18 +44,19 @@ pub const DEFAULT_CONFIG: &str = r#"# disk-tools configuration.
 #
 # One exception, and it is a limitation rather than a rule: a true/false setting
 # turned on here cannot be turned back off from the command line, because a flag
-# can only be passed or not passed. `--purge` and `--allow-dirty` are absent
-# from this file for the same reason inverted — a file that silently deleted
-# past the trash, or disabled the git guard, would hide the fact.
+# can only be passed or not passed. `--purge` and `--yes` are absent from this
+# file for the same reason inverted — a file that silently deleted past the
+# trash, or answered a confirmation in advance, would hide that it had. The git
+# guard is settled per rule instead, by `requires-clean-repo`.
 #
 # The never-touch denylist is NOT here and cannot be configured.
 
 [scan]                          # walk behaviour, for `scan <PATH>` only
 one-file-system = false
 
-# `scan` only, and display only — none of it ever changes a total. `clean`
-# always lists every candidate, because that list is what you approve by typing
-# --apply, and a truncated one would be approval of what was never shown.
+# `scan` only, and display only — none of it ever changes a total. `preview`
+# and `clean` list every candidate: that list is what you act on by running the
+# other verb, and a truncated one would be acting on what was never shown.
 #
 # Commented-out keys are the built-in defaults; uncomment to change them.
 #   n     = 20    # show at most this many entries. Default: all of them.
@@ -78,6 +79,28 @@ safe                 = false    # as if --safe were always passed
 # A trailing `/` in `includes` means directory only, as in gitignore — which is
 # why `**/*.pyc` matches files and `**/node_modules/` does not match a file of
 # that name.
+#
+# `requires-sibling` is a glob matched against the file names *beside* a match,
+# and each pattern given has to find something of its own. It is a glob because
+# most build systems name their marker after the project — the file that proves
+# a `bin/` is .NET output is `Whatever.csproj`. A pattern with no metacharacters
+# matches itself, so "Cargo.toml" still means exactly that.
+#
+#   requires-sibling = "*.csproj"                   # a .NET project lives here
+#   requires-sibling = ["*.csproj", "*.sln"]        # and a solution beside it
+#
+# `tier` says what `clean` does with what the rule claims. Three answers to one
+# question, and an unstated tier is the cautious one:
+#
+#   purge     destroys it. No confirmation, and no trash — for content a single
+#             command regenerates, where the trash is a chore rather than a
+#             safety net, since it frees nothing until it is emptied.
+#   trash     moves it to the OS trash. No confirmation.
+#   confirm   nothing, until you pass --yes. The default when `tier` is absent.
+#
+# `--safe` drops what needs confirming, so it keeps *both* of the others: purge
+# is a stronger claim of regenerability than trash, not a weaker one. Anything
+# but `confirm` is a claim this tool cannot check — it takes your word and acts.
 
 [[rules]]
 name                = "rust-target"
@@ -85,19 +108,19 @@ root                = "*"
 includes            = ["**/target/"]
 requires-sibling    = "Cargo.toml"   # without it, target/ is an ordinary directory
 requires-clean-repo = true
-tier                = "auto"
+tier                = "trash"
 
 [[rules]]
 name     = "node-modules"
 root     = "*"
 includes = ["**/node_modules/"]
-tier     = "auto"
+tier     = "trash"
 
 [[rules]]
 name     = "pycache"
 root     = "*"
 includes = ["**/__pycache__/", "**/*.pyc"]
-tier     = "auto"
+tier     = "trash"
 
 # The tilde is the whole safety of this one: `~/Library/Caches` is regenerable
 # user data, and `/Library/Caches` is on the denylist. No `**` — the cache root
@@ -106,13 +129,13 @@ tier     = "auto"
 name     = "user-caches"
 root     = "~"
 includes = [".cache/", "Library/Caches/"]
-tier     = "auto"
+tier     = "trash"
 
 [[rules]]
 name     = "windows-temp"
 root     = "%LOCALAPPDATA%"
 includes = ["Temp/"]
-tier     = "auto"
+tier     = "trash"
 "#;
 
 /// The file's contents, validated and converted.
@@ -420,7 +443,13 @@ fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
                 .map(|value| size(&value, &format!("{where_}: `min-size`")))
                 .transpose()?
                 .unwrap_or(0),
-            tier: entry.tier.map_or(Tier::Confirm, TierName::into_tier),
+            tier: entry
+                .tier
+                .map(|word| tier(&word, &format!("{where_}: `tier`")))
+                .transpose()?
+                // Cautious when unstated: a rule that forgets to say gets the
+                // answer that asks.
+                .unwrap_or(Tier::Confirm),
             enabled: entry.enabled.unwrap_or(true),
             name,
         });
@@ -492,7 +521,7 @@ struct RuleEntry {
     requires_clean_repo: Option<bool>,
     older_than: Option<String>,
     min_size: Option<String>,
-    tier: Option<TierName>,
+    tier: Option<String>,
     enabled: Option<bool>,
 }
 
@@ -514,19 +543,27 @@ impl Strings {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum TierName {
-    Auto,
-    Confirm,
-}
-
-impl TierName {
-    fn into_tier(self) -> Tier {
-        match self {
-            TierName::Auto => Tier::Auto,
-            TierName::Confirm => Tier::Confirm,
-        }
+/// The tier, by the word the file uses.
+///
+/// Read from a plain string rather than a serde enum so that both messages can
+/// be written here. serde's own would list `auto` among the valid values while
+/// rejecting it, or omit it and say nothing about where it went — and the whole
+/// point of failing on `auto` is to name what replaced it.
+fn tier(word: &str, where_: &str) -> Result<Tier, String> {
+    match word {
+        "purge" => Ok(Tier::Purge),
+        "trash" => Ok(Tier::Trash),
+        "confirm" => Ok(Tier::Confirm),
+        // Not an alias. An alias lives for ever; an error costs one edit and
+        // stops `clean` from starting on a file that has not been read through
+        // — which, for a verb that now removes, is the safe direction.
+        "auto" => Err(format!(
+            "{where_}: `auto` was renamed to `trash` in v0.5. The three tiers say what \
+             `clean` does: `purge` destroys, `trash` recovers, `confirm` waits for --yes"
+        )),
+        other => Err(format!(
+            "{where_}: unknown tier `{other}`; expected `purge`, `trash` or `confirm`"
+        )),
     }
 }
 
@@ -696,7 +733,7 @@ mod tests {
             requires-clean-repo = true
             older-than = "90d"
             min-size = "1M"
-            tier = "auto"
+            tier = "trash"
             enabled = false
             "#,
         );
@@ -712,7 +749,7 @@ mod tests {
                 requires_clean_repo: true,
                 older_than: Some(Duration::from_secs(90 * 24 * 60 * 60)),
                 min_size: 1_048_576,
-                tier: Tier::Auto,
+                tier: Tier::Trash,
                 enabled: false,
             }
         );
@@ -732,6 +769,50 @@ mod tests {
         );
 
         assert_eq!(rules[0].includes, vec!["**/x/".to_owned()]);
+    }
+
+    /// The three names, each accepted as written.
+    #[test]
+    fn every_tier_the_file_may_say() {
+        for (word, expected) in [
+            ("purge", Tier::Purge),
+            ("trash", Tier::Trash),
+            ("confirm", Tier::Confirm),
+        ] {
+            let rules = rules_of(&format!(
+                "[[rules]]\nname = \"r\"\nroot = \"*\"\nincludes = [\"x\"]\ntier = \"{word}\"\n"
+            ));
+            assert_eq!(rules[0].tier, expected, "`{word}`");
+        }
+    }
+
+    /// Not an alias. An alias lives for ever; an error costs one edit and stops
+    /// `clean` — which now removes — from starting on a file nobody has read
+    /// through.
+    #[test]
+    fn the_renamed_tier_is_refused_by_name() {
+        let err =
+            at("[[rules]]\nname = \"r\"\nroot = \"*\"\nincludes = [\"x\"]\ntier = \"auto\"\n")
+                .expect_err("`auto` must not parse");
+
+        let message = err.to_string();
+        assert!(message.contains("auto"), "{message}");
+        assert!(
+            message.contains("trash"),
+            "and it has to name what replaced it: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_tier_names_the_three() {
+        let err =
+            at("[[rules]]\nname = \"r\"\nroot = \"*\"\nincludes = [\"x\"]\ntier = \"maybe\"\n")
+                .expect_err("`maybe` is not a tier");
+
+        let message = err.to_string();
+        for word in ["purge", "trash", "confirm"] {
+            assert!(message.contains(word), "{word} missing from {message}");
+        }
     }
 
     /// An unstated tier asks. The file cannot make a rule auto by omission.

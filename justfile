@@ -187,7 +187,11 @@ bench-phases DIR:
 # Smoke-test the OS trash backend and time it on 10,000 files.
 smoke-trash:
     cargo test -p disk-tools-core --lib -- --ignored --nocapture trash
-    cargo test -p disk-tools --test cli -- --ignored --nocapture apply
+    # No name filter. One used to be here — `apply` — and it stopped matching the
+    # moment the test it named was renamed with the flag it was named after. The
+    # recipe then ran zero tests and reported success, in CI as well as here,
+    # which is the one outcome a smoke test must not be able to produce.
+    cargo test -p disk-tools --test cli -- --ignored --nocapture
 
 # Answers whether parallelising the per-directory loop is worth doing, or whether
 # the kernel serialises the metadata path anyway.

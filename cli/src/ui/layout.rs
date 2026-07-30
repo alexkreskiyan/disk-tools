@@ -20,10 +20,19 @@ use crate::render::tree::{fit, format_size};
 use std::time::SystemTime;
 use unicode_width::UnicodeWidthStr;
 
-/// Right-aligned, wide enough for the label and for `16384.0P`.
+/// Every fixed column is wide enough for **its label plus a sort arrow** as well
+/// as for its widest value. A header cell that outgrows its column shifts every
+/// separator after it by one and the table stops lining up — which is what
+/// `created↑` in seven columns did.
+///
+/// Right-aligned, wide enough for `16384.0P`.
 const SIZE: usize = 8;
-const CREATED: usize = 7;
-const MODIFIED: usize = 8;
+/// The same figures, so the same width; the label is shorter than they are.
+const CLEAN: usize = 8;
+/// `created↑`. An age itself is at most four columns.
+const CREATED: usize = 8;
+/// `modified↑`.
+const MODIFIED: usize = 9;
 /// The bar, a space, and `100%`.
 const BAR: usize = 7;
 const TOTAL: usize = BAR + 1 + 4;
@@ -35,6 +44,7 @@ const MIN_NAME: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Columns {
     pub size: bool,
+    pub clean: bool,
     pub created: bool,
     pub modified: bool,
     pub total: bool,
@@ -44,12 +54,13 @@ pub struct Columns {
 /// Fit the table to `width`.
 ///
 /// Columns are dropped rather than squeezed, widest and least-load-bearing
-/// first: the bar is decoration, then the two ages, and the size last — on a
-/// screen this narrow, "how big" is the one question still worth answering. The
-/// name is never dropped.
+/// first: the bar is decoration, then the two ages, then what could be cleaned,
+/// and the size last — on a screen this narrow, "how big" is the one question
+/// still worth answering. The name is never dropped.
 pub fn columns(width: usize) -> Columns {
     let mut cols = Columns {
         size: true,
+        clean: true,
         created: true,
         modified: true,
         total: true,
@@ -65,6 +76,9 @@ pub fn columns(width: usize) -> Columns {
     }
     if cramped(&cols) {
         cols.modified = false;
+    }
+    if cramped(&cols) {
+        cols.clean = false;
     }
     if cramped(&cols) {
         cols.size = false;
@@ -84,6 +98,7 @@ fn fixed(cols: &Columns) -> usize {
     let sep = UnicodeWidthStr::width(SEP);
     [
         (cols.size, SIZE),
+        (cols.clean, CLEAN),
         (cols.created, CREATED),
         (cols.modified, MODIFIED),
         (cols.total, TOTAL),
@@ -99,20 +114,32 @@ fn fixed(cols: &Columns) -> usize {
 /// Each label sits over its own cells and takes its alignment from them, so the
 /// arrow marks a column rather than floating in a line of its own.
 pub fn header(cols: &Columns, order: Order, reverse: bool) -> String {
-    let arrow = if reverse { "↓" } else { "↑" };
+    let arrow = if reverse { '↓' } else { '↑' };
     // The labels come from `Order` itself, so a column can never be headed by
     // one name and sorted by another.
+    //
+    // **The arrow's place is always there**, as a space when the column is not
+    // the one sorting. Right-aligned cells grow leftwards, so a label that gains
+    // a character shifts the whole word one column left — every label on the
+    // line moving whenever the sort key changed, which is the second way this
+    // header failed to line up.
     let mark = |column: Order| {
-        if order == column {
-            format!("{}{arrow}", column.label())
-        } else {
-            column.label().to_owned()
-        }
+        format!(
+            "{}{}",
+            column.label(),
+            if order == column { arrow } else { ' ' }
+        )
     };
+    // A column with no key that sorts it reserves the slot too, so its label
+    // ends where the others do rather than one place to the right.
+    let unsorted = |label: &str| format!("{label} ");
 
     let mut parts = Vec::new();
     if cols.size {
         parts.push(format!("{:>SIZE$}", mark(Order::Size)));
+    }
+    if cols.clean {
+        parts.push(format!("{:>CLEAN$}", unsorted("clean")));
     }
     parts.push(fit(&mark(Order::Name), cols.name));
     if cols.created {
@@ -143,6 +170,18 @@ pub fn row(entry: &Entry, now: SystemTime, sized: u64, cols: &Columns) -> String
             (false, None) => String::new(),
         };
         parts.push(format!("{size:>SIZE$}"));
+    }
+
+    if cols.clean {
+        // Blank for nothing and blank for not-known-yet, deliberately. The two
+        // are told apart one column to the left: a row still being walked is
+        // spinning, and a row that has settled has finished looking. A `0`
+        // would read as a verdict on a directory nobody has been into.
+        let clean = match entry.reclaimable {
+            Some(bytes) if bytes > 0 => format_size(bytes),
+            _ => String::new(),
+        };
+        parts.push(format!("{clean:>CLEAN$}"));
     }
 
     let mark = if entry.is_dir { "/" } else { "" };
@@ -257,6 +296,7 @@ mod tests {
             modified: ago(3 * 24 * 60 * 60),
             created: ago(90 * 24 * 60 * 60),
             state: disk_tools_core::State::Untracked,
+            reclaimable: None,
             measuring: false,
         }
     }
@@ -280,7 +320,106 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(positions(&header), positions(&row));
-        assert_eq!(positions(&header).len(), 4, "size, name, created, modified");
+        assert_eq!(
+            positions(&header).len(),
+            5,
+            "size, clean, name, created, modified"
+        );
+    }
+
+    /// Where a word starts, counted in columns rather than bytes.
+    fn column_of(line: &str, word: &str) -> usize {
+        let line: Vec<char> = line.chars().collect();
+        let word: Vec<char> = word.chars().collect();
+        line.windows(word.len())
+            .position(|seen| seen == word)
+            .unwrap_or_else(|| panic!("{word:?} is not in {:?}", line.iter().collect::<String>()))
+    }
+
+    /// The two ways the arrow used to move the header, both fixed by the same
+    /// rule — its place is always reserved.
+    ///
+    /// It widened its cell: `created↑` is eight columns and `created` was given
+    /// seven, so every separator after it shifted one place right. And in a
+    /// right-aligned cell it pushed its own label left, so changing the sort key
+    /// moved words that had nothing to do with it.
+    #[test]
+    fn the_arrow_never_moves_anything() {
+        const LABELS: [&str; 5] = ["size", "clean", "name", "created", "modified"];
+        let cols = columns(100);
+
+        let plain = header(&cols, Order::Name, false);
+        let width = plain.chars().count();
+        let places: Vec<usize> = LABELS.iter().map(|word| column_of(&plain, word)).collect();
+
+        for order in [Order::Name, Order::Size, Order::Created, Order::Modified] {
+            for reverse in [false, true] {
+                let header = header(&cols, order, reverse);
+                let what = format!("{} reversed={reverse}: {header:?}", order.label());
+
+                assert_eq!(header.chars().count(), width, "{what}");
+                assert_eq!(
+                    header.chars().filter(|ch| *ch == '│').count(),
+                    5,
+                    "every separator is still there — {what}"
+                );
+                assert_eq!(
+                    LABELS
+                        .iter()
+                        .map(|word| column_of(&header, word))
+                        .collect::<Vec<_>>(),
+                    places,
+                    "and no label moved — {what}"
+                );
+            }
+        }
+    }
+
+    /// A row says how much of itself `clean` would take, and says nothing
+    /// where there is nothing to say.
+    #[test]
+    fn the_clean_column_carries_what_a_rule_claims() {
+        let cols = columns(100);
+        let claimed = Entry {
+            size: Some(40_960),
+            reclaimable: Some(40_960),
+            ..entry("node_modules")
+        };
+
+        let whole = row(&claimed, now(), 40_960, &cols);
+        assert_eq!(
+            whole.matches("40.0K").count(),
+            2,
+            "the size, and all of it reclaimable: {whole}"
+        );
+
+        let partly = row(
+            &Entry {
+                reclaimable: Some(4096),
+                ..claimed.clone()
+            },
+            now(),
+            40_960,
+            &cols,
+        );
+        assert!(partly.contains("4.0K"), "{partly}");
+
+        for nothing in [None, Some(0)] {
+            let quiet = row(
+                &Entry {
+                    reclaimable: nothing,
+                    ..claimed.clone()
+                },
+                now(),
+                40_960,
+                &cols,
+            );
+            assert_eq!(
+                quiet.matches("40.0K").count(),
+                1,
+                "only the size is left: {quiet}"
+            );
+        }
     }
 
     #[test]
@@ -302,19 +441,21 @@ mod tests {
             columns(120),
             Columns {
                 size: true,
+                clean: true,
                 created: true,
                 modified: true,
                 total: true,
-                name: 120 - (8 + 3) - (7 + 3) - (8 + 3) - (12 + 3)
+                name: 120 - (SIZE + 3) - (CLEAN + 3) - (CREATED + 3) - (MODIFIED + 3) - (TOTAL + 3)
             }
         );
 
         let narrower = columns(50);
         assert!(!narrower.total, "the bar is decoration");
-        assert!(narrower.size, "and the size is not");
+        assert!(narrower.clean, "what could be freed is not");
+        assert!(narrower.size, "nor is how big it is");
 
         let narrow = columns(24);
-        assert!(!narrow.created && !narrow.modified);
+        assert!(!narrow.created && !narrow.modified && !narrow.clean);
         assert!(narrow.size, "how big is the last question worth answering");
     }
 

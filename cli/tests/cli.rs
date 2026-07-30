@@ -89,7 +89,7 @@ fn missing_path_errors_and_does_not_scan_cwd() {
         "a bare invocation should print usage, got:\n{stderr}"
     );
     // The point of printing help rather than an error: it says what to type.
-    for verb in ["scan", "clean"] {
+    for verb in ["scan", "preview", "clean"] {
         assert!(
             stderr.contains(verb),
             "and it should list `{verb}`, got:\n{stderr}"
@@ -546,6 +546,201 @@ fn cleanable_dir() -> tempfile::TempDir {
     dir
 }
 
+/// A fixture path in the form the spawned process's own working directory will
+/// have, so that a `~`-rooted rule and a relative path can meet.
+///
+/// Both halves are the platform's doing and neither is the tool's:
+///
+/// - **macOS** hands `tempdir` a `/var/...` path while `current_dir()` reports
+///   the resolved `/private/var/...`, so without canonicalising, the rule's root
+///   and the candidate disagree.
+/// - **Windows** canonicalises to a *verbatim* path (`\\?\C:\...`), which a
+///   working directory never is — so canonicalising alone makes them disagree in
+///   the other direction. The prefix is stripped.
+///
+/// Only a test needs this. The binary must not canonicalise: the path it shows
+/// has to be the path it removes, and resolving links would report somewhere the
+/// user never named.
+fn as_the_child_sees_it(path: &Path) -> std::path::PathBuf {
+    let canonical = std::fs::canonicalize(path).expect("canonicalize the fixture");
+    let text = canonical.to_string_lossy().into_owned();
+    std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+}
+
+/// The bug a preview cannot survive: `preview .` inside a project reported
+/// "Nothing to clean" while `preview /full/path` to the same directory found
+/// gigabytes.
+///
+/// A rooted rule is compiled against an absolute root, so a relative path
+/// produces nodes like `./node_modules` that no such glob can match — and the
+/// run claims nothing, silently and in the safe direction. Only a **rooted**
+/// rule shows it: the built-in `node-modules` is unrooted, matches by name
+/// wherever it is, and works relative or not.
+#[test]
+fn a_relative_path_finds_what_the_absolute_one_does() {
+    let home = isolated();
+    let home_dir = as_the_child_sees_it(home.path());
+    let home_dir = home_dir.as_path();
+    let project = home_dir.join("project");
+    std::fs::create_dir_all(project.join("node_modules")).expect("mkdir");
+    std::fs::write(project.join("node_modules/lib.bin"), vec![b'x'; 4096]).expect("write");
+
+    let config = home_dir.join("rules.toml");
+    std::fs::write(
+        &config,
+        "[[rules]]\nname = \"js\"\nroot = \"~\"\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n",
+    )
+    .expect("write config");
+    let config = config.to_str().expect("utf8");
+
+    let from = |dir: &Path, path: &str| {
+        let output = spawn(&["--config", config, "preview", path, "-d", "1"], home_dir)
+            .current_dir(dir)
+            .output()
+            .expect("spawn disk-tools");
+        assert!(output.status.success(), "{:?}", output.status);
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let relative = from(&project, ".");
+    let absolute = from(home_dir, project.to_str().expect("utf8"));
+
+    assert!(
+        relative.contains("node_modules"),
+        "`preview .` must find what the absolute path finds:\n{relative}"
+    );
+    assert_eq!(
+        relative, absolute,
+        "and report it identically, since it is the same directory"
+    );
+}
+
+/// The one property a machine-readable output has to keep: a display flag
+/// cannot change a byte of it. Anything else and a consumer is reading a
+/// document that was quietly shortened, with nothing in it saying so.
+#[test]
+fn display_flags_cannot_change_the_json() {
+    let dir = cleanable_dir();
+    let path = dir.path().to_str().expect("utf8");
+    let plain = run(&["preview", path, "--json"]);
+    assert!(plain.status.success(), "{:?}", plain.status);
+
+    for extra in [
+        vec!["-d", "1"],
+        vec!["-d", "9"],
+        vec!["--sort", "size"],
+        vec!["-d", "1", "--sort", "size"],
+    ] {
+        let mut args = vec!["preview", path, "--json"];
+        args.extend_from_slice(&extra);
+        let output = run(&args);
+
+        assert_eq!(
+            output.stdout, plain.stdout,
+            "{extra:?} changed the document"
+        );
+    }
+}
+
+/// And a flag that narrows the *plan* is of course reflected: it changes what
+/// the answer is, not how it is shown.
+#[test]
+fn a_narrowing_flag_does_change_the_json() {
+    let dir = cleanable_dir();
+    let path = dir.path().to_str().expect("utf8");
+
+    let whole = run(&["preview", path, "--json"]);
+    let narrowed = run(&["preview", path, "--json", "--min-size", "1G"]);
+
+    let of = |out: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice(&out.stdout).expect("valid JSON")
+    };
+    assert!(
+        !of(&whole)["candidates"]
+            .as_array()
+            .expect("array")
+            .is_empty()
+    );
+    assert!(
+        of(&narrowed)["candidates"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "nothing here is a gigabyte"
+    );
+}
+
+/// stdout is the document and stderr is everything else — which is what makes
+/// the output pipeable at all.
+#[test]
+fn preview_json_is_one_document_on_stdout() {
+    let dir = cleanable_dir();
+
+    let output = run(&[
+        "preview",
+        dir.path().to_str().expect("utf8"),
+        "--json",
+        "-v",
+    ]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    let first = &value["candidates"][0];
+    assert_eq!(first["rule"], "node-modules");
+    assert_eq!(first["tier"], "trash");
+    assert_eq!(first["purge"], false);
+    assert!(
+        first["allocated"]
+            .as_u64()
+            .is_some_and(|bytes| bytes >= 4096),
+        "a raw byte count: {first}"
+    );
+}
+
+/// `clean --json` answers a different question — what was *done* — so it is a
+/// different document, and the two halves are both in it.
+#[test]
+fn clean_json_reports_what_it_did() {
+    let dir = cleanable_dir();
+
+    let output = run(&["clean", dir.path().to_str().expect("utf8"), "--json"]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    assert!(value.get("trashed").is_some(), "{value}");
+    assert!(value.get("purged").is_some(), "{value}");
+    assert_eq!(value["failed"].as_array().expect("array").len(), 0);
+    assert!(
+        value.get("candidates").is_none(),
+        "an outcome is not a plan, and must not look like one: {value}"
+    );
+}
+
+/// A refusal removed nothing, so what there is to report is the plan. The two
+/// are told apart by the exit code, which a consumer has to read anyway.
+#[test]
+fn a_refusal_emits_the_plan_and_exits_two() {
+    let dir = mixed_tiers_dir();
+
+    let output = run(&[
+        "clean",
+        dir.path().to_str().expect("utf8"),
+        "--older-than",
+        "1d",
+        "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    assert!(
+        value.get("candidates").is_some(),
+        "nothing happened, so the plan is what there is to say: {value}"
+    );
+}
+
 /// Every path under `root`, with its length — enough to catch a creation, a
 /// deletion or a truncation.
 fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, u64)> {
@@ -590,7 +785,7 @@ fn clean_without_a_path_announces_what_it_walks() {
     // The built-in `user-caches` is rooted at the home directory, so a bare
     // `clean` walks all of it. On a real machine that is minutes; nobody should
     // have to guess why.
-    let output = run(&["clean"]);
+    let output = run(&["preview"]);
 
     assert!(output.status.success(), "{:?}", output.status);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -612,7 +807,7 @@ fn a_config_that_names_no_directory_says_so() {
         "[[rules]]\nname = \"anywhere\"\nroot = \"*\"\nincludes = [\"**/x/\"]\n",
     );
 
-    let output = run(&["--config", config.to_str().expect("utf8"), "clean"]);
+    let output = run(&["--config", config.to_str().expect("utf8"), "preview"]);
 
     assert!(
         output.status.success(),
@@ -634,13 +829,18 @@ fn a_config_that_names_no_directory_says_so() {
     );
 }
 
-/// The load-bearing safety property: the default does nothing at all.
+/// The load-bearing safety property: `preview` does nothing at all.
 #[test]
-fn dry_run_writes_nothing() {
+fn a_preview_writes_nothing() {
     let dir = cleanable_dir();
     let before = snapshot(dir.path());
 
-    let output = run(&["clean", dir.path().to_str().expect("utf8 path")]);
+    let output = run(&[
+        "preview",
+        dir.path().to_str().expect("utf8 path"),
+        "-d",
+        "1",
+    ]);
 
     assert!(output.status.success(), "{:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -649,7 +849,7 @@ fn dry_run_writes_nothing() {
         "the fixture must actually match, or this proves nothing:\n{stdout}"
     );
     assert!(
-        stdout.contains("Dry run"),
+        stdout.contains("Preview — nothing was removed"),
         "and the report must say it removed nothing:\n{stdout}"
     );
     assert_eq!(
@@ -659,17 +859,17 @@ fn dry_run_writes_nothing() {
     );
 }
 
-/// `--apply` really removes, end to end through the binary.
+/// `clean` really removes, end to end through the binary.
 ///
 /// `#[ignore]` for the reason every real-trash test here carries: it puts
 /// things in the developer's actual Trash. Run via `just smoke-trash`.
 #[test]
 #[ignore = "moves real files to the OS trash; run via `just smoke-trash`"]
-fn apply_removes_the_candidates() {
+fn clean_removes_the_candidates() {
     let dir = cleanable_dir();
     let path = dir.path().to_str().expect("utf8 path");
 
-    let output = run(&["clean", path, "--apply"]);
+    let output = run(&["clean", path]);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -717,7 +917,7 @@ fn partial_failure_exits_non_zero_and_names_survivors() {
         return;
     }
 
-    let output = run(&["clean", root.to_str().expect("utf8 path"), "--apply"]);
+    let output = run(&["clean", root.to_str().expect("utf8 path")]);
 
     // Restore before any assertion can unwind, or TempDir::drop cannot clean up.
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).expect("restore");
@@ -744,7 +944,7 @@ fn partial_failure_exits_non_zero_and_names_survivors() {
 fn clean_report_is_on_stdout() {
     let dir = cleanable_dir();
 
-    let output = run(&["clean", dir.path().to_str().expect("utf8 path")]);
+    let output = run(&["preview", dir.path().to_str().expect("utf8 path")]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Reclaimable"), "{stdout}");
@@ -784,14 +984,14 @@ fn safe_reports_how_many_candidates_it_hid() {
     }
     let path = dir.path().to_str().expect("utf8 path");
 
-    let everything = run(&["clean", path, "--older-than", "90d"]);
+    let everything = run(&["preview", path, "--older-than", "90d", "-d", "1"]);
     let stdout = String::from_utf8_lossy(&everything.stdout);
     assert!(
         stdout.contains("ancient-one.bin") && stdout.contains("node_modules"),
         "the fixture must offer both tiers, or this proves nothing:\n{stdout}"
     );
 
-    let safe = run(&["clean", path, "--older-than", "90d", "--safe"]);
+    let safe = run(&["preview", path, "--older-than", "90d", "--safe", "-d", "1"]);
     let stdout = String::from_utf8_lossy(&safe.stdout);
 
     assert!(
@@ -833,7 +1033,7 @@ fn purge_removes_without_trashing_and_says_so() {
     let dir = cleanable_dir();
     let path = dir.path().to_str().expect("utf8 path");
 
-    let output = run(&["clean", path, "--apply", "--purge"]);
+    let output = run(&["clean", path, "--purge"]);
 
     assert!(output.status.success(), "{:?}", output.status);
     assert!(
@@ -848,20 +1048,22 @@ fn purge_removes_without_trashing_and_says_so() {
     );
 }
 
+/// `--purge` no longer requires a companion flag — the verb it modifies already
+/// removes. On `preview` it still removes nothing, which is the property that
+/// makes the flag safe to carry across from one line to the other.
 #[test]
-fn purge_without_apply_is_a_usage_error() {
+fn purge_on_a_preview_removes_nothing() {
     let dir = cleanable_dir();
     let before = snapshot(dir.path());
 
-    let output = run(&["clean", dir.path().to_str().expect("utf8 path"), "--purge"]);
+    let output = run(&[
+        "preview",
+        dir.path().to_str().expect("utf8 path"),
+        "--purge",
+    ]);
 
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "a destructive flag on its own is a usage error, got {:?}",
-        output.status
-    );
-    assert_eq!(before, snapshot(dir.path()), "and nothing was removed");
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(before, snapshot(dir.path()), "nothing was removed");
 }
 
 // ---- the configuration file ---------------------------------------------
@@ -891,13 +1093,13 @@ fn a_configured_rule_replaces_the_builtins() {
     let config = write(
         home.path(),
         "config.toml",
-        "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"**/node_modules/\"]\ntier = \"auto\"\n",
+        "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n",
     );
 
     let output = run(&[
         "--config",
         config.to_str().expect("utf8"),
-        "clean",
+        "preview",
         fixture.path().to_str().expect("utf8"),
     ]);
 
@@ -924,7 +1126,7 @@ fn a_malformed_config_stops_the_program_before_scanning() {
     let output = run(&[
         "--config",
         config.to_str().expect("utf8"),
-        "clean",
+        "preview",
         fixture.path().to_str().expect("utf8"),
     ]);
 
@@ -950,7 +1152,7 @@ fn an_explicit_config_that_is_absent_is_an_error() {
     let output = run(&[
         "--config",
         home.path().join("nope.toml").to_str().expect("utf8"),
-        "clean",
+        "preview",
         fixture.path().to_str().expect("utf8"),
     ]);
 
@@ -976,7 +1178,7 @@ fn an_unknown_key_warns_but_the_run_continues() {
     let output = run(&[
         "--config",
         config.to_str().expect("utf8"),
-        "clean",
+        "preview",
         fixture.path().to_str().expect("utf8"),
     ]);
 
@@ -1007,7 +1209,7 @@ fn a_rule_missing_its_root_is_refused_by_name() {
     let output = run(&[
         "--config",
         config.to_str().expect("utf8"),
-        "clean",
+        "preview",
         fixture.path().to_str().expect("utf8"),
     ]);
 
@@ -1038,7 +1240,7 @@ fn config_init_writes_a_usable_file_and_prints_its_path() {
     let reread = run(&[
         "--config",
         target.to_str().expect("utf8"),
-        "clean",
+        "preview",
         fixture.path().to_str().expect("utf8"),
     ]);
     assert!(reread.status.success(), "{:?}", reread.status);
@@ -1089,7 +1291,7 @@ fn rules_rooted_at(at: &Path, roots: &[&Path]) -> std::path::PathBuf {
     let mut text = String::new();
     for (index, root) in roots.iter().enumerate() {
         text.push_str(&format!(
-            "[[rules]]\nname = \"r{index}\"\nroot = {:?}\nincludes = [\"**/node_modules/\"]\ntier = \"auto\"\n\n",
+            "[[rules]]\nname = \"r{index}\"\nroot = {:?}\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n\n",
             root.to_str().expect("utf8")
         ));
     }
@@ -1106,7 +1308,13 @@ fn two_rule_roots_are_both_walked() {
     seed_node_modules(&b, 4096);
     let config = rules_rooted_at(home.path(), &[&a, &b]);
 
-    let output = run(&["--config", config.to_str().expect("utf8"), "clean"]);
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "preview",
+        "-d",
+        "1",
+    ]);
 
     assert!(output.status.success(), "{:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1140,8 +1348,8 @@ fn a_nested_root_does_not_double_the_total() {
     };
     let only = write(home.path(), "only.toml", &just_outer);
 
-    let with_both = run(&["--config", both.to_str().expect("utf8"), "clean"]);
-    let with_one = run(&["--config", only.to_str().expect("utf8"), "clean"]);
+    let with_both = run(&["--config", both.to_str().expect("utf8"), "preview"]);
+    let with_one = run(&["--config", only.to_str().expect("utf8"), "preview"]);
 
     assert!(with_both.status.success() && with_one.status.success());
     assert_eq!(
@@ -1161,7 +1369,13 @@ fn a_rule_root_that_is_gone_is_skipped_not_fatal() {
     let vanished = home.path().join("vanished");
     let config = rules_rooted_at(home.path(), &[&vanished, &real]);
 
-    let output = run(&["--config", config.to_str().expect("utf8"), "clean"]);
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf8"),
+        "preview",
+        "-d",
+        "1",
+    ]);
 
     assert!(
         output.status.success(),
@@ -1196,7 +1410,7 @@ fn a_named_path_that_is_gone_is_still_an_error() {
 //
 // The three that do get past the refusal pass `--purge`, and not for speed. The
 // refusal is decided before the removal method matters, so either flag exercises
-// the same branch — but `--apply` alone would put a temp fixture into the real
+// the same branch — but `clean` alone would put a temp fixture into the real
 // Trash of whoever ran the suite, which is exactly what this project keeps
 // behind `#[ignore]`. `--purge` confines the deletion to the temp directory.
 // (It is also 70x faster: measured at 121 s for these three against the trash.)
@@ -1235,10 +1449,10 @@ fn filetime_set(path: &Path, when: std::time::SystemTime) {
         .expect("set mtime");
 }
 
-/// The headline property: `--apply` alone does not take what cannot be
+/// The headline property: `clean` on its own does not take what cannot be
 /// regenerated.
 #[test]
-fn apply_refuses_while_a_confirm_tier_candidate_remains() {
+fn clean_refuses_while_a_confirm_tier_candidate_remains() {
     let dir = mixed_tiers_dir();
     let before = snapshot(dir.path());
 
@@ -1247,7 +1461,6 @@ fn apply_refuses_while_a_confirm_tier_candidate_remains() {
         dir.path().to_str().expect("utf8"),
         "--older-than",
         "1d",
-        "--apply",
     ]);
 
     assert_eq!(
@@ -1273,7 +1486,7 @@ fn apply_refuses_while_a_confirm_tier_candidate_remains() {
     );
 }
 
-/// The refusal prints the plan as a **dry run**. Printing "about to apply" and
+/// The refusal prints the plan as a **preview**. Printing "about to remove" and
 /// then declining would make the last thing a user reads before the outcome the
 /// one sentence in the report that is false — the defect `Intent` exists for.
 #[test]
@@ -1285,28 +1498,22 @@ fn the_refusal_does_not_promise_a_removal() {
         dir.path().to_str().expect("utf8"),
         "--older-than",
         "1d",
-        "--apply",
     ]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Dry run — nothing was removed"),
-        "the plan must close as a dry run:\n{stdout}"
+        stdout.contains("Preview — nothing was removed"),
+        "the plan must close as a preview, since that is what happened:\n{stdout}"
     );
 }
 
-/// A plan of only regenerable candidates needs no confirmation, so `--apply`
-/// proceeds. This is also why every pre-existing `--apply` test still passes.
+/// A plan of only regenerable candidates needs no confirmation, so `clean`
+/// proceeds — which is what makes a bare `clean` usable at all.
 #[test]
-fn apply_proceeds_when_nothing_needs_confirming() {
+fn clean_proceeds_when_nothing_needs_confirming() {
     let dir = cleanable_dir();
 
-    let output = run(&[
-        "clean",
-        dir.path().to_str().expect("utf8"),
-        "--apply",
-        "--purge",
-    ]);
+    let output = run(&["clean", dir.path().to_str().expect("utf8"), "--purge"]);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1327,7 +1534,6 @@ fn safe_removes_the_regenerable_ones_without_a_refusal() {
         "--older-than",
         "1d",
         "--safe",
-        "--apply",
         "--purge",
     ]);
 
@@ -1339,7 +1545,7 @@ fn safe_removes_the_regenerable_ones_without_a_refusal() {
 }
 
 /// Turning the setting off restores v0.2's behaviour: the confirmation is having
-/// read the list and typed `--apply`.
+/// read the list and ran `clean`.
 #[test]
 fn the_setting_can_be_turned_off() {
     let dir = mixed_tiers_dir();
@@ -1357,7 +1563,6 @@ fn the_setting_can_be_turned_off() {
         dir.path().to_str().expect("utf8"),
         "--older-than",
         "1d",
-        "--apply",
         "--purge",
     ]);
 
@@ -1372,16 +1577,62 @@ fn the_setting_can_be_turned_off() {
     );
 }
 
-/// "I confirm" without "remove" is a statement about nothing.
+/// `--yes` on a preview is accepted and does nothing, which is the point:
+/// the way a preview is acted on is to retype the line with the other verb, and
+/// a flag one of them rejected would break the copy exactly then.
 #[test]
-fn yes_without_apply_is_a_usage_error() {
+fn yes_on_a_preview_is_accepted_and_removes_nothing() {
     let dir = cleanable_dir();
     let before = snapshot(dir.path());
 
-    let output = run(&["clean", dir.path().to_str().expect("utf8"), "--yes"]);
+    let output = run(&["preview", dir.path().to_str().expect("utf8"), "--yes"]);
 
-    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+    assert!(output.status.success(), "{:?}", output.status);
     assert_eq!(before, snapshot(dir.path()));
+}
+
+/// Every flag either verb takes, on a preview, still changes nothing. The one
+/// promise `preview` makes, asserted against the flags most able to break it.
+#[test]
+fn a_preview_changes_nothing_whatever_the_flags() {
+    let dir = cleanable_dir();
+    let path = dir.path().to_str().expect("utf8");
+    let before = snapshot(dir.path());
+
+    for extra in [
+        vec![],
+        vec!["--purge"],
+        vec!["--yes"],
+        vec!["--safe"],
+        vec!["--purge", "--yes"],
+        vec!["--older-than", "1d"],
+        vec!["--min-size", "1"],
+    ] {
+        let mut args = vec!["preview", path];
+        args.extend_from_slice(&extra);
+        let output = run(&args);
+
+        assert!(output.status.success(), "{extra:?}: {:?}", output.status);
+        assert_eq!(before, snapshot(dir.path()), "{extra:?} removed something");
+    }
+}
+
+/// Both are gone from the surface. A flag that no longer exists must be a usage
+/// error that names itself — and, above all, must not remove anything on its way
+/// to being refused.
+#[test]
+fn the_removed_flags_are_usage_errors_that_change_nothing() {
+    let dir = cleanable_dir();
+    let before = snapshot(dir.path());
+
+    for flag in ["--apply", "--allow-dirty"] {
+        let output = run(&["clean", dir.path().to_str().expect("utf8"), flag]);
+
+        assert_eq!(output.status.code(), Some(2), "{flag}: {:?}", output.status);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(flag), "the error must name it:\n{stderr}");
+        assert_eq!(before, snapshot(dir.path()), "{flag} removed something");
+    }
 }
 
 /// The count is said aloud only when there is something to say.
@@ -1396,7 +1647,6 @@ fn nothing_is_announced_when_nothing_needs_confirming() {
     let output = run(&[
         "clean",
         dir.path().to_str().expect("utf8"),
-        "--apply",
         "--purge",
         "--yes",
     ]);
@@ -1419,7 +1669,6 @@ fn one_refused_candidate_reads_singular() {
         dir.path().to_str().expect("utf8"),
         "--older-than",
         "1d",
-        "--apply",
     ]);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
