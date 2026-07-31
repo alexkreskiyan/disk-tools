@@ -368,6 +368,7 @@ pub fn stdout_is_terminal() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use disk_tools_core::{Part, Rule};
     use ratatui::backend::TestBackend;
 
     /// Draw into a fake terminal of a known size and read the text back.
@@ -649,9 +650,12 @@ mod tests {
         let rules = Rules::new(
             vec![disk_tools_core::Rule {
                 name: "junk".into(),
-                root: Some(dir.path().to_string_lossy().into_owned()),
-                includes: vec!["**/sub/".into()],
-                ..disk_tools_core::Rule::default()
+                parts: vec![Part {
+                    root: Some(dir.path().to_string_lossy().into_owned()),
+                    includes: vec!["**/sub/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
             }],
             &disk_tools_core::UserDirs::default(),
         )

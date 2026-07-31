@@ -20,7 +20,7 @@
 //! warning, naming the key so the typo is findable.
 
 use crate::args::{parse_duration, parse_size};
-use disk_tools_core::{Keep, Rule, Tier, UserDirs, builtin_rules};
+use disk_tools_core::{Keep, Part, Rule, Tier, UserDirs, builtin_rules};
 use serde::Deserialize;
 use std::fmt;
 use std::io;
@@ -533,28 +533,7 @@ fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
         }
 
         rules.push(Rule {
-            // The file's spelling of "no root". The core distinguishes an
-            // unrooted rule from one rooted at `/`, and this is how a required
-            // field still expresses the former.
-            root: (root != "*").then_some(root),
-            includes,
-            excludes: entry.excludes.map(Strings::into_vec).unwrap_or_default(),
-            requires_sibling: entry
-                .requires_sibling
-                .map(Strings::into_vec)
-                .unwrap_or_default(),
-            requires_clean_repo: entry.requires_clean_repo.unwrap_or(false),
-            older_than: entry
-                .older_than
-                .map(|value| {
-                    parse_duration(&value).map_err(|err| format!("{where_}: `older-than`: {err}"))
-                })
-                .transpose()?,
-            min_size: entry
-                .min_size
-                .map(|value| size(&value, &format!("{where_}: `min-size`")))
-                .transpose()?
-                .unwrap_or(0),
+            name,
             tier: entry
                 .tier
                 .map(|word| tier(&word, &format!("{where_}: `tier`")))
@@ -563,7 +542,33 @@ fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
                 // answer that asks.
                 .unwrap_or(Tier::Confirm),
             enabled: entry.enabled.unwrap_or(true),
-            name,
+            // The file still spells a rule flat, so it makes exactly one part.
+            // Task 2 gives it the shape the core already has.
+            parts: vec![Part {
+                // The file's spelling of "no root". The core distinguishes an
+                // unrooted part from one rooted at `/`, and this is how a
+                // required field still expresses the former.
+                root: (root != "*").then_some(root),
+                includes,
+                excludes: entry.excludes.map(Strings::into_vec).unwrap_or_default(),
+                requires: entry
+                    .requires_sibling
+                    .map(Strings::into_vec)
+                    .unwrap_or_default(),
+                requires_clean_repo: entry.requires_clean_repo.unwrap_or(false),
+                older_than: entry
+                    .older_than
+                    .map(|value| {
+                        parse_duration(&value)
+                            .map_err(|err| format!("{where_}: `older-than`: {err}"))
+                    })
+                    .transpose()?,
+                min_size: entry
+                    .min_size
+                    .map(|value| size(&value, &format!("{where_}: `min-size`")))
+                    .transpose()?
+                    .unwrap_or(0),
+            }],
         });
     }
 
@@ -847,7 +852,7 @@ rules:
 "#,
         );
 
-        assert_eq!(rules[0].root, None);
+        assert_eq!(rules[0].parts[0].root, None);
     }
 
     #[test]
@@ -862,7 +867,7 @@ rules:
         );
 
         assert_eq!(
-            rules[0].root.as_deref(),
+            rules[0].parts[0].root.as_deref(),
             Some("~/Projects"),
             "the token is the core's to expand, not this module's"
         );
@@ -890,15 +895,17 @@ rules:
             rules[0],
             Rule {
                 name: "mine".into(),
-                root: None,
-                includes: vec!["**/a/".into(), "**/b".into()],
-                excludes: vec!["**/vendor/**".into()],
-                requires_sibling: vec!["Cargo.toml".into()],
-                requires_clean_repo: true,
-                older_than: Some(Duration::from_secs(90 * 24 * 60 * 60)),
-                min_size: 1_048_576,
                 tier: Tier::Trash,
                 enabled: false,
+                parts: vec![Part {
+                    root: None,
+                    includes: vec!["**/a/".into(), "**/b".into()],
+                    excludes: vec!["**/vendor/**".into()],
+                    requires: vec!["Cargo.toml".into()],
+                    requires_clean_repo: true,
+                    older_than: Some(Duration::from_secs(90 * 24 * 60 * 60)),
+                    min_size: 1_048_576,
+                }],
             }
         );
     }
@@ -916,7 +923,7 @@ rules:
 "#,
         );
 
-        assert_eq!(rules[0].includes, vec!["**/x/".to_owned()]);
+        assert_eq!(rules[0].parts[0].includes, vec!["**/x/".to_owned()]);
     }
 
     /// The three names, each accepted as written.

@@ -55,7 +55,7 @@ pub use duplicates::{
 pub use measure::{Claim, Finished, Measured, measure};
 pub use options::ScanOptions;
 pub use rules::{
-    AnySibling, Facts, NameTest, Rule, RuleError, Rules, State, Tier, UserDirs, age_rule,
+    AnySibling, Facts, NameTest, Part, Rule, RuleError, Rules, State, Tier, UserDirs, age_rule,
     builtin_rules, user_path,
 };
 pub use size::allocated_size;

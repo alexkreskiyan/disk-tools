@@ -64,9 +64,16 @@ impl Default for DetectOptions {
 pub struct Detection {
     pub path: PathBuf,
 
-    /// The name of the rule that claimed it — which is how the plan later finds
-    /// its tier, its `min_size` and whether it wants a clean repository.
+    /// The name of the rule that claimed it — the name the report carries.
     pub rule: String,
+
+    /// **Which part** of that rule matched, as an index into the compiled set.
+    ///
+    /// The tier is the rule's, but `min_size` and `requires_clean_repo` belong
+    /// to the part that matched, and a rule with two parts can hold two
+    /// different answers. Carried rather than looked up again, because "which
+    /// part" is exactly what the lookup could not reconstruct.
+    pub part: usize,
 
     pub allocated: u64,
 }
@@ -104,10 +111,11 @@ fn visit(
         return;
     }
 
-    if let Some(rule) = claim(node, siblings, options) {
+    if let Some((rule, part)) = claim(node, siblings, options) {
         found.push(Detection {
             path: node.path.clone(),
             rule,
+            part,
             allocated: node.allocated,
         });
         return; // the subtree is this one candidate
@@ -127,7 +135,11 @@ fn visit(
 /// A rule that matches by glob but fails a later predicate does not abandon the
 /// node: the next-lowest rule is tried. Otherwise disabling one rule's marker
 /// requirement would silently shadow every rule beneath it.
-fn claim(node: &ScanNode, siblings: &[ScanNode], options: &DetectOptions) -> Option<String> {
+fn claim(
+    node: &ScanNode,
+    siblings: &[ScanNode],
+    options: &DetectOptions,
+) -> Option<(String, usize)> {
     let candidate = Candidate::new(node.path.as_path());
     // The predicates live on `Rules` so that `Rules::state` — the colour the TUI
     // paints — is decided by the same code. A directory shown as junk and a
@@ -147,7 +159,7 @@ fn claim(node: &ScanNode, siblings: &[ScanNode], options: &DetectOptions) -> Opt
             continue;
         }
 
-        return Some(options.rules.rule_at(index).name.clone());
+        return Some((options.rules.rule_at(index).name.clone(), index));
     }
 
     None
@@ -163,7 +175,7 @@ fn any_sibling(siblings: &[ScanNode], wanted: &dyn Fn(&std::ffi::OsStr) -> bool)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{Rule, Tier, age_rule, builtin_rules};
+    use crate::rules::{Part, Rule, Tier, age_rule, builtin_rules};
     use std::path::Path;
     use std::time::Duration;
 
@@ -244,6 +256,164 @@ mod tests {
         let mut rules = builtin_rules();
         rules.push(age_rule(older_than));
         compiled(rules, &UserDirs::default())
+    }
+
+    /// One rule set, compiled against no user directories.
+    fn with(rules: Vec<Rule>) -> DetectOptions {
+        compiled(rules, &UserDirs::default())
+    }
+
+    /// The paths claimed, in order.
+    fn claimed(tree: &ScanTree, options: &DetectOptions) -> Vec<String> {
+        detect(tree, options)
+            .into_iter()
+            .map(|found| found.path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // ---- parts -----------------------------------------------------------
+
+    /// The case the cross product could not express. `requires` is matched
+    /// **all**, so one rule with both markers demands both beside the node;
+    /// two parts ask two questions and either answer claims it.
+    #[test]
+    fn either_part_claims_and_each_asks_its_own_question() {
+        let rule = Rule {
+            name: "dotnet-output".into(),
+            tier: Tier::Trash,
+            parts: vec![
+                Part {
+                    includes: vec!["**/bin/".into()],
+                    requires: vec!["*.csproj".into()],
+                    ..Part::default()
+                },
+                Part {
+                    includes: vec!["**/bin/".into()],
+                    requires: vec!["*.fsproj".into()],
+                    ..Part::default()
+                },
+            ],
+            ..Rule::default()
+        };
+
+        let sharp = tree(dir(
+            "/p",
+            vec![file("/p/App.csproj"), dir("/p/bin", vec![])],
+        ));
+        let effs = tree(dir(
+            "/p",
+            vec![file("/p/App.fsproj"), dir("/p/bin", vec![])],
+        ));
+        let neither = tree(dir("/p", vec![file("/p/README"), dir("/p/bin", vec![])]));
+
+        let options = with(vec![rule]);
+        assert_eq!(claimed(&sharp, &options), vec!["/p/bin"], "the C# part");
+        assert_eq!(claimed(&effs, &options), vec!["/p/bin"], "the F# part");
+        assert!(
+            claimed(&neither, &options).is_empty(),
+            "neither marker, no claim"
+        );
+    }
+
+    /// A node satisfying two parts is claimed **once**: the rule is what claims
+    /// it, and a candidate listed twice would be removed twice and counted
+    /// twice.
+    #[test]
+    fn a_node_matching_two_parts_is_claimed_once() {
+        let rule = Rule {
+            name: "twice".into(),
+            tier: Tier::Trash,
+            parts: vec![
+                Part {
+                    includes: vec!["**/bin/".into()],
+                    ..Part::default()
+                },
+                Part {
+                    includes: vec!["**/b*/".into()],
+                    ..Part::default()
+                },
+            ],
+            ..Rule::default()
+        };
+
+        let found = detect(
+            &tree(dir("/p", vec![dir("/p/bin", vec![])])),
+            &with(vec![rule]),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    /// Which part matched is carried out, because the two narrowings `plan`
+    /// applies afterwards belong to the part and a rule can hold two different
+    /// answers.
+    #[test]
+    fn the_detection_names_the_part_that_matched() {
+        let rule = Rule {
+            name: "sizes".into(),
+            tier: Tier::Trash,
+            parts: vec![
+                Part {
+                    includes: vec!["**/small/".into()],
+                    min_size: 1,
+                    ..Part::default()
+                },
+                Part {
+                    includes: vec!["**/large/".into()],
+                    min_size: 4096,
+                    ..Part::default()
+                },
+            ],
+            ..Rule::default()
+        };
+        let options = with(vec![rule]);
+
+        let found = detect(
+            &tree(dir(
+                "/p",
+                vec![dir("/p/small", vec![]), dir("/p/large", vec![])],
+            )),
+            &options,
+        );
+
+        let minimum = |path: &str| {
+            let at = found
+                .iter()
+                .find(|d| d.path == Path::new(path))
+                .expect(path);
+            options.rules.part_at(at.part).min_size
+        };
+        assert_eq!(minimum("/p/small"), 1);
+        assert_eq!(minimum("/p/large"), 4096);
+    }
+
+    /// Parts are tried in order within a rule, as rules are between them — so a
+    /// narrow part written first decides, and the report says the rule either
+    /// way.
+    #[test]
+    fn a_part_that_fails_a_predicate_lets_the_next_one_try() {
+        let rule = Rule {
+            name: "either".into(),
+            tier: Tier::Trash,
+            parts: vec![
+                Part {
+                    includes: vec!["**/target/".into()],
+                    requires: vec!["Cargo.toml".into()],
+                    ..Part::default()
+                },
+                Part {
+                    includes: vec!["**/target/".into()],
+                    ..Part::default()
+                },
+            ],
+            ..Rule::default()
+        };
+
+        let found = detect(
+            &tree(dir("/p", vec![dir("/p/target", vec![])])),
+            &with(vec![rule]),
+        );
+        assert_eq!(found.len(), 1, "the second part has no marker to want");
+        assert_eq!(found[0].part, 1, "and it is the second that claimed it");
     }
 
     /// Just the paths, for asserting on a whole result at once.
@@ -660,9 +830,12 @@ mod tests {
     fn a_required_sibling_matches_by_glob() {
         let rules = vec![Rule {
             name: "csharp-bin".into(),
-            includes: vec!["**/bin/".into(), "**/obj/".into()],
-            requires_sibling: vec!["*.csproj".into()],
             tier: Tier::Trash,
+            parts: vec![Part {
+                includes: vec!["**/bin/".into(), "**/obj/".into()],
+                requires: vec!["*.csproj".into()],
+                ..Part::default()
+            }],
             ..Rule::default()
         }];
 
@@ -704,14 +877,20 @@ mod tests {
         let rules = vec![
             Rule {
                 name: "needs-marker".into(),
-                includes: vec!["**/target/".into()],
-                requires_sibling: vec!["Cargo.toml".into()],
                 tier: Tier::Trash,
+                parts: vec![Part {
+                    includes: vec!["**/target/".into()],
+                    requires: vec!["Cargo.toml".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             },
             Rule {
                 name: "catch-all".into(),
-                includes: vec!["**/target/".into()],
+                parts: vec![Part {
+                    includes: vec!["**/target/".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             },
         ];
@@ -731,14 +910,20 @@ mod tests {
         let rules = vec![
             Rule {
                 name: "narrow".into(),
-                includes: vec!["**/node_modules/".into()],
-                excludes: vec!["**/vendor/**".into()],
                 tier: Tier::Trash,
+                parts: vec![Part {
+                    includes: vec!["**/node_modules/".into()],
+                    excludes: vec!["**/vendor/**".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             },
             Rule {
                 name: "wide".into(),
-                includes: vec!["**/node_modules/".into()],
+                parts: vec![Part {
+                    includes: vec!["**/node_modules/".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             },
         ];
@@ -768,9 +953,12 @@ mod tests {
     fn min_size_does_not_block_the_match() {
         let rules = vec![Rule {
             name: "small".into(),
-            includes: vec!["**/__pycache__/".into()],
-            min_size: 1_048_576,
             tier: Tier::Trash,
+            parts: vec![Part {
+                includes: vec!["**/__pycache__/".into()],
+                min_size: 1_048_576,
+                ..Part::default()
+            }],
             ..Rule::default()
         }];
 
@@ -795,9 +983,12 @@ mod tests {
     fn a_rooted_rule_is_still_reached_through_unrelated_directories() {
         let rules = vec![Rule {
             name: "scoped".into(),
-            root: Some("/home/me/Projects".into()),
-            includes: vec!["**/node_modules/".into()],
             tier: Tier::Trash,
+            parts: vec![Part {
+                root: Some("/home/me/Projects".into()),
+                includes: vec!["**/node_modules/".into()],
+                ..Part::default()
+            }],
             ..Rule::default()
         }];
 

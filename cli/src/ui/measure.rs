@@ -386,7 +386,7 @@ impl Drop for Sizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_tools_core::{Rule, UserDirs};
+    use disk_tools_core::{Part, Rule, UserDirs};
 
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_750_000_000)
@@ -655,7 +655,10 @@ mod tests {
         let rules = Rules::new(
             vec![Rule {
                 name: "node-modules".into(),
-                includes: vec!["**/node_modules/".into()],
+                parts: vec![Part {
+                    includes: vec!["**/node_modules/".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             }],
             &UserDirs::default(),

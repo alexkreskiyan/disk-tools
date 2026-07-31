@@ -16,7 +16,7 @@
 use crate::detect::{DetectOptions, detect};
 use crate::git;
 use crate::paths::{is_within, normalize_lexically, under_root};
-use crate::rules::{Rule, UserDirs};
+use crate::rules::{Part, UserDirs};
 use crate::tree::{ScanNode, ScanTree};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -303,11 +303,12 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
     let mut repos: HashMap<PathBuf, git::RepoState> = HashMap::new();
 
     for detection in detect(tree, &options.detect) {
-        // The rule that claimed it decides the three questions below. It is
-        // always present — `detect` only ever names a rule it matched with — but
-        // a missing one must not panic in a delete path, so it reads as the
-        // cautious default: confirm tier, no threshold, no guard.
-        let rule = options.detect.rules.get(&detection.rule);
+        // The **part** that matched decides the two narrowings below, and the
+        // rule it belongs to decides the tier. Both are reached by the index
+        // `detect` carried out, so there is no name lookup to come back empty
+        // and no cautious default to stand in for one.
+        let part = options.detect.rules.part_at(detection.part);
+        let rule = options.detect.rules.rule_at(detection.part);
 
         if is_denied(&detection.path, &denied) {
             excluded.push(Excluded {
@@ -317,7 +318,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
             continue;
         }
 
-        if is_mid_change(&detection.path, rule, &mut repos) {
+        if is_mid_change(&detection.path, part, &mut repos) {
             excluded.push(Excluded {
                 path: detection.path,
                 reason: ExcludeReason::DirtyRepo,
@@ -332,7 +333,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
         // is counted apart, because the remedy differs: lower the flag, or go
         // and edit the rule. The rule is checked first, since it is the narrower
         // statement and the harder one to find.
-        let rule_minimum = rule.map_or(0, |rule| rule.min_size);
+        let rule_minimum = part.min_size;
         if detection.allocated < rule_minimum {
             below_rule_minimum += 1;
             continue;
@@ -342,7 +343,7 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
             continue;
         }
 
-        let tier = rule.map_or(Tier::Confirm, |rule| rule.tier);
+        let tier = rule.tier;
         // Not recorded in `excluded`, deliberately. That list answers "the tool
         // refused something you might have expected"; `--safe` is the user's own
         // narrowing, and putting the two in one list would show a protected
@@ -555,12 +556,8 @@ fn matches_denylist(path: &Path, absolute: &[PathBuf]) -> bool {
 ///
 /// `repos` memoises the verdict per repository, since several candidates often
 /// share one.
-fn is_mid_change(
-    path: &Path,
-    rule: Option<&Rule>,
-    repos: &mut HashMap<PathBuf, git::RepoState>,
-) -> bool {
-    if !rule.is_some_and(|rule| rule.requires_clean_repo) {
+fn is_mid_change(path: &Path, part: &Part, repos: &mut HashMap<PathBuf, git::RepoState>) -> bool {
+    if !part.requires_clean_repo {
         return false;
     }
 
@@ -638,7 +635,7 @@ fn holds_shared_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{Rules, age_rule, builtin_rules};
+    use crate::rules::{Part, Rule, Rules, age_rule, builtin_rules};
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
@@ -996,20 +993,29 @@ mod tests {
             vec![
                 Rule {
                     name: "destroyed".into(),
-                    includes: vec!["**/node_modules/".into()],
                     tier: Tier::Purge,
+                    parts: vec![Part {
+                        includes: vec!["**/node_modules/".into()],
+                        ..Part::default()
+                    }],
                     ..Rule::default()
                 },
                 Rule {
                     name: "recovered".into(),
-                    includes: vec!["**/target/".into()],
                     tier: Tier::Trash,
+                    parts: vec![Part {
+                        includes: vec!["**/target/".into()],
+                        ..Part::default()
+                    }],
                     ..Rule::default()
                 },
                 Rule {
                     name: "asked".into(),
-                    includes: vec!["**/notes/".into()],
                     tier: Tier::Confirm,
+                    parts: vec![Part {
+                        includes: vec!["**/notes/".into()],
+                        ..Part::default()
+                    }],
                     ..Rule::default()
                 },
             ],
@@ -1186,10 +1192,13 @@ mod tests {
         let unguarded = Rules::new(
             vec![Rule {
                 name: "rust-target".into(),
-                includes: vec!["**/target/".into()],
-                requires_sibling: vec!["Cargo.toml".into()],
-                requires_clean_repo: false,
                 tier: Tier::Trash,
+                parts: vec![Part {
+                    includes: vec!["**/target/".into()],
+                    requires: vec!["Cargo.toml".into()],
+                    requires_clean_repo: false,
+                    ..Part::default()
+                }],
                 ..Rule::default()
             }],
             &UserDirs::default(),
@@ -1349,8 +1358,11 @@ mod tests {
             UserDirs::default(),
             vec![Rule {
                 name: "mine".into(),
-                includes: vec!["**/venv/".into()],
                 tier: Tier::Trash,
+                parts: vec![Part {
+                    includes: vec!["**/venv/".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             }],
         );
@@ -1373,9 +1385,12 @@ mod tests {
             UserDirs::default(),
             vec![Rule {
                 name: "big-only".into(),
-                includes: vec!["**/node_modules/".into()],
-                min_size: 1_048_576,
                 tier: Tier::Trash,
+                parts: vec![Part {
+                    includes: vec!["**/node_modules/".into()],
+                    min_size: 1_048_576,
+                    ..Part::default()
+                }],
                 ..Rule::default()
             }],
         );
@@ -1421,15 +1436,21 @@ mod tests {
                 vec![
                     Rule {
                         name: "strict".into(),
-                        includes: vec!["**/__pycache__/".into()],
-                        min_size: 4_194_304,
                         tier: Tier::Trash,
+                        parts: vec![Part {
+                            includes: vec!["**/__pycache__/".into()],
+                            min_size: 4_194_304,
+                            ..Part::default()
+                        }],
                         ..Rule::default()
                     },
                     Rule {
                         name: "loose".into(),
-                        includes: vec!["**/node_modules/".into()],
                         tier: Tier::Trash,
+                        parts: vec![Part {
+                            includes: vec!["**/node_modules/".into()],
+                            ..Part::default()
+                        }],
                         ..Rule::default()
                     },
                 ],
@@ -1470,9 +1491,12 @@ mod tests {
                 UserDirs::default(),
                 vec![Rule {
                     name: "strict".into(),
-                    includes: vec!["**/node_modules/".into()],
-                    min_size: 4_194_304,
                     tier: Tier::Trash,
+                    parts: vec![Part {
+                        includes: vec!["**/node_modules/".into()],
+                        min_size: 4_194_304,
+                        ..Part::default()
+                    }],
                     ..Rule::default()
                 }],
             )

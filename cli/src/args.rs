@@ -1551,7 +1551,7 @@ mod tests {
 
     /// The age rule's threshold, if `--older-than` put one in the list.
     fn older_than_of(options: &CleanOptions) -> Option<Duration> {
-        options.detect.rules.get("old")?.older_than
+        options.detect.rules.get("old")?.parts.first()?.older_than
     }
 
     fn clean_options(args: &[&str]) -> CleanOptions {
@@ -1635,6 +1635,7 @@ mod tests {
             Rules::builtin(&UserDirs::default())
                 .get("rust-target")
                 .expect("a built-in")
+                .parts[0]
                 .requires_clean_repo,
             "the git guard survives as the per-rule setting that replaced the flag"
         );

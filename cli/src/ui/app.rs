@@ -664,7 +664,7 @@ fn blank(cwd: &Path) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_tools_core::{Rule, UserDirs};
+    use disk_tools_core::{Part, Rule, UserDirs};
 
     /// A fixed clock, so an `older_than` rule decides the same way every run.
     fn now() -> SystemTime {
@@ -1209,9 +1209,12 @@ mod tests {
         let rules = Rules::new(
             vec![disk_tools_core::Rule {
                 name: "junk".into(),
-                root: Some(dir.path().to_string_lossy().into_owned()),
-                includes: vec!["**/alpha/".into()],
-                ..disk_tools_core::Rule::default()
+                parts: vec![Part {
+                    root: Some(dir.path().to_string_lossy().into_owned()),
+                    includes: vec!["**/alpha/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
             }],
             &disk_tools_core::UserDirs::default(),
         )
@@ -1258,9 +1261,12 @@ mod tests {
         let rules = Rules::new(
             vec![disk_tools_core::Rule {
                 name: "junk".into(),
-                root: Some(dir.path().to_string_lossy().into_owned()),
-                includes: vec!["**/target/".into()],
-                ..disk_tools_core::Rule::default()
+                parts: vec![Part {
+                    root: Some(dir.path().to_string_lossy().into_owned()),
+                    includes: vec!["**/target/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
             }],
             &disk_tools_core::UserDirs::default(),
         )
@@ -1297,10 +1303,13 @@ mod tests {
             Rules::new(
                 vec![disk_tools_core::Rule {
                     name: "rust-target".into(),
-                    root: Some(root.to_string_lossy().into_owned()),
-                    includes: vec!["**/target/".into()],
-                    requires_sibling: vec!["Cargo.toml".into()],
-                    ..disk_tools_core::Rule::default()
+                    parts: vec![Part {
+                        root: Some(root.to_string_lossy().into_owned()),
+                        includes: vec!["**/target/".into()],
+                        requires: vec!["Cargo.toml".into()],
+                        ..Part::default()
+                    }],
+                    ..Rule::default()
                 }],
                 &disk_tools_core::UserDirs::default(),
             )
@@ -1348,9 +1357,12 @@ mod tests {
             Rules::new(
                 vec![disk_tools_core::Rule {
                     name: "junk".into(),
-                    root: Some(dir.path().to_string_lossy().into_owned()),
-                    includes: vec!["**/alpha/".into()],
-                    ..disk_tools_core::Rule::default()
+                    parts: vec![Part {
+                        root: Some(dir.path().to_string_lossy().into_owned()),
+                        includes: vec!["**/alpha/".into()],
+                        ..Part::default()
+                    }],
+                    ..Rule::default()
                 }],
                 &disk_tools_core::UserDirs::default(),
             )
@@ -1450,8 +1462,11 @@ mod tests {
         Rules::new(
             vec![Rule {
                 name: "junk".into(),
-                root: Some(root.to_string_lossy().into_owned()),
-                includes: vec!["**/node_modules/".into(), "**/*.pyc".into()],
+                parts: vec![Part {
+                    root: Some(root.to_string_lossy().into_owned()),
+                    includes: vec!["**/node_modules/".into(), "**/*.pyc".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             }],
             &UserDirs::default(),
