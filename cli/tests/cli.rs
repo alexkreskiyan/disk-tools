@@ -588,7 +588,7 @@ fn a_relative_path_finds_what_the_absolute_one_does() {
     let config = home_dir.join("rules.toml");
     std::fs::write(
         &config,
-        "rules:\n  - name: js\n    root: \"~\"\n    includes: [\"**/node_modules/\"]\n    tier: trash\n",
+        "clean-rules:\n  - name: js\n    tier: trash\n    parts:\n      - root: \"~\"\n        includes: [\"**/node_modules/\"]\n",
     )
     .expect("write config");
     let config = config.to_str().expect("utf8");
@@ -804,7 +804,7 @@ fn a_config_that_names_no_directory_says_so() {
     let config = write(
         home.path(),
         "config.yml",
-        "rules:\n  - name: \"anywhere\"\n    root: \"*\"\n    includes: [\"**/x/\"]\n",
+        "clean-rules:\n  - name: \"anywhere\"\n    parts:\n      - root: \"*\"\n        includes: [\"**/x/\"]\n",
     );
 
     let output = run(&["--config", config.to_str().expect("utf8"), "preview"]);
@@ -1093,7 +1093,7 @@ fn a_configured_rule_replaces_the_builtins() {
     let config = write(
         home.path(),
         "config.yml",
-        "rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: [\"**/node_modules/\"]\n    tier: \"trash\"\n",
+        "clean-rules:\n  - name: \"mine\"\n    parts:\n      - root: \"*\"\n        includes: [\"**/node_modules/\"]\n    tier: \"trash\"\n",
     );
 
     let output = run(&[
@@ -1207,7 +1207,7 @@ fn a_rule_missing_its_root_is_refused_by_name() {
     let config = write(
         home.path(),
         "config.yml",
-        "rules:\n  - name: \"mine\"\n    includes: [\"**/x/\"]\n",
+        "clean-rules:\n  - name: \"mine\"\n    parts:\n      - includes: [\"**/x/\"]\n",
     );
 
     let output = run(&[
@@ -1279,7 +1279,7 @@ fn config_init_refuses_to_overwrite_without_force() {
     assert!(
         std::fs::read_to_string(&target)
             .expect("read")
-            .contains("rules:\n  -")
+            .contains("clean-rules:\n  - name:")
     );
 }
 
@@ -1292,10 +1292,10 @@ fn seed_node_modules(dir: &Path, bytes: usize) {
 
 /// A config rooting one rule at each of `roots`.
 fn rules_rooted_at(at: &Path, roots: &[&Path]) -> std::path::PathBuf {
-    let mut text = String::from("rules:\n");
+    let mut text = String::from("clean-rules:\n");
     for (index, root) in roots.iter().enumerate() {
         text.push_str(&format!(
-            "  - name: \"r{index}\"\n    root: {:?}\n    includes: [\"**/node_modules/\"]\n    tier: \"trash\"\n",
+            "  - name: \"r{index}\"\n    tier: \"trash\"\n    parts:\n      - root: {:?}\n        includes: [\"**/node_modules/\"]\n",
             root.to_str().expect("utf8")
         ));
     }

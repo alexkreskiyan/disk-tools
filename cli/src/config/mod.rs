@@ -100,24 +100,39 @@ duplicates:
   #   - ~/Photos
   #   - ~/Documents
 
-# Rules. List order is precedence: the first match claims the node, and a
-# claimed node is never descended into.
+# Rules. A rule is a **name**, what its claim **means**, and a list of **parts**.
+# A node is claimed when it satisfies any one of them.
 #
-# `root` is where the rule applies, and answers "what do I clean when no path is
-# named". Use "*" for a rule that applies wherever the scan goes.
+# List order is precedence: the first rule that claims a node wins, and a
+# claimed node is never descended into. Within a rule, its parts are tried in
+# order too.
 #
-# A trailing `/` in `includes` means directory only, as in gitignore — which is
-# why `**/*.pyc` matches files and `**/node_modules/` does not match a file of
-# that name.
+# Everything that decides *whether* a node qualifies lives in the part, so a
+# part reads on its own. What the rule carries is what a part cannot: the name
+# the report groups by, and the tier that says what happens to what it claims.
 #
-# `requires-sibling` is a glob matched against the file names *beside* a match,
-# and each pattern given has to find something of its own. It is a glob because
-# most build systems name their marker after the project — the file that proves
-# a `bin/` is .NET output is `Whatever.csproj`. A pattern with no metacharacters
-# matches itself, so "Cargo.toml" still means exactly that.
+# In a part:
 #
-#   requires-sibling: "*.csproj"                # a .NET project lives here
-#   requires-sibling: ["*.csproj", "*.sln"]     # and a solution beside it
+#   root      where it applies, and what `clean` walks when given no path.
+#             Use "*" for a part that applies wherever the scan goes.
+#             `~`, `%LOCALAPPDATA%` and `%APPDATA%` expand from your
+#             environment; a token that cannot be resolved drops the part.
+#   includes  globs relative to `root`. A trailing `/` means directory only,
+#             as in gitignore — which is why `**/*.pyc` matches files and
+#             `**/node_modules/` does not match a file of that name.
+#   excludes  likewise relative: matched by `includes`, but left alone.
+#   requires  paths relative to the directory holding the match, each of which
+#             must find something of its own. `Cargo.toml` means the file
+#             beside the match; `src/main.rs` descends from there. Globs, since
+#             most build systems name their marker after the project — the file
+#             that proves a `bin/` is .NET output is `Whatever.csproj`.
+#   older-than / min-size / requires-clean-repo  the other three questions.
+#
+# No pattern may leave its root: `..` is refused wherever it appears.
+#
+# Two parts are how a rule says "either of these", which one part cannot:
+# `requires` is matched *all*, so listing both markers in one part demands both
+# beside the node.
 #
 # `tier` says what `clean` does with what the rule claims. Three answers to one
 # question, and an unstated tier is the cautious one:
@@ -131,43 +146,44 @@ duplicates:
 # `--safe` drops what needs confirming, so it keeps *both* of the others: purge
 # is a stronger claim of regenerability than trash, not a weaker one. Anything
 # but `confirm` is a claim this tool cannot check — it takes your word and acts.
-#
-# Two more, not shown below:
-#
-#   older-than: 90d    only claim it if nothing has touched it for this long
-#   min-size: "10M"    only claim it if it is at least this big
-#   enabled: false     keep the rule written down and stop applying it
 
-rules:
+clean-rules:
   - name: rust-target
-    root: "*"
-    includes: ["**/target/"]
-    requires-sibling: Cargo.toml   # without it, target/ is an ordinary directory
-    requires-clean-repo: true
     tier: trash
+    parts:
+      - root: "*"
+        includes: ["**/target/"]
+        # Without the manifest this is an ordinary directory that happens to
+        # share a name with a build one.
+        requires: ["Cargo.toml"]
+        requires-clean-repo: true
 
   - name: node-modules
-    root: "*"
-    includes: ["**/node_modules/"]
     tier: trash
+    parts:
+      - root: "*"
+        includes: ["**/node_modules/"]
 
   - name: pycache
-    root: "*"
-    includes: ["**/__pycache__/", "**/*.pyc"]
     tier: trash
+    parts:
+      - root: "*"
+        includes: ["**/__pycache__/", "**/*.pyc"]
 
   # The tilde is the whole safety of this one: `~/Library/Caches` is regenerable
   # user data, and `/Library/Caches` is on the denylist. No `**` — the cache root
   # itself is the candidate, not each thing inside it.
   - name: user-caches
-    root: "~"
-    includes: [".cache/", "Library/Caches/"]
     tier: trash
+    parts:
+      - root: "~"
+        includes: [".cache/", "Library/Caches/"]
 
   - name: windows-temp
-    root: "%LOCALAPPDATA%"
-    includes: ["Temp/"]
     tier: trash
+    parts:
+      - root: "%LOCALAPPDATA%"
+        includes: ["Temp/"]
 "#;
 
 /// The file's contents, validated and converted.
@@ -420,10 +436,24 @@ fn parse(path: &Path, text: &str) -> Result<Config, ConfigError> {
 
     let invalid = |message: String| ConfigError::Invalid(path.to_path_buf(), message);
 
+    // Refused rather than warned about. `serde_ignored` would report `rules` as
+    // an unknown key and carry on with the built-ins — so a file full of the
+    // user's own rules would stop applying without a word, and `clean` would run
+    // on rules they never wrote. Checked before anything else, so a stale file
+    // gets the one message that matters instead of a complaint about a key
+    // inside a list that no longer exists.
+    if file.rules.is_some() {
+        return Err(invalid(
+            "`rules:` is now `clean-rules:`, and a rule is a name, a tier and a list of parts:"
+                .to_owned()
+                + EXAMPLE,
+        ));
+    }
+
     // Absent means "say nothing about rules", which leaves the built-ins alone.
     // An explicitly empty list means "no rules", which is a thing a user may
     // legitimately want and is not the same statement.
-    let rules = match file.rules {
+    let rules = match file.clean_rules {
         Some(entries) => convert(entries).map_err(invalid)?,
         None => builtin_rules(),
     };
@@ -487,7 +517,7 @@ fn readable(key: &str) -> String {
 /// Validate and convert the file's rules into the core's.
 ///
 /// Each message names the rule, by its name where it has one and by its position
-/// where it does not — an error about "a rule" in a file with twelve of them is
+/// where it does not — an error about "a rule"    in a file with twelve of them is
 /// not an error a user can act on.
 fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
     let mut rules: Vec<Rule> = Vec::with_capacity(entries.len());
@@ -503,10 +533,8 @@ fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
         let where_ = format!("rule `{name}`");
 
         // The report prints this name in every candidate's row, and a duplicate
-        // candidate carries the fixed one below. Letting a rule take it would
-        // make one line of a plan mean two different things — and they differ in
-        // exactly the way that matters, since a rule may say `tier = "purge"`
-        // while every duplicate needs confirming.
+        // candidate carries the fixed one. Letting a rule take it would make one
+        // line of a plan mean two different things.
         if name == disk_tools_core::DUPLICATE_RULE {
             return Err(format!(
                 "{where_}: `{name}` is reserved — it is the name the report gives to a copy found by `--dup`"
@@ -519,17 +547,36 @@ fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
             ));
         }
 
-        let Some(root) = entry.root else {
-            return Err(format!(
-                "{where_}: `root` is required — use \"*\" for a rule that applies wherever the scan goes"
-            ));
-        };
+        // A field that used to sit on the rule now sits in a part, and a rule
+        // still carrying one would match nothing at all — the silent failure
+        // this names instead.
+        for (field, present) in [
+            ("root", entry.root.is_some()),
+            ("includes", entry.includes.is_some()),
+            ("excludes", entry.excludes.is_some()),
+            ("requires", entry.requires.is_some()),
+            ("requires-sibling", entry.requires_sibling.is_some()),
+            ("requires-clean-repo", entry.requires_clean_repo.is_some()),
+            ("older-than", entry.older_than.is_some()),
+            ("min-size", entry.min_size.is_some()),
+        ] {
+            if present {
+                return Err(format!(
+                    "{where_}: `{field}` belongs to a part, not to the rule. A rule is a name, a tier and a list of parts:\n{EXAMPLE}"
+                ));
+            }
+        }
 
-        let includes = entry.includes.map(Strings::into_vec).unwrap_or_default();
-        if includes.is_empty() {
+        let parts = entry.parts.unwrap_or_default();
+        if parts.is_empty() {
             return Err(format!(
-                "{where_}: `includes` is required and must not be empty; a rule that matches nothing is not a rule"
+                "{where_}: `parts` is required and must not be empty. A node is claimed when it satisfies any one of them:\n{EXAMPLE}"
             ));
+        }
+
+        let mut converted = Vec::with_capacity(parts.len());
+        for (at, part) in parts.into_iter().enumerate() {
+            converted.push(convert_part(part, &format!("{where_}, part #{}", at + 1))?);
         }
 
         rules.push(Rule {
@@ -542,37 +589,88 @@ fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
                 // answer that asks.
                 .unwrap_or(Tier::Confirm),
             enabled: entry.enabled.unwrap_or(true),
-            // The file still spells a rule flat, so it makes exactly one part.
-            // Task 2 gives it the shape the core already has.
-            parts: vec![Part {
-                // The file's spelling of "no root". The core distinguishes an
-                // unrooted part from one rooted at `/`, and this is how a
-                // required field still expresses the former.
-                root: (root != "*").then_some(root),
-                includes,
-                excludes: entry.excludes.map(Strings::into_vec).unwrap_or_default(),
-                requires: entry
-                    .requires_sibling
-                    .map(Strings::into_vec)
-                    .unwrap_or_default(),
-                requires_clean_repo: entry.requires_clean_repo.unwrap_or(false),
-                older_than: entry
-                    .older_than
-                    .map(|value| {
-                        parse_duration(&value)
-                            .map_err(|err| format!("{where_}: `older-than`: {err}"))
-                    })
-                    .transpose()?,
-                min_size: entry
-                    .min_size
-                    .map(|value| size(&value, &format!("{where_}: `min-size`")))
-                    .transpose()?
-                    .unwrap_or(0),
-            }],
+            parts: converted,
         });
     }
 
     Ok(rules)
+}
+
+/// What a rule looks like, shown wherever one is refused for its shape.
+const EXAMPLE: &str = "\n  - name: rust-target\n    tier: trash\n    parts:\n      - root: \"*\"\n        includes: [\"**/target/\"]\n        requires: [\"Cargo.toml\"]\n";
+
+fn convert_part(entry: PartEntry, where_: &str) -> Result<Part, String> {
+    if entry.requires_sibling.is_some() {
+        return Err(format!(
+            "{where_}: `requires-sibling` is now `requires` — the same globs, matched the same way"
+        ));
+    }
+
+    let Some(root) = entry.root else {
+        return Err(format!(
+            "{where_}: `root` is required — use \"*\" for a part that applies wherever the scan goes"
+        ));
+    };
+
+    let includes = entry.includes.map(Strings::into_vec).unwrap_or_default();
+    if includes.is_empty() {
+        return Err(format!(
+            "{where_}: `includes` is required and must not be empty; a part that matches nothing is not a part"
+        ));
+    }
+    let excludes = entry.excludes.map(Strings::into_vec).unwrap_or_default();
+    let requires = entry.requires.map(Strings::into_vec).unwrap_or_default();
+
+    // A pattern is relative to its part's root and may not leave it. `..` is the
+    // only way it could, and every way it could is a mistake: an `includes` that
+    // escapes compiles to a glob no absolute path can match, silently disabling
+    // the part, and a `requires` that escapes cannot be checked statically at
+    // all, since the match's depth under the root is unknown until it is found.
+    for (field, patterns) in [
+        ("includes", &includes),
+        ("excludes", &excludes),
+        ("requires", &requires),
+    ] {
+        for pattern in patterns {
+            if leaves_its_root(pattern) {
+                return Err(format!(
+                    "{where_}: `{field}`: `{pattern}` leaves its root. A pattern is relative to `root` and may not climb above it"
+                ));
+            }
+        }
+    }
+
+    Ok(Part {
+        // The file's spelling of "no root". The core distinguishes an unrooted
+        // part from one rooted at `/`, and this is how a required field still
+        // expresses the former.
+        root: (root != "*").then_some(root),
+        includes,
+        excludes,
+        requires,
+        requires_clean_repo: entry.requires_clean_repo.unwrap_or(false),
+        older_than: entry
+            .older_than
+            .map(|value| {
+                parse_duration(&value).map_err(|err| format!("{where_}: `older-than`: {err}"))
+            })
+            .transpose()?,
+        min_size: entry
+            .min_size
+            .map(|value| size(&value, &format!("{where_}: `min-size`")))
+            .transpose()?
+            .unwrap_or(0),
+    })
+}
+
+/// Does this pattern contain a `..` component?
+///
+/// Both separators, because a config written on Windows is read on Linux and the
+/// answer must not depend on which.
+fn leaves_its_root(pattern: &str) -> bool {
+    pattern
+        .split(['/', '\\'])
+        .any(|component| component == "..")
 }
 
 /// The keeper rule, by the word the file uses.
@@ -618,7 +716,11 @@ struct FileConfig {
     clean: RawClean,
     #[serde(default)]
     duplicates: RawDuplicates,
-    rules: Option<Vec<RuleEntry>>,
+    clean_rules: Option<Vec<RuleEntry>>,
+    /// The former spelling, kept only to be **refused**. An unfamiliar key is a
+    /// warning here, so leaving it out would mean a file full of rules quietly
+    /// stops applying while `clean` runs on the built-ins.
+    rules: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -667,15 +769,41 @@ struct RawDuplicates {
 #[serde(rename_all = "kebab-case")]
 struct RuleEntry {
     name: Option<String>,
+    tier: Option<String>,
+    enabled: Option<bool>,
+    parts: Option<Vec<PartEntry>>,
+
+    // Everything a rule used to carry itself, kept only to say where it went.
+    // Silently ignoring them would leave a rule that matches nothing.
+    root: Option<serde::de::IgnoredAny>,
+    includes: Option<serde::de::IgnoredAny>,
+    excludes: Option<serde::de::IgnoredAny>,
+    requires: Option<serde::de::IgnoredAny>,
+    requires_sibling: Option<serde::de::IgnoredAny>,
+    requires_clean_repo: Option<serde::de::IgnoredAny>,
+    older_than: Option<serde::de::IgnoredAny>,
+    min_size: Option<serde::de::IgnoredAny>,
+}
+
+/// One part as the file spells it.
+///
+/// Everything that decides whether an object qualifies, and nothing else: the
+/// tier and the name are the rule's, because they are its consequence and its
+/// identity rather than a question about a path.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PartEntry {
     root: Option<String>,
     includes: Option<Strings>,
     excludes: Option<Strings>,
-    requires_sibling: Option<Strings>,
+    requires: Option<Strings>,
     requires_clean_repo: Option<bool>,
     older_than: Option<String>,
     min_size: Option<String>,
-    tier: Option<String>,
-    enabled: Option<bool>,
+
+    /// The former spelling, refused by name — it did not change meaning, and an
+    /// alias would outlive the rename.
+    requires_sibling: Option<serde::de::IgnoredAny>,
 }
 
 /// One pattern or several. `includes = "**/target/"` is the obvious thing to
@@ -845,10 +973,11 @@ mod tests {
     fn a_star_root_becomes_an_unrooted_rule() {
         let rules = rules_of(
             r#"
-rules:
+clean-rules:
   - name: "mine"
-    root: "*"
-    includes: ["**/x/"]
+    parts:
+      - root: "*"
+        includes: ["**/x/"]
 "#,
         );
 
@@ -859,10 +988,11 @@ rules:
     fn a_real_root_is_carried_through_as_written() {
         let rules = rules_of(
             r#"
-rules:
+clean-rules:
   - name: "mine"
-    root: "~/Projects"
-    includes: ["**/x/"]
+    parts:
+      - root: "~/Projects"
+        includes: ["**/x/"]
 "#,
         );
 
@@ -877,15 +1007,16 @@ rules:
     fn every_field_survives_the_conversion() {
         let rules = rules_of(
             r#"
-rules:
+clean-rules:
   - name: "mine"
-    root: "*"
-    includes: ["**/a/", "**/b"]
-    excludes: "**/vendor/**"
-    requires-sibling: ["Cargo.toml"]
-    requires-clean-repo: true
-    older-than: "90d"
-    min-size: "1M"
+    parts:
+      - root: "*"
+        includes: ["**/a/", "**/b"]
+        excludes: "**/vendor/**"
+        requires: ["Cargo.toml"]
+        requires-clean-repo: true
+        older-than: "90d"
+        min-size: "1M"
     tier: "trash"
     enabled: false
 "#,
@@ -916,10 +1047,11 @@ rules:
     fn includes_accepts_a_bare_string() {
         let rules = rules_of(
             r#"
-rules:
+clean-rules:
   - name: "mine"
-    root: "*"
-    includes: "**/x/"
+    parts:
+      - root: "*"
+        includes: "**/x/"
 "#,
         );
 
@@ -935,7 +1067,7 @@ rules:
             ("confirm", Tier::Confirm),
         ] {
             let rules = rules_of(&format!(
-                "rules:\n  - name: \"r\"\n    root: \"*\"\n    includes: [\"x\"]\n    tier: \"{word}\"\n"
+                "clean-rules:\n  - name: \"r\"\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n    tier: \"{word}\"\n"
             ));
             assert_eq!(rules[0].tier, expected, "`{word}`");
         }
@@ -1009,11 +1141,169 @@ rules:
     /// where it matters: a rule may say `tier = "purge"`, a duplicate never can.
     #[test]
     fn a_rule_may_not_take_the_name_the_report_gives_a_duplicate() {
-        let message =
-            message("rules:\n  - name: \"duplicate\"\n    root: \"*\"\n    includes: [\"x\"]\n");
+        let message = message(
+            "clean-rules:\n  - name: \"duplicate\"\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n",
+        );
 
         assert!(message.contains("reserved"), "{message}");
         assert!(message.contains("--dup"), "{message}");
+    }
+
+    // ---- the shape a rule must have --------------------------------------
+
+    /// Not a warning. An unfamiliar key is one here, so leaving the old list
+    /// name to `serde_ignored` would mean a file full of the user's rules stops
+    /// applying without a word while `clean` runs on the built-ins.
+    #[test]
+    fn the_renamed_list_is_refused_by_name() {
+        let message = message(
+            "rules:\n  - name: mine\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n",
+        );
+
+        assert!(message.contains("clean-rules"), "{message}");
+        assert!(
+            message.contains("parts"),
+            "and it shows the shape, since both changed at once: {message}"
+        );
+    }
+
+    /// The old list name wins over anything else wrong with the file: a stale
+    /// config should get the one message that explains all of it.
+    #[test]
+    fn the_renamed_list_is_reported_before_anything_inside_it() {
+        let message = message("rules:\n  - includes: [\"x\"]\n");
+        assert!(message.contains("clean-rules"), "{message}");
+        assert!(!message.contains("`name` is required"), "{message}");
+    }
+
+    #[test]
+    fn a_rule_without_parts_is_refused_and_shown_one() {
+        let message = message("clean-rules:\n  - name: mine\n    tier: trash\n");
+
+        assert!(message.contains("`parts` is required"), "{message}");
+        assert!(message.contains("mine"), "and names the rule: {message}");
+        assert!(
+            message.contains("includes:"),
+            "and shows what one looks like: {message}"
+        );
+    }
+
+    #[test]
+    fn an_empty_parts_list_is_refused_too() {
+        assert!(
+            message("clean-rules:\n  - name: mine\n    parts: []\n")
+                .contains("`parts` is required")
+        );
+    }
+
+    /// A field that moved into the part would otherwise be an unknown key — a
+    /// warning — and the rule would match nothing at all.
+    #[test]
+    fn a_field_left_on_the_rule_is_pointed_at_its_part() {
+        for field in [
+            "root: \"*\"",
+            "includes: [\"x\"]",
+            "excludes: [\"y\"]",
+            "requires: [\"z\"]",
+            "requires-clean-repo: true",
+            "older-than: 90d",
+            "min-size: \"1M\"",
+        ] {
+            let text = format!(
+                "clean-rules:\n  - name: mine\n    {field}\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n"
+            );
+            let message = message(&text);
+            assert!(message.contains("belongs to a part"), "{field}: {message}");
+        }
+    }
+
+    /// The rename did not change what the field means, only what it is called —
+    /// and an alias would outlive the rename.
+    #[test]
+    fn the_renamed_field_is_refused_by_name() {
+        let message = message(
+            "clean-rules:\n  - name: mine\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n        requires-sibling: [\"Cargo.toml\"]\n",
+        );
+
+        assert!(message.contains("`requires`"), "{message}");
+        assert!(
+            message.contains("part #1"),
+            "and says which part: {message}"
+        );
+    }
+
+    /// `..` is the only way a pattern can leave its root, and every way it can
+    /// do so is a mistake that would otherwise be silent: the glob simply never
+    /// matches, and the part it was written for stops claiming anything.
+    #[test]
+    fn a_pattern_may_not_climb_above_its_root() {
+        for (field, pattern) in [
+            ("includes", "../other/**"),
+            ("excludes", "**/../keep/"),
+            ("requires", "../Directory.Build.props"),
+        ] {
+            // The `includes` case replaces the line rather than adding a second
+            // one: a duplicate key is a YAML error, and this test is about the
+            // pattern, not about the file.
+            let includes = if field == "includes" {
+                format!("[\"{pattern}\"]")
+            } else {
+                "[\"**/x/\"]".to_owned()
+            };
+            let extra = if field == "includes" {
+                String::new()
+            } else {
+                format!("        {field}: [\"{pattern}\"]\n")
+            };
+            let text = format!(
+                "clean-rules:\n  - name: mine\n    parts:\n      - root: \"~/Projects\"\n        includes: {includes}\n{extra}"
+            );
+            let message = message(&text);
+            assert!(message.contains("leaves its root"), "{field}: {message}");
+            assert!(message.contains(pattern), "{field}: {message}");
+        }
+    }
+
+    /// A Windows separator is the same mistake, and a file written on one
+    /// platform is read on the others.
+    #[test]
+    fn a_backslash_climb_is_refused_as_well() {
+        let message = message(
+            "clean-rules:\n  - name: mine\n    parts:\n      - root: \"*\"\n        includes: [\"..\\\\other\"]\n",
+        );
+        assert!(message.contains("leaves its root"), "{message}");
+    }
+
+    /// Two parts under one name and one tier — the whole point of the shape.
+    #[test]
+    fn a_rule_may_carry_several_parts() {
+        let rules = rules_of(
+            r#"
+clean-rules:
+  - name: dotnet-output
+    tier: purge
+    parts:
+      - root: "~/"
+        includes: ["**/bin/", "**/obj/"]
+        requires: ["*.csproj"]
+      - root: "~/work"
+        includes: ["**/bin/"]
+        requires: ["*.fsproj"]
+        min-size: "1M"
+"#,
+        );
+
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert_eq!(rule.tier, Tier::Purge, "the consequence is the rule's");
+        assert_eq!(rule.parts.len(), 2);
+        assert_eq!(rule.parts[0].requires, vec!["*.csproj".to_owned()]);
+        assert_eq!(rule.parts[1].root.as_deref(), Some("~/work"));
+        assert_eq!(
+            rule.parts[1].min_size, 1_048_576,
+            "a threshold belongs to the part that set it"
+        );
+        assert_eq!(rule.parts[0].min_size, 0, "and not to the one beside it");
     }
 
     /// Not an alias. An alias lives for ever; an error costs one edit and stops
@@ -1022,7 +1312,7 @@ rules:
     #[test]
     fn the_renamed_tier_is_refused_by_name() {
         let err = at(
-            "rules:\n  - name: \"r\"\n    root: \"*\"\n    includes: [\"x\"]\n    tier: \"auto\"\n",
+            "clean-rules:\n  - name: \"r\"\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n    tier: \"auto\"\n",
         )
         .expect_err("`auto` must not parse");
 
@@ -1037,7 +1327,7 @@ rules:
     #[test]
     fn an_unknown_tier_names_the_three() {
         let err =
-            at("rules:\n  - name: \"r\"\n    root: \"*\"\n    includes: [\"x\"]\n    tier: \"maybe\"\n")
+            at("clean-rules:\n  - name: \"r\"\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n    tier: \"maybe\"\n")
                 .expect_err("`maybe` is not a tier");
 
         let message = err.to_string();
@@ -1051,10 +1341,11 @@ rules:
     fn an_unstated_tier_is_confirm() {
         let rules = rules_of(
             r#"
-rules:
+clean-rules:
   - name: "mine"
-    root: "*"
-    includes: ["**/x/"]
+    parts:
+      - root: "*"
+        includes: ["**/x/"]
 "#,
         );
 
@@ -1068,7 +1359,7 @@ rules:
     #[test]
     fn absent_rules_keep_the_builtins_but_an_empty_list_does_not() {
         assert_eq!(rules_of("report:\n  n: 5\n"), builtin_rules());
-        assert!(rules_of("rules: []\n").is_empty());
+        assert!(rules_of("clean-rules: []\n").is_empty());
     }
 
     // ---- what is refused -------------------------------------------------
@@ -1089,9 +1380,10 @@ rules:
     fn a_rule_without_a_root_is_refused_by_name() {
         let message = message(
             r#"
-rules:
+clean-rules:
   - name: "mine"
-    includes: ["**/x/"]
+    parts:
+      - includes: ["**/x/"]
 "#,
         );
 
@@ -1106,8 +1398,8 @@ rules:
     #[test]
     fn a_rule_without_includes_is_refused_by_name() {
         for text in [
-            "rules:\n  - name: \"mine\"\n    root: \"*\"\n",
-            "rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: []\n",
+            "clean-rules:\n  - name: \"mine\"\n    parts:\n      - root: \"*\"\n",
+            "clean-rules:\n  - name: \"mine\"\n    parts:\n      - root: \"*\"\n        includes: []\n",
         ] {
             let message = message(text);
             assert!(message.contains("rule `mine`"), "{message}");
@@ -1119,7 +1411,8 @@ rules:
     /// position instead.
     #[test]
     fn a_nameless_rule_is_refused_by_position() {
-        let message = message("rules:\n  - root: \"*\"\n    includes: [\"**/x/\"]\n");
+        let message =
+            message("clean-rules:\n  - root: \"*\"\n    parts:\n      - includes: [\"**/x/\"]\n");
 
         assert!(message.contains("rule #1"), "{message}");
         assert!(message.contains("name"), "{message}");
@@ -1131,14 +1424,16 @@ rules:
     fn a_duplicate_name_is_refused() {
         let message = message(
             r#"
-rules:
+clean-rules:
   - name: "mine"
-    root: "*"
-    includes: ["**/a/"]
+    parts:
+      - root: "*"
+        includes: ["**/a/"]
 
   - name: "mine"
-    root: "*"
-    includes: ["**/b/"]
+    parts:
+      - root: "*"
+        includes: ["**/b/"]
 "#,
         );
 
@@ -1149,7 +1444,7 @@ rules:
     #[test]
     fn a_bad_size_or_duration_names_the_key_and_the_rule() {
         let size = message(
-            "rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: [\"x\"]\n    min-size: \"1Q\"\n",
+            "clean-rules:\n  - name: \"mine\"\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n        min-size: \"1Q\"\n",
         );
         assert!(
             size.contains("rule `mine`") && size.contains("min-size"),
@@ -1157,7 +1452,7 @@ rules:
         );
 
         let age = message(
-            "rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: [\"x\"]\n    older-than: \"90\"\n",
+            "clean-rules:\n  - name: \"mine\"\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n        older-than: \"90\"\n",
         );
         assert!(
             age.contains("rule `mine`") && age.contains("older-than"),
@@ -1193,10 +1488,10 @@ rules:
     #[test]
     fn an_unknown_key_inside_a_rule_is_reported_with_its_path() {
         let config =
-            at("rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: [\"x\"]\n    tyer: \"auto\"\n")
+            at("clean-rules:\n  - name: \"mine\"\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n    tyer: \"auto\"\n")
                 .expect("must not fail");
 
-        assert_eq!(config.warnings, vec!["rules.0.tyer".to_owned()]);
+        assert_eq!(config.warnings, vec!["clean-rules.0.tyer".to_owned()]);
         assert_eq!(
             config.rules[0].tier,
             Tier::Confirm,
@@ -1237,7 +1532,7 @@ rules:
         assert!(
             std::fs::read_to_string(&target)
                 .expect("read")
-                .contains("rules:\n  -")
+                .contains("clean-rules:\n  - name:")
         );
     }
 

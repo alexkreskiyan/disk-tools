@@ -1805,7 +1805,7 @@ mod tests {
     #[test]
     fn without_a_path_the_rule_roots_are_walked() {
         let config = crate::config::parse_for_test(
-            "rules:\n  - name: \"a\"\n    root: \"/tmp/a\"\n    includes: [\"**/x/\"]\n\n  - name: \"b\"\n    root: \"/tmp/b\"\n    includes: [\"**/y/\"]\n",
+            "clean-rules:\n  - name: \"a\"\n    parts:\n      - root: \"/tmp/a\"\n        includes: [\"**/x/\"]\n  - name: \"b\"\n    parts:\n      - root: \"/tmp/b\"\n        includes: [\"**/y/\"]\n",
         );
         let mode = parse(&["clean"])
             .expect("parse")
@@ -1827,7 +1827,7 @@ mod tests {
     #[test]
     fn a_path_is_the_only_thing_walked() {
         let config = crate::config::parse_for_test(
-            "rules:\n  - name: \"a\"\n    root: \"/tmp/a\"\n    includes: [\"**/x/\"]\n",
+            "clean-rules:\n  - name: \"a\"\n    parts:\n      - root: \"/tmp/a\"\n        includes: [\"**/x/\"]\n",
         );
         let path = rooted("elsewhere");
         let mode = parse(&["clean", &path])
