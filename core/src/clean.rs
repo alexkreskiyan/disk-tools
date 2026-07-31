@@ -399,6 +399,11 @@ pub fn plan(tree: &ScanTree, options: &CleanOptions) -> CleanPlan {
 /// the rule that claimed it.
 ///
 /// Reserved in the config file, so a report naming it can only ever mean this.
+///
+/// Gated with the pass that produces it: without the feature nothing can carry
+/// this name, and a constant nothing can reach is dead code — which
+/// `just check-minimal` says out loud.
+#[cfg(feature = "duplicates")]
 pub const DUPLICATE_RULE: &str = "duplicate";
 
 /// Decide which redundant copies may go, and what that would free.
