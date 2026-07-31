@@ -18,8 +18,8 @@ its Roadmap for what lands when; the
 the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
 (the TUI) **is complete** — `disk-tools ui` browses a directory as a table, sizes
 its subdirectories in the background, colours them by what the rules say, filters
-with `/`, writes rules back to `config.toml` with every comment intact, and
-always gives the terminal back.
+with `/`, and always gives the terminal back. **Its rule editor is gone** — see
+the configuration section.
 **[v0.5](kb/specs/2026.07/2026.07.29-disk-tools-v0.5-preview-clean.md) is
 complete** — `preview` shows and `clean` removes, on an identical flag set;
 `--apply` and `--allow-dirty` are gone; the report unfolds by `-d` and orders by
@@ -103,19 +103,17 @@ disc-tools/
 │       ├── measure.rs  # one subtree's bytes and its claim; reports each directory as it finishes
 │       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
 ├── cli/                # disk-tools (bin) — CLI frontend
-│   ├── Cargo.toml      # clap, toml, serde, serde_ignored, indicatif, unicode-width
+│   ├── Cargo.toml      # clap, yaml_serde, serde, serde_ignored, indicatif, unicode-width
 │   ├── src/
 │   │   ├── main.rs     # verb dispatch (scan | preview | clean | ui); spinner to stderr
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
 │   │   ├── config/     # locate/parse/validate the TOML file; `config init`
-│   │   │   └── write.rs    # putting a rule back, comments and all
-│   │   ├── ui/         # the TUI
+│   │   │   ├── ui/         # the TUI
 │   │   │   ├── term.rs     # restores the terminal on every path
 │   │   │   ├── app.rs      # cwd, cursor, order, filter — every key as a function
 │   │   │   ├── listing.rs  # one directory, one metadata call per entry
 │   │   │   ├── sort.rs     # four orders; reports the one it could apply
 │   │   │   ├── layout.rs   # the table: which columns fit, and what is in them
-│   │   │   ├── edit.rs     # the rule form and its chooser, as values
 │   │   │   └── measure.rs  # the sizing worker, its queue and its session cache
 │   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
 │   │   └── render/
@@ -271,11 +269,13 @@ Invariants worth keeping in mind:
   only while that column sorted.
 - **The TUI cancels only what the user asks it to** (`r`) and what exit
   requires. Cancelling on navigation destroyed work that was about to be wanted.
-- **The config file is edited, never regenerated.** `toml_edit` keeps comments,
-  spacing and key order; serialising the parsed form would throw away the
-  explanations that make the file worth having. An **absent `[[rules]]` means
-  "leave the built-ins alone"**, so adding the first rule writes them out too
-  rather than silently turning five rules into one.
+- **The tool never writes the config file except `config init`,** which refuses
+  to overwrite without `-f`. v0.4's comment-preserving write-back is gone with
+  the TOML it was built on: the YAML editor that could have replaced it produces
+  wrong indentation on the one operation it was needed for (appending a mapping
+  to a sequence), and a config editor that can corrupt a config is worse than
+  none. An **absent `rules:` still means "leave the built-ins alone"**, and an
+  empty list still means "no rules".
 - **A colour and a candidate are decided by the same code.** `detect::claim` and
   `Rules::state` both run `matching` → `excluded` → `predicates_hold`, in that
   order. A `target/` with no `Cargo.toml` beside it is `in scope`, not
@@ -295,13 +295,15 @@ Invariants worth keeping in mind:
 
 ## Configuration
 
-`disk-tools` reads a TOML file: `$XDG_CONFIG_HOME/disk-tools/config.toml` when
-that is set (on **every** platform), otherwise `%APPDATA%\disk-tools\config.toml`
-on Windows and `~/.config/disk-tools/config.toml` elsewhere. `--config <PATH>`
-overrides it; `disk-tools config init` writes the commented defaults.
+`disk-tools` reads a YAML file: `$XDG_CONFIG_HOME/disk-tools/config.yml` when
+that is set (on **every** platform), otherwise `%APPDATA%\disk-tools\config.yml`
+on Windows and `~/.config/disk-tools/config.yml` elsewhere. `--config <PATH>`
+overrides it; `disk-tools config init` writes the commented defaults, and refuses to overwrite without `-f`.
 
-The file supplies the **rules**. An absent `[[rules]]` leaves the built-ins
-alone; an empty list means none. `root` is required, and `"*"` is how a rule says
+The file supplies the **rules**. An absent `rules:` leaves the built-ins alone;
+an empty list means none. A leftover `config.toml` with no `config.yml` beside it
+is an **error**, not a fallback: ignoring it would run `clean` under rules the
+user did not write. `root` is required, and `"*"` is how a rule says
 it applies wherever the scan goes. `tier` is one of `purge` / `trash` /
 `confirm`, and `"auto"` is an **error** naming `trash` rather than an alias.
 
@@ -323,7 +325,7 @@ What configuration exists beyond that is build-time:
 |------|-------|
 | `Cargo.toml` (workspace) | `version`, `edition = "2024"`, `rust-version = "1.88"`, inherited by both crates |
 | `core/Cargo.toml` | The optional `serde` and `duplicates` features; `windows-sys` under `[target.'cfg(windows)'.dependencies]`. **blake3 carries `features = ["pure"]`** — its default build assembles x86 sources through `cc`, which needs `ml64.exe` on the Windows target and so breaks `just lint-windows` on a Unix host |
-| `cli/Cargo.toml` | Enables the core's `serde` feature for `--json`; `toml_edit` for writing rules back |
+| `cli/Cargo.toml` | Enables the core's `serde` feature for `--json`; `yaml_serde` (the maintained fork of the archived `serde_yaml`) for the config |
 | `.gitattributes` | `* text=auto eol=lf` — a CRLF checkout would fail `cargo fmt --check` on Windows |
 
 `.gitignore` also lists `.env`, `.direnv/`, `chat/` and `logs/`; none of these

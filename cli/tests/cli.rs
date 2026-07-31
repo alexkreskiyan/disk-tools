@@ -588,7 +588,7 @@ fn a_relative_path_finds_what_the_absolute_one_does() {
     let config = home_dir.join("rules.toml");
     std::fs::write(
         &config,
-        "[[rules]]\nname = \"js\"\nroot = \"~\"\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n",
+        "rules:\n  - name: js\n    root: \"~\"\n    includes: [\"**/node_modules/\"]\n    tier: trash\n",
     )
     .expect("write config");
     let config = config.to_str().expect("utf8");
@@ -803,8 +803,8 @@ fn a_config_that_names_no_directory_says_so() {
     let home = isolated();
     let config = write(
         home.path(),
-        "config.toml",
-        "[[rules]]\nname = \"anywhere\"\nroot = \"*\"\nincludes = [\"**/x/\"]\n",
+        "config.yml",
+        "rules:\n  - name: \"anywhere\"\n    root: \"*\"\n    includes: [\"**/x/\"]\n",
     );
 
     let output = run(&["--config", config.to_str().expect("utf8"), "preview"]);
@@ -1092,8 +1092,8 @@ fn a_configured_rule_replaces_the_builtins() {
     let home = tempfile::tempdir().expect("tempdir");
     let config = write(
         home.path(),
-        "config.toml",
-        "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n",
+        "config.yml",
+        "rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: [\"**/node_modules/\"]\n    tier: \"trash\"\n",
     );
 
     let output = run(&[
@@ -1121,7 +1121,11 @@ fn a_configured_rule_replaces_the_builtins() {
 fn a_malformed_config_stops_the_program_before_scanning() {
     let fixture = node_modules_dir();
     let home = tempfile::tempdir().expect("tempdir");
-    let config = write(home.path(), "config.toml", "[scan]\none-file-system = \n");
+    let config = write(
+        home.path(),
+        "config.yml",
+        "scan:\n  one-file-system: true\n bad-indent: 1\n",
+    );
 
     let output = run(&[
         "--config",
@@ -1138,7 +1142,7 @@ fn a_malformed_config_stops_the_program_before_scanning() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("line 2"),
+        stderr.contains("line 3"),
         "must locate the mistake:\n{stderr}"
     );
 }
@@ -1171,8 +1175,8 @@ fn an_unknown_key_warns_but_the_run_continues() {
     let home = tempfile::tempdir().expect("tempdir");
     let config = write(
         home.path(),
-        "config.toml",
-        "[scan]\none-file-sistem = true\n",
+        "config.yml",
+        "scan:\n  one-file-sistem: true\n",
     );
 
     let output = run(&[
@@ -1202,8 +1206,8 @@ fn a_rule_missing_its_root_is_refused_by_name() {
     let home = tempfile::tempdir().expect("tempdir");
     let config = write(
         home.path(),
-        "config.toml",
-        "[[rules]]\nname = \"mine\"\nincludes = [\"**/x/\"]\n",
+        "config.yml",
+        "rules:\n  - name: \"mine\"\n    includes: [\"**/x/\"]\n",
     );
 
     let output = run(&[
@@ -1224,7 +1228,7 @@ fn a_rule_missing_its_root_is_refused_by_name() {
 #[test]
 fn config_init_writes_a_usable_file_and_prints_its_path() {
     let home = tempfile::tempdir().expect("tempdir");
-    let target = home.path().join("nested").join("config.toml");
+    let target = home.path().join("nested").join("config.yml");
 
     let output = run(&["--config", target.to_str().expect("utf8"), "config", "init"]);
 
@@ -1252,7 +1256,7 @@ fn config_init_writes_a_usable_file_and_prints_its_path() {
 #[test]
 fn config_init_refuses_to_overwrite_without_force() {
     let home = tempfile::tempdir().expect("tempdir");
-    let target = write(home.path(), "config.toml", "# mine\n");
+    let target = write(home.path(), "config.yml", "# mine\n");
 
     let output = run(&["--config", target.to_str().expect("utf8"), "config", "init"]);
 
@@ -1275,7 +1279,7 @@ fn config_init_refuses_to_overwrite_without_force() {
     assert!(
         std::fs::read_to_string(&target)
             .expect("read")
-            .contains("[[rules]]")
+            .contains("rules:\n  -")
     );
 }
 
@@ -1288,14 +1292,14 @@ fn seed_node_modules(dir: &Path, bytes: usize) {
 
 /// A config rooting one rule at each of `roots`.
 fn rules_rooted_at(at: &Path, roots: &[&Path]) -> std::path::PathBuf {
-    let mut text = String::new();
+    let mut text = String::from("rules:\n");
     for (index, root) in roots.iter().enumerate() {
         text.push_str(&format!(
-            "[[rules]]\nname = \"r{index}\"\nroot = {:?}\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n\n",
+            "  - name: \"r{index}\"\n    root: {:?}\n    includes: [\"**/node_modules/\"]\n    tier: \"trash\"\n",
             root.to_str().expect("utf8")
         ));
     }
-    write(at, "config.toml", &text)
+    write(at, "config.yml", &text)
 }
 
 /// The promise Task 2 made when it required `root` in the file.
@@ -1552,8 +1556,8 @@ fn the_setting_can_be_turned_off() {
     let home = isolated();
     let config = write(
         home.path(),
-        "config.toml",
-        "[clean]\nrequire-confirmation = false\n",
+        "config.yml",
+        "clean:\n  require-confirmation: false\n",
     );
 
     let output = run(&[

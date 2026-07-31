@@ -19,8 +19,6 @@
 //! over one would make the tool brittle for no safety gained — so it is a
 //! warning, naming the key so the typo is findable.
 
-pub mod write;
-
 use crate::args::{parse_duration, parse_size};
 use disk_tools_core::{Keep, Rule, Tier, UserDirs, builtin_rules};
 use serde::Deserialize;
@@ -51,24 +49,25 @@ pub const DEFAULT_CONFIG: &str = r#"# disk-tools configuration.
 #
 # The never-touch denylist is NOT here and cannot be configured.
 
-[scan]                          # walk behaviour, for `scan <PATH>` only
-one-file-system = false
+# Walk behaviour, for `scan <PATH>` only.
+scan:
+  one-file-system: false
 
 # `scan` only, and display only — none of it ever changes a total. `preview`
 # and `clean` list every candidate: that list is what you act on by running the
 # other verb, and a truncated one would be acting on what was never shown.
 #
 # Commented-out keys are the built-in defaults; uncomment to change them.
-#   n     = 20    # show at most this many entries. Default: all of them.
-#   depth = 2     # print at most this many levels. 0 is the root alone,
-#                 # exactly as --depth 0 means. Default: unlimited.
-[report]
-min-size = "0"
-apparent = false
+#   n: 20        # show at most this many entries. Default: all of them.
+#   depth: 2     # print at most this many levels. 0 is the root alone,
+#                # exactly as --depth 0 means. Default: unlimited.
+report:
+  min-size: "0"
+  apparent: false
 
-[clean]
-require-confirmation = true     # clean refuses while confirm-tier remains
-safe                 = false    # as if --safe were always passed
+clean:
+  require-confirmation: true   # clean refuses while confirm-tier remains
+  safe: false                  # as if --safe were always passed
 
 # `preview --dup <PATH>` / `clean --dup <PATH>`. This section says *how* that
 # searches, never whether it runs: there is no key here that turns duplicates
@@ -94,10 +93,12 @@ safe                 = false    # as if --safe were always passed
 # `keep-in` beats `keep` outright: a group with a copy under one of these roots
 # keeps that copy, and `keep` then only chooses among them. Tried in order.
 # `~` and `%APPDATA%` expand as in a rule's `root`.
-[duplicates]
-min-size = "1M"
-keep     = "oldest-created"
-# keep-in  = ["~/Photos", "~/Documents"]
+duplicates:
+  min-size: "1M"
+  keep: oldest-created
+  # keep-in:
+  #   - ~/Photos
+  #   - ~/Documents
 
 # Rules. List order is precedence: the first match claims the node, and a
 # claimed node is never descended into.
@@ -115,8 +116,8 @@ keep     = "oldest-created"
 # a `bin/` is .NET output is `Whatever.csproj`. A pattern with no metacharacters
 # matches itself, so "Cargo.toml" still means exactly that.
 #
-#   requires-sibling = "*.csproj"                   # a .NET project lives here
-#   requires-sibling = ["*.csproj", "*.sln"]        # and a solution beside it
+#   requires-sibling: "*.csproj"                # a .NET project lives here
+#   requires-sibling: ["*.csproj", "*.sln"]     # and a solution beside it
 #
 # `tier` says what `clean` does with what the rule claims. Three answers to one
 # question, and an unstated tier is the cautious one:
@@ -130,41 +131,43 @@ keep     = "oldest-created"
 # `--safe` drops what needs confirming, so it keeps *both* of the others: purge
 # is a stronger claim of regenerability than trash, not a weaker one. Anything
 # but `confirm` is a claim this tool cannot check — it takes your word and acts.
+#
+# Two more, not shown below:
+#
+#   older-than: 90d    only claim it if nothing has touched it for this long
+#   min-size: "10M"    only claim it if it is at least this big
+#   enabled: false     keep the rule written down and stop applying it
 
-[[rules]]
-name                = "rust-target"
-root                = "*"
-includes            = ["**/target/"]
-requires-sibling    = "Cargo.toml"   # without it, target/ is an ordinary directory
-requires-clean-repo = true
-tier                = "trash"
+rules:
+  - name: rust-target
+    root: "*"
+    includes: ["**/target/"]
+    requires-sibling: Cargo.toml   # without it, target/ is an ordinary directory
+    requires-clean-repo: true
+    tier: trash
 
-[[rules]]
-name     = "node-modules"
-root     = "*"
-includes = ["**/node_modules/"]
-tier     = "trash"
+  - name: node-modules
+    root: "*"
+    includes: ["**/node_modules/"]
+    tier: trash
 
-[[rules]]
-name     = "pycache"
-root     = "*"
-includes = ["**/__pycache__/", "**/*.pyc"]
-tier     = "trash"
+  - name: pycache
+    root: "*"
+    includes: ["**/__pycache__/", "**/*.pyc"]
+    tier: trash
 
-# The tilde is the whole safety of this one: `~/Library/Caches` is regenerable
-# user data, and `/Library/Caches` is on the denylist. No `**` — the cache root
-# itself is the candidate, not each thing inside it.
-[[rules]]
-name     = "user-caches"
-root     = "~"
-includes = [".cache/", "Library/Caches/"]
-tier     = "trash"
+  # The tilde is the whole safety of this one: `~/Library/Caches` is regenerable
+  # user data, and `/Library/Caches` is on the denylist. No `**` — the cache root
+  # itself is the candidate, not each thing inside it.
+  - name: user-caches
+    root: "~"
+    includes: [".cache/", "Library/Caches/"]
+    tier: trash
 
-[[rules]]
-name     = "windows-temp"
-root     = "%LOCALAPPDATA%"
-includes = ["Temp/"]
-tier     = "trash"
+  - name: windows-temp
+    root: "%LOCALAPPDATA%"
+    includes: ["Temp/"]
+    tier: trash
 "#;
 
 /// The file's contents, validated and converted.
@@ -259,6 +262,10 @@ pub enum ConfigError {
     Invalid(PathBuf, String),
     /// `config init` will not write over something.
     Exists(PathBuf),
+    /// A `config.toml` from before the format changed, with no `config.yml`
+    /// beside it. Refused rather than ignored: ignoring it means running under
+    /// rules the user did not write.
+    Former(PathBuf),
     Write(PathBuf, io::Error),
 }
 
@@ -274,6 +281,13 @@ impl fmt::Display for ConfigError {
             ConfigError::Exists(path) => write!(
                 f,
                 "{}: already exists; pass --force to overwrite it",
+                path.display()
+            ),
+            ConfigError::Former(path) => write!(
+                f,
+                "{} is from before the configuration moved to YAML, and there is no {FILE} \
+                 beside it.\nRewrite it as {FILE} — `disk-tools config init` writes a \
+                 commented example — or delete it to run on the built-in rules",
                 path.display()
             ),
             ConfigError::Write(path, err) => write!(f, "{}: {err}", path.display()),
@@ -300,8 +314,21 @@ pub fn locate(explicit: Option<&Path>, dirs: &UserDirs, xdg: Option<PathBuf>) ->
 }
 
 fn config_file(dir: &Path) -> PathBuf {
-    dir.join("disk-tools").join("config.toml")
+    dir.join("disk-tools").join(FILE)
 }
+
+/// The file's name. YAML, because the rule model this describes is a list of
+/// records with lists inside them, and TOML spells that as a stack of
+/// `[[table]]` headers that reads worse the more of it there is.
+pub const FILE: &str = "config.yml";
+
+/// What the file used to be called.
+///
+/// Kept only to be refused: an unfamiliar *key* is a warning here, so a leftover
+/// `config.toml` would simply not be found, the built-in rules would apply, and
+/// `clean` would run under rules the user did not write. That is the one outcome
+/// worth stopping for.
+const FORMER: &str = "config.toml";
 
 #[cfg(windows)]
 fn platform_dir(dirs: &UserDirs) -> Option<PathBuf> {
@@ -332,10 +359,17 @@ pub fn load(
         Ok(text) => parse(&path, &text),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             if explicit.is_some() {
-                Err(ConfigError::Missing(path))
-            } else {
-                Ok(Config::default())
+                return Err(ConfigError::Missing(path));
             }
+            // An absent file at the default path is ordinary — unless the file
+            // this one replaced is sitting right beside it, in which case the
+            // user has rules that have silently stopped applying.
+            if let Some(former) = path.parent().map(|dir| dir.join(FORMER))
+                && former.exists()
+            {
+                return Err(ConfigError::Former(former));
+            }
+            Ok(Config::default())
         }
         Err(err) => Err(ConfigError::Read(path, err)),
     }
@@ -376,9 +410,9 @@ pub fn parse_for_test(text: &str) -> Config {
 /// case below be tested from a string literal.
 fn parse(path: &Path, text: &str) -> Result<Config, ConfigError> {
     let mut warnings = Vec::new();
-    let syntax = |err: toml::de::Error| ConfigError::Parse(path.to_path_buf(), err.to_string());
+    let syntax = |err: yaml_serde::Error| ConfigError::Parse(path.to_path_buf(), err.to_string());
 
-    let deserializer = toml::Deserializer::parse(text).map_err(syntax)?;
+    let deserializer = yaml_serde::Deserializer::from_str(text);
     let file: FileConfig = serde_ignored::deserialize(deserializer, |key| {
         warnings.push(readable(&key.to_string()));
     })
@@ -687,7 +721,7 @@ mod tests {
     use std::time::Duration;
 
     fn at(text: &str) -> Result<Config, ConfigError> {
-        parse(Path::new("/cfg/config.toml"), text)
+        parse(Path::new("/cfg/config.yml"), text)
     }
 
     fn rules_of(text: &str) -> Vec<Rule> {
@@ -714,7 +748,7 @@ mod tests {
     fn xdg_config_home_wins_when_set() {
         assert_eq!(
             locate(None, &dirs("/home/me"), Some(PathBuf::from("/xdg"))),
-            Some(PathBuf::from("/xdg/disk-tools/config.toml"))
+            Some(PathBuf::from("/xdg/disk-tools/config.yml"))
         );
     }
 
@@ -723,7 +757,7 @@ mod tests {
     fn without_xdg_the_path_is_under_dot_config() {
         assert_eq!(
             locate(None, &dirs("/home/me"), None),
-            Some(PathBuf::from("/home/me/.config/disk-tools/config.toml"))
+            Some(PathBuf::from("/home/me/.config/disk-tools/config.yml"))
         );
     }
 
@@ -733,7 +767,7 @@ mod tests {
         assert_eq!(
             locate(None, &dirs(r"C:\Users\Me"), None),
             Some(PathBuf::from(
-                r"C:\Users\Me\AppData\Roaming\disk-tools\config.toml"
+                r"C:\Users\Me\AppData\Roaming\disk-tools\config.yml"
             ))
         );
     }
@@ -806,11 +840,11 @@ mod tests {
     fn a_star_root_becomes_an_unrooted_rule() {
         let rules = rules_of(
             r#"
-            [[rules]]
-            name = "mine"
-            root = "*"
-            includes = ["**/x/"]
-            "#,
+rules:
+  - name: "mine"
+    root: "*"
+    includes: ["**/x/"]
+"#,
         );
 
         assert_eq!(rules[0].root, None);
@@ -820,11 +854,11 @@ mod tests {
     fn a_real_root_is_carried_through_as_written() {
         let rules = rules_of(
             r#"
-            [[rules]]
-            name = "mine"
-            root = "~/Projects"
-            includes = ["**/x/"]
-            "#,
+rules:
+  - name: "mine"
+    root: "~/Projects"
+    includes: ["**/x/"]
+"#,
         );
 
         assert_eq!(
@@ -838,18 +872,18 @@ mod tests {
     fn every_field_survives_the_conversion() {
         let rules = rules_of(
             r#"
-            [[rules]]
-            name = "mine"
-            root = "*"
-            includes = ["**/a/", "**/b"]
-            excludes = "**/vendor/**"
-            requires-sibling = ["Cargo.toml"]
-            requires-clean-repo = true
-            older-than = "90d"
-            min-size = "1M"
-            tier = "trash"
-            enabled = false
-            "#,
+rules:
+  - name: "mine"
+    root: "*"
+    includes: ["**/a/", "**/b"]
+    excludes: "**/vendor/**"
+    requires-sibling: ["Cargo.toml"]
+    requires-clean-repo: true
+    older-than: "90d"
+    min-size: "1M"
+    tier: "trash"
+    enabled: false
+"#,
         );
 
         assert_eq!(
@@ -875,11 +909,11 @@ mod tests {
     fn includes_accepts_a_bare_string() {
         let rules = rules_of(
             r#"
-            [[rules]]
-            name = "mine"
-            root = "*"
-            includes = "**/x/"
-            "#,
+rules:
+  - name: "mine"
+    root: "*"
+    includes: "**/x/"
+"#,
         );
 
         assert_eq!(rules[0].includes, vec!["**/x/".to_owned()]);
@@ -894,7 +928,7 @@ mod tests {
             ("confirm", Tier::Confirm),
         ] {
             let rules = rules_of(&format!(
-                "[[rules]]\nname = \"r\"\nroot = \"*\"\nincludes = [\"x\"]\ntier = \"{word}\"\n"
+                "rules:\n  - name: \"r\"\n    root: \"*\"\n    includes: [\"x\"]\n    tier: \"{word}\"\n"
             ));
             assert_eq!(rules[0].tier, expected, "`{word}`");
         }
@@ -904,7 +938,7 @@ mod tests {
 
     #[test]
     fn the_duplicates_section_is_read() {
-        let config = at("[duplicates]\nmin-size = \"4M\"\nkeep = \"newest-created\"\nkeep-in = [\"~/Photos\", \"/other\"]\n")
+        let config = at("duplicates:\n  min-size: \"4M\"\n  keep: \"newest-created\"\n  keep-in: [\"~/Photos\", \"/other\"]\n")
             .expect("parse");
 
         assert_eq!(
@@ -931,14 +965,14 @@ mod tests {
     /// mtime and never carries a creation time.
     #[test]
     fn a_keeper_rule_without_a_date_is_refused_by_name() {
-        let message = message("[duplicates]\nkeep = \"oldest\"\n");
+        let message = message("duplicates:\n  keep: \"oldest\"\n");
         assert!(message.contains("oldest-created"), "{message}");
         assert!(message.contains("oldest-modified"), "{message}");
     }
 
     #[test]
     fn an_unknown_keeper_rule_names_all_five() {
-        let message = message("[duplicates]\nkeep = \"whichever\"\n");
+        let message = message("duplicates:\n  keep: \"whichever\"\n");
         for word in [
             "first",
             "oldest-created",
@@ -955,7 +989,7 @@ mod tests {
     /// into a different command than the one typed.
     #[test]
     fn no_key_here_can_switch_the_mode_on() {
-        let config = at("[duplicates]\ndup = true\nenabled = true\n").expect("parse");
+        let config = at("duplicates:\n  dup: true\n  enabled: true\n").expect("parse");
 
         assert_eq!(
             config.warnings,
@@ -969,7 +1003,7 @@ mod tests {
     #[test]
     fn a_rule_may_not_take_the_name_the_report_gives_a_duplicate() {
         let message =
-            message("[[rules]]\nname = \"duplicate\"\nroot = \"*\"\nincludes = [\"x\"]\n");
+            message("rules:\n  - name: \"duplicate\"\n    root: \"*\"\n    includes: [\"x\"]\n");
 
         assert!(message.contains("reserved"), "{message}");
         assert!(message.contains("--dup"), "{message}");
@@ -980,9 +1014,10 @@ mod tests {
     /// through.
     #[test]
     fn the_renamed_tier_is_refused_by_name() {
-        let err =
-            at("[[rules]]\nname = \"r\"\nroot = \"*\"\nincludes = [\"x\"]\ntier = \"auto\"\n")
-                .expect_err("`auto` must not parse");
+        let err = at(
+            "rules:\n  - name: \"r\"\n    root: \"*\"\n    includes: [\"x\"]\n    tier: \"auto\"\n",
+        )
+        .expect_err("`auto` must not parse");
 
         let message = err.to_string();
         assert!(message.contains("auto"), "{message}");
@@ -995,7 +1030,7 @@ mod tests {
     #[test]
     fn an_unknown_tier_names_the_three() {
         let err =
-            at("[[rules]]\nname = \"r\"\nroot = \"*\"\nincludes = [\"x\"]\ntier = \"maybe\"\n")
+            at("rules:\n  - name: \"r\"\n    root: \"*\"\n    includes: [\"x\"]\n    tier: \"maybe\"\n")
                 .expect_err("`maybe` is not a tier");
 
         let message = err.to_string();
@@ -1009,11 +1044,11 @@ mod tests {
     fn an_unstated_tier_is_confirm() {
         let rules = rules_of(
             r#"
-            [[rules]]
-            name = "mine"
-            root = "*"
-            includes = ["**/x/"]
-            "#,
+rules:
+  - name: "mine"
+    root: "*"
+    includes: ["**/x/"]
+"#,
         );
 
         assert_eq!(rules[0].tier, Tier::Confirm);
@@ -1025,31 +1060,32 @@ mod tests {
     /// silently disables every rule.
     #[test]
     fn absent_rules_keep_the_builtins_but_an_empty_list_does_not() {
-        assert_eq!(rules_of("[report]\nn = 5\n"), builtin_rules());
-        assert!(rules_of("rules = []\n").is_empty());
+        assert_eq!(rules_of("report:\n  n: 5\n"), builtin_rules());
+        assert!(rules_of("rules: []\n").is_empty());
     }
 
     // ---- what is refused -------------------------------------------------
 
     #[test]
     fn a_syntax_error_names_the_line() {
-        let message = message("[scan]\none-file-system = \n");
+        let message = message("scan:\n  one-file-system: true\n bad-indent: 1\n");
+        // yaml_serde counts from 1 and names the column, like `toml` did.
 
         assert!(
-            message.contains("line 2"),
+            message.contains("line 3"),
             "the message must locate the mistake: {message}"
         );
-        assert!(message.contains("/cfg/config.toml"), "{message}");
+        assert!(message.contains("/cfg/config.yml"), "{message}");
     }
 
     #[test]
     fn a_rule_without_a_root_is_refused_by_name() {
         let message = message(
             r#"
-            [[rules]]
-            name = "mine"
-            includes = ["**/x/"]
-            "#,
+rules:
+  - name: "mine"
+    includes: ["**/x/"]
+"#,
         );
 
         assert!(message.contains("rule `mine`"), "{message}");
@@ -1063,8 +1099,8 @@ mod tests {
     #[test]
     fn a_rule_without_includes_is_refused_by_name() {
         for text in [
-            "[[rules]]\nname = \"mine\"\nroot = \"*\"\n",
-            "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = []\n",
+            "rules:\n  - name: \"mine\"\n    root: \"*\"\n",
+            "rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: []\n",
         ] {
             let message = message(text);
             assert!(message.contains("rule `mine`"), "{message}");
@@ -1076,7 +1112,7 @@ mod tests {
     /// position instead.
     #[test]
     fn a_nameless_rule_is_refused_by_position() {
-        let message = message("[[rules]]\nroot = \"*\"\nincludes = [\"**/x/\"]\n");
+        let message = message("rules:\n  - root: \"*\"\n    includes: [\"**/x/\"]\n");
 
         assert!(message.contains("rule #1"), "{message}");
         assert!(message.contains("name"), "{message}");
@@ -1088,16 +1124,15 @@ mod tests {
     fn a_duplicate_name_is_refused() {
         let message = message(
             r#"
-            [[rules]]
-            name = "mine"
-            root = "*"
-            includes = ["**/a/"]
+rules:
+  - name: "mine"
+    root: "*"
+    includes: ["**/a/"]
 
-            [[rules]]
-            name = "mine"
-            root = "*"
-            includes = ["**/b/"]
-            "#,
+  - name: "mine"
+    root: "*"
+    includes: ["**/b/"]
+"#,
         );
 
         assert!(message.contains("rule `mine`"), "{message}");
@@ -1107,7 +1142,7 @@ mod tests {
     #[test]
     fn a_bad_size_or_duration_names_the_key_and_the_rule() {
         let size = message(
-            "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"x\"]\nmin-size = \"1Q\"\n",
+            "rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: [\"x\"]\n    min-size: \"1Q\"\n",
         );
         assert!(
             size.contains("rule `mine`") && size.contains("min-size"),
@@ -1115,7 +1150,7 @@ mod tests {
         );
 
         let age = message(
-            "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"x\"]\nolder-than = \"90\"\n",
+            "rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: [\"x\"]\n    older-than: \"90\"\n",
         );
         assert!(
             age.contains("rule `mine`") && age.contains("older-than"),
@@ -1127,7 +1162,7 @@ mod tests {
     /// carried around as an unparsed string to fail later.
     #[test]
     fn a_bad_report_size_is_refused_at_read_time() {
-        let message = message("[report]\nmin-size = \"12x\"\n");
+        let message = message("report:\n  min-size: \"12x\"\n");
 
         assert!(message.contains("[report] min-size"), "{message}");
     }
@@ -1138,7 +1173,7 @@ mod tests {
     /// make the tool brittle and protect nothing, so it is named and skipped.
     #[test]
     fn an_unknown_key_warns_and_parsing_continues() {
-        let config = at("[scan]\none-file-sistem = true\n").expect("must not fail");
+        let config = at("scan:\n  one-file-sistem: true\n").expect("must not fail");
 
         assert_eq!(config.warnings, vec!["scan.one-file-sistem".to_owned()]);
         assert_eq!(
@@ -1151,7 +1186,7 @@ mod tests {
     #[test]
     fn an_unknown_key_inside_a_rule_is_reported_with_its_path() {
         let config =
-            at("[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"x\"]\ntyer = \"auto\"\n")
+            at("rules:\n  - name: \"mine\"\n    root: \"*\"\n    includes: [\"x\"]\n    tyer: \"auto\"\n")
                 .expect("must not fail");
 
         assert_eq!(config.warnings, vec!["rules.0.tyer".to_owned()]);
@@ -1195,7 +1230,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(&target)
                 .expect("read")
-                .contains("[[rules]]")
+                .contains("rules:\n  -")
         );
     }
 

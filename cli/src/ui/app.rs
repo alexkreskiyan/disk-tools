@@ -19,12 +19,10 @@
 //! would mean re-reading the directory to widen the filter again, and a size
 //! arriving for a hidden row would have nowhere to land.
 
-use super::edit::{Chooser, Dialog, Form};
 use super::listing::{self, Entry};
 use super::measure::Sizer;
 use super::sort::{Applied, Order, sort};
-use crate::config::write;
-use disk_tools_core::{Facts, Rule, Rules, State, UserDirs};
+use disk_tools_core::{Facts, Rules, State};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,14 +77,6 @@ pub struct App {
     /// stays open.
     now: SystemTime,
 
-    /// For resolving `~` in a rule the user writes. The core reads no
-    /// environment either.
-    user_dirs: UserDirs,
-
-    /// The rule dialog, when one is open. Everything else on screen is frozen
-    /// behind it — a keypress means something different while a form has focus.
-    dialog: Option<Dialog>,
-
     /// How many rows the list band has. Set by the drawing code, which is the
     /// only place that knows — a page is a screenful, so it cannot be a
     /// constant.
@@ -98,12 +88,7 @@ impl App {
     ///
     /// Fails only if `root` itself cannot be read — the caller has already
     /// checked it exists, and there would be nothing to show.
-    pub fn open(
-        root: &Path,
-        rules: Rules,
-        now: SystemTime,
-        user_dirs: UserDirs,
-    ) -> std::io::Result<Self> {
+    pub fn open(root: &Path, rules: Rules, now: SystemTime) -> std::io::Result<Self> {
         let rules = Arc::new(rules);
         let mut app = App {
             cwd: root.to_path_buf(),
@@ -123,8 +108,6 @@ impl App {
             sizer: Sizer::new(Arc::clone(&rules), now),
             rules,
             now,
-            user_dirs,
-            dialog: None,
             page: 1,
         };
         let listed = app.read(root)?;
@@ -417,176 +400,6 @@ impl App {
         )
     }
 
-    pub fn dialog(&self) -> Option<&Dialog> {
-        self.dialog.as_ref()
-    }
-
-    /// Open the rule dialog on the entry under the cursor.
-    ///
-    /// The parent row is not a thing in this listing, so there is no rule to
-    /// write about it.
-    pub fn open_rules(&mut self) {
-        let Some(entry) = self.selected() else {
-            return;
-        };
-        if entry.name == PARENT {
-            return;
-        }
-
-        self.dialog = Some(Dialog::Choosing(Chooser::new(
-            &self.cwd,
-            &entry.name.to_string_lossy(),
-            entry.is_dir,
-            self.rules.names(),
-        )));
-    }
-
-    pub fn choose_down(&mut self) {
-        if let Some(Dialog::Choosing(chooser)) = &mut self.dialog {
-            chooser.down();
-        }
-    }
-
-    pub fn choose_up(&mut self) {
-        if let Some(Dialog::Choosing(chooser)) = &mut self.dialog {
-            chooser.up();
-        }
-    }
-
-    pub fn form_next(&mut self) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.next_field();
-        }
-    }
-
-    pub fn form_previous(&mut self) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.previous_field();
-        }
-    }
-
-    pub fn form_push(&mut self, ch: char) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.push(ch);
-        }
-    }
-
-    pub fn form_pop(&mut self) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.pop();
-        }
-    }
-
-    pub fn form_toggle(&mut self) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.toggle();
-        }
-    }
-
-    pub fn close_dialog(&mut self) {
-        // Nothing else is touched: cancelling has to leave the rules, the
-        // listing and the file exactly as they were.
-        self.dialog = None;
-    }
-
-    /// Move from the chooser to the form for whatever it is pointing at.
-    pub fn open_form(&mut self) {
-        let Some(Dialog::Choosing(chooser)) = &self.dialog else {
-            return;
-        };
-        // Taken by value before anything is written back: the chooser lives in
-        // the field about to be replaced.
-        let picked = chooser.picked().map(str::to_owned);
-        let (parent, name, is_dir) = (chooser.parent.clone(), chooser.name.clone(), chooser.is_dir);
-
-        let form = match picked {
-            Some(name) => match self.rules.get(&name) {
-                Some(rule) => Form::for_existing(rule),
-                // The list came from `Rules::names`, so this cannot happen — but
-                // a panic in a browser over a rule that moved is not a trade
-                // worth making.
-                None => return,
-            },
-            None => Form::for_new(&parent, &name, is_dir, &self.user_dirs),
-        };
-        self.dialog = Some(Dialog::Editing(Box::new(form)));
-    }
-
-    /// Try to close the form, writing the rule and putting it into effect.
-    ///
-    /// The file first, then the screen. A rule that recoloured the listing and
-    /// then failed to save would leave the user believing something that is not
-    /// on disk — and the next run would disagree with what they are looking at.
-    pub fn confirm_form(&mut self, config: Option<&Path>) {
-        let Some(Dialog::Editing(form)) = &mut self.dialog else {
-            return;
-        };
-
-        let taken = self.rules.names();
-        let Some(rule) = form.confirm(&taken, &self.user_dirs) else {
-            // The form stays open with the field flagged.
-            return;
-        };
-        let name = rule.name.clone();
-
-        let mut rules: Vec<Rule> = self.rules.to_vec();
-        match rules.iter().position(|existing| existing.name == name) {
-            // In place, because a rule's position is its precedence and an edit
-            // is not a request to change that.
-            Some(at) => rules[at] = rule.clone(),
-            None => rules.push(rule.clone()),
-        }
-
-        let compiled = match Rules::new(rules, &self.user_dirs) {
-            Ok(compiled) => compiled,
-            // `Form::confirm` already compiled this rule on its own, so the only
-            // way here is a clash with the rules around it.
-            Err(err) => {
-                if let Some(Dialog::Editing(form)) = &mut self.dialog {
-                    form.reject(err.to_string());
-                }
-                return;
-            }
-        };
-
-        let saved = match config {
-            Some(path) => match write::to_file(path, &rule) {
-                Ok(wrote) => wrote,
-                Err(problem) => {
-                    // The form stays open over a file that was not written. A
-                    // dialog that closes on a failed save is a dialog that lost
-                    // the user's work as well as their rule.
-                    if let Some(Dialog::Editing(form)) = &mut self.dialog {
-                        form.reject(problem);
-                    }
-                    return;
-                }
-            },
-            // Nothing in this environment implies a path — the same case
-            // `config init` cannot serve. The rule still works for this session.
-            None => {
-                self.dialog = None;
-                self.reload_rules(compiled);
-                self.notice = Some(format!(
-                    "rule `{name}` is in effect, but this environment names no config file to save it in"
-                ));
-                return;
-            }
-        };
-
-        self.dialog = None;
-        self.reload_rules(compiled);
-        self.notice = Some(match saved {
-            write::Wrote::Changed => format!("rule `{name}` changed"),
-            write::Wrote::Added => format!("rule `{name}` added"),
-            // Worth its own sentence: the file said nothing about rules, which
-            // left the built-ins in force, and it now lists them explicitly.
-            write::Wrote::AddedWithBuiltins => format!(
-                "rule `{name}` added, and the built-in rules written out beside it so they stay in force"
-            ),
-        });
-    }
-
     /// Swap in a freshly read rule set and repaint against it.
     ///
     /// The listing is not re-read: rules are about what the files mean, not
@@ -851,7 +664,7 @@ fn blank(cwd: &Path) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::edit::Field;
+    use disk_tools_core::{Rule, UserDirs};
 
     /// A fixed clock, so an `older_than` rule decides the same way every run.
     fn now() -> SystemTime {
@@ -908,8 +721,7 @@ mod tests {
     fn opens_sorted_by_name_with_directories_first() {
         let dir = fixture();
 
-        let app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         // `..` is a directory named `..`, so it sorts among them.
         assert_eq!(names(&app), ["..", "alpha", "zulu", "big.bin", "small.bin"]);
@@ -921,8 +733,7 @@ mod tests {
     #[test]
     fn the_cursor_stays_on_the_same_entry_when_the_order_changes() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         point_at(&mut app, "small.bin");
 
@@ -939,8 +750,7 @@ mod tests {
     #[test]
     fn pressing_the_active_order_again_reverses_it() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         assert!(!app.reverse());
         app.sort_by(Order::Name);
@@ -953,8 +763,7 @@ mod tests {
     #[test]
     fn entering_and_leaving_a_directory() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         point_at(&mut app, "alpha");
         app.enter();
@@ -979,8 +788,7 @@ mod tests {
     #[test]
     fn entering_the_parent_row_goes_up() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         point_at(&mut app, "alpha");
         app.enter();
 
@@ -993,8 +801,7 @@ mod tests {
     #[test]
     fn a_file_under_the_cursor_is_not_something_to_enter() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         point_at(&mut app, "big.bin");
 
         app.enter();
@@ -1021,8 +828,7 @@ mod tests {
             return;
         }
 
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         point_at(&mut app, "locked");
         let before = (app.cwd().to_path_buf(), app.cursor(), names(&app));
 
@@ -1040,8 +846,7 @@ mod tests {
     #[test]
     fn a_successful_move_clears_the_notice() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         app.notice = Some("stale".into());
 
         point_at(&mut app, "alpha");
@@ -1053,8 +858,7 @@ mod tests {
     #[test]
     fn the_cursor_cannot_leave_the_list() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         app.move_up();
         assert_eq!(app.cursor(), 0, "nothing above the first row");
@@ -1096,8 +900,7 @@ mod tests {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
 
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         assert!(
             app.entries()
@@ -1119,8 +922,7 @@ mod tests {
     fn the_parent_row_is_never_measured() {
         let dir = fixture();
 
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         await_sizes(&mut app);
 
         let parent = app
@@ -1137,8 +939,7 @@ mod tests {
     #[test]
     fn re_measuring_forgets_what_was_there_and_walks_again() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         await_sizes(&mut app);
         assert!(size_of(&app, "alpha").is_some());
 
@@ -1160,8 +961,7 @@ mod tests {
     fn returning_to_a_directory_reuses_the_sizes_already_computed() {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         await_sizes(&mut app);
         let before = size_of(&app, "alpha").expect("measured once");
 
@@ -1190,8 +990,7 @@ mod tests {
             std::fs::write(sub.join("f.bin"), vec![b'x'; bytes]).expect("write");
         }
 
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         app.sort_by(Order::Size);
         await_sizes(&mut app);
 
@@ -1213,8 +1012,7 @@ mod tests {
             std::fs::write(sub.join("f.bin"), vec![b'x'; 4096]).expect("write");
         }
 
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         point_at(&mut app, "zulu");
         app.enter();
         app.leave();
@@ -1230,8 +1028,7 @@ mod tests {
     #[test]
     fn a_filter_narrows_the_listing_as_it_is_typed() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         app.start_filtering();
         assert!(app.is_filtering());
@@ -1247,8 +1044,7 @@ mod tests {
     fn matching_ignores_case() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("Projects")).expect("mkdir");
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         app.start_filtering();
         for ch in "proj".chars() {
@@ -1266,8 +1062,7 @@ mod tests {
     #[test]
     fn a_filter_matching_nothing_still_offers_the_way_out() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         app.start_filtering();
         for ch in "qqqq".chars() {
@@ -1282,8 +1077,7 @@ mod tests {
     #[test]
     fn backspace_widens_the_filter_again() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         app.start_filtering();
         for ch in "zulu".chars() {
@@ -1302,8 +1096,7 @@ mod tests {
     #[test]
     fn accepting_keeps_the_filter_and_clearing_drops_it() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         app.start_filtering();
         app.filter_push('z');
 
@@ -1321,8 +1114,7 @@ mod tests {
     #[test]
     fn moving_directory_drops_the_filter() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         app.start_filtering();
         app.filter_push('a');
         app.filter_accept();
@@ -1340,8 +1132,7 @@ mod tests {
     fn a_hidden_row_keeps_the_size_it_was_given() {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/f.bin"), vec![b'x'; 8192]).expect("write");
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         app.start_filtering();
         for ch in "zulu".chars() {
@@ -1359,8 +1150,7 @@ mod tests {
         for n in 0..30 {
             std::fs::write(dir.path().join(format!("f{n:02}.bin")), b"x").expect("write");
         }
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         app.set_page(10);
 
         app.page_down();
@@ -1384,8 +1174,7 @@ mod tests {
     #[test]
     fn home_and_end_go_the_whole_way() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         app.jump_to_bottom();
         assert_eq!(app.cursor(), app.entries().len() - 1);
@@ -1398,8 +1187,7 @@ mod tests {
     #[test]
     fn paging_an_empty_listing_does_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         app.start_filtering();
         for ch in "nothing".chars() {
             app.filter_push(ch);
@@ -1429,7 +1217,7 @@ mod tests {
         )
         .expect("compiles");
 
-        let app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
+        let app = App::open(dir.path(), rules, now()).expect("open");
         let state_of = |name: &str| {
             app.entries()
                 .iter()
@@ -1454,8 +1242,7 @@ mod tests {
     fn a_directory_no_rule_reaches_needs_no_legend() {
         let dir = fixture();
 
-        let app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         assert!(app.entries().iter().all(|e| e.state == State::Untracked));
         assert!(!app.any_rule_applies());
@@ -1479,7 +1266,7 @@ mod tests {
         )
         .expect("compiles");
 
-        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), rules, now()).expect("open");
         assert!(
             !app.any_rule_applies()
                 || app
@@ -1522,8 +1309,7 @@ mod tests {
 
         let bare = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(bare.path().join("target")).expect("mkdir");
-        let app =
-            App::open(bare.path(), rules(bare.path()), now(), UserDirs::default()).expect("open");
+        let app = App::open(bare.path(), rules(bare.path()), now()).expect("open");
         assert_eq!(
             app.entries()
                 .iter()
@@ -1537,13 +1323,7 @@ mod tests {
         let crated = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(crated.path().join("target")).expect("mkdir");
         std::fs::write(crated.path().join("Cargo.toml"), b"[package]").expect("write");
-        let app = App::open(
-            crated.path(),
-            rules(crated.path()),
-            now(),
-            UserDirs::default(),
-        )
-        .expect("open");
+        let app = App::open(crated.path(), rules(crated.path()), now()).expect("open");
         assert_eq!(
             app.entries()
                 .iter()
@@ -1559,8 +1339,7 @@ mod tests {
     #[test]
     fn reloading_rules_repaints_without_moving_anything() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         point_at(&mut app, "zulu");
         let before = names(&app);
         assert!(!app.any_rule_applies());
@@ -1596,8 +1375,7 @@ mod tests {
             std::fs::write(inner.join("f.bin"), vec![b'x'; bytes]).expect("write");
         }
 
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         // Sizing `sub` reports everything beneath it on the way, so by now both
         // of its children are known and entering it starts no walk at all.
         await_sizes(&mut app);
@@ -1622,8 +1400,7 @@ mod tests {
     #[test]
     fn the_current_directory_is_a_row_of_its_own() {
         let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         await_sizes(&mut app);
 
         let here = app.here();
@@ -1642,8 +1419,7 @@ mod tests {
     fn the_current_directory_adds_up_its_listing() {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         await_sizes(&mut app);
 
         let listed: u64 = app
@@ -1664,8 +1440,7 @@ mod tests {
     fn the_current_directory_is_measuring_while_anything_under_it_is() {
         let dir = fixture();
 
-        let app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let app = App::open(dir.path(), Rules::default(), now()).expect("open");
 
         assert!(app.here().measuring, "{:?}", names(&app));
     }
@@ -1695,8 +1470,7 @@ mod tests {
         std::fs::write(dir.path().join("stale.pyc"), vec![b'x'; 4096]).expect("write");
         std::fs::write(dir.path().join("live.py"), vec![b'x'; 4096]).expect("write");
 
-        let mut app =
-            App::open(dir.path(), claiming(dir.path()), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), claiming(dir.path()), now()).expect("open");
         await_sizes(&mut app);
         let row = |name: &str| {
             app.entries()
@@ -1739,8 +1513,7 @@ mod tests {
         std::fs::create_dir_all(modules.join("dep")).expect("mkdir");
         std::fs::write(modules.join("dep/f.bin"), vec![b'x'; 16_384]).expect("write");
 
-        let mut app =
-            App::open(dir.path(), claiming(dir.path()), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), claiming(dir.path()), now()).expect("open");
         await_sizes(&mut app);
         let row = app
             .entries()
@@ -1763,8 +1536,7 @@ mod tests {
         std::fs::create_dir(&modules).expect("mkdir");
         std::fs::write(modules.join("dep.bin"), vec![b'x'; 16_384]).expect("write");
 
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
         await_sizes(&mut app);
         let claimed = |app: &App| {
             app.entries()
@@ -1781,256 +1553,11 @@ mod tests {
         assert!(claimed(&app).is_some_and(|bytes| bytes >= 16_384));
     }
 
-    /// A rule to compile against, for the dialog tests.
-    fn one_rule(root: &Path, name: &str, includes: &str) -> Rules {
-        Rules::new(
-            vec![Rule {
-                name: name.into(),
-                root: Some(root.to_string_lossy().into_owned()),
-                includes: vec![includes.into()],
-                ..Rule::default()
-            }],
-            &UserDirs::default(),
-        )
-        .expect("compiles")
-    }
-
-    fn form(app: &App) -> &crate::ui::edit::Form {
-        match app.dialog().expect("a dialog") {
-            Dialog::Editing(form) => form,
-            Dialog::Choosing(_) => panic!("still choosing"),
-        }
-    }
-
-    /// `a` offers both answers to "which rule": a new one, or any of the
-    /// existing ones.
-    #[test]
-    fn the_dialog_offers_a_new_rule_and_the_existing_ones() {
-        let dir = fixture();
-        let rules = one_rule(dir.path(), "junk", "**/alpha/");
-        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-
-        let Some(Dialog::Choosing(chooser)) = app.dialog() else {
-            panic!("a chooser")
-        };
-        assert_eq!(chooser.rows(), ["new rule for alpha", "junk"]);
-        assert_eq!(chooser.cursor(), 0, "a new rule is the first answer");
-    }
-
-    /// There is no rule to write about a directory that is not in this listing.
-    #[test]
-    fn the_parent_row_opens_no_dialog() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, PARENT);
-
-        app.open_rules();
-
-        assert!(app.dialog().is_none());
-    }
-
-    #[test]
-    fn picking_new_opens_a_form_prefilled_from_the_row() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-        app.open_form();
-
-        let form = form(&app);
-        assert!(!form.is_edit());
-        assert_eq!(form.value(Field::Name), "alpha");
-        assert_eq!(form.value(Field::Includes), "**/alpha/");
-    }
-
-    #[test]
-    fn picking_an_existing_rule_opens_it_as_it_stands() {
-        let dir = fixture();
-        let rules = one_rule(dir.path(), "junk", "**/alpha/");
-        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-        app.choose_down();
-        app.open_form();
-
-        let form = form(&app);
-        assert!(form.is_edit());
-        assert_eq!(form.value(Field::Name), "junk");
-        assert_eq!(form.value(Field::Includes), "**/alpha/");
-    }
-
-    /// Cancelling has to leave the rules, the listing and the file exactly as
-    /// they were.
-    #[test]
-    fn cancelling_changes_nothing() {
-        let dir = fixture();
-        let rules = one_rule(dir.path(), "junk", "**/alpha/");
-        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-        let before = names(&app);
-
-        app.open_rules();
-        app.open_form();
-        app.form_push('x');
-        app.close_dialog();
-
-        assert!(app.dialog().is_none());
-        assert_eq!(names(&app), before);
-        assert_eq!(
-            app.entries()
-                .iter()
-                .find(|e| e.name == "alpha")
-                .expect("listed")
-                .state,
-            State::Included,
-            "the rule that was in force still is"
-        );
-    }
-
-    /// A confirmed rule takes effect immediately, which is the only way to see
-    /// whether it says what was meant.
-    #[test]
-    fn a_confirmed_rule_recolours_the_listing() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-        assert!(!app.any_rule_applies());
-
-        app.open_rules();
-        app.open_form();
-        app.confirm_form(None);
-
-        assert!(app.dialog().is_none(), "the form closed");
-        assert_eq!(
-            app.entries()
-                .iter()
-                .find(|e| e.name == "alpha")
-                .expect("listed")
-                .state,
-            State::Included
-        );
-        let notice = app.notice().expect("a word about the file");
-        assert!(
-            notice.contains("names no config file"),
-            "with nowhere to save it, the rule still works and says so: {notice}"
-        );
-    }
-
-    /// An edit replaces the rule where it was: a rule's position is its
-    /// precedence, and rewriting one is not a request to change that.
-    #[test]
-    fn editing_a_rule_keeps_its_place_in_the_list() {
-        let dir = fixture();
-        let rules = Rules::new(
-            vec![
-                Rule {
-                    name: "first".into(),
-                    root: Some(dir.path().to_string_lossy().into_owned()),
-                    includes: vec!["**/alpha/".into()],
-                    ..Rule::default()
-                },
-                Rule {
-                    name: "second".into(),
-                    root: Some(dir.path().to_string_lossy().into_owned()),
-                    includes: vec!["**/zulu/".into()],
-                    ..Rule::default()
-                },
-            ],
-            &UserDirs::default(),
-        )
-        .expect("compiles");
-        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-        app.choose_down();
-        app.open_form();
-        app.confirm_form(None);
-
-        assert_eq!(app.rules.names(), ["first", "second"]);
-    }
-
-    /// A rejected form stays open with the field flagged, and nothing else
-    /// moves.
-    #[test]
-    fn a_rejected_form_stays_open_and_changes_nothing() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-        app.open_rules();
-        app.open_form();
-
-        // Clear the name, which is required.
-        for _ in 0.."alpha".len() {
-            app.form_pop();
-        }
-        app.confirm_form(None);
-
-        assert!(app.dialog().is_some(), "the form is still open");
-        assert_eq!(form(&app).problem().expect("a reason").field, Field::Name);
-        assert!(app.rules.is_empty(), "and no rule was added");
-    }
-
-    /// The file first, then the screen. A rule that recoloured the listing and
-    /// then failed to save would leave the user believing something that is not
-    /// on disk.
-    #[test]
-    fn a_confirmed_rule_reaches_the_config_file() {
-        let dir = fixture();
-        let config = dir.path().join("config.toml");
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-        app.open_form();
-        app.confirm_form(Some(&config));
-
-        let text = std::fs::read_to_string(&config).expect("written");
-        assert!(text.contains(r#"name = "alpha""#), "{text}");
-        let notice = app.notice().expect("a word about it");
-        assert!(!notice.contains("not written"), "{notice}");
-    }
-
-    /// A dialog that closes on a failed save loses the user's work as well as
-    /// their rule.
-    #[test]
-    fn a_write_that_fails_leaves_the_form_open() {
-        let dir = fixture();
-        // A directory where the file should be: the write cannot succeed, and
-        // nothing else about the situation is unusual.
-        let config = dir.path().join("alpha");
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-        app.open_form();
-        app.confirm_form(Some(&config));
-
-        assert!(app.dialog().is_some(), "still open");
-        assert!(form(&app).problem().is_some(), "and it says why");
-        assert!(
-            !app.any_rule_applies(),
-            "the rule did not take effect either"
-        );
-    }
-
     /// The root of the filesystem has no parent, so there is no `..` and
     /// leaving is a no-op rather than an error.
     #[test]
     fn there_is_no_way_up_from_the_top() {
-        let mut app = App::open(Path::new("/"), Rules::default(), now(), UserDirs::default())
-            .expect("open /");
+        let mut app = App::open(Path::new("/"), Rules::default(), now()).expect("open /");
 
         assert!(
             !names(&app).contains(&PARENT.to_owned()),

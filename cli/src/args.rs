@@ -96,7 +96,11 @@ pub enum ConfigAction {
     /// Write the default configuration, comments and all, so it can be edited.
     Init {
         /// Overwrite an existing file.
-        #[arg(long)]
+        ///
+        /// Without it an existing config stops the command: this reads as "show
+        /// me the defaults", and a command that reads that way must not be able
+        /// to throw away a file the user has edited.
+        #[arg(short = 'f', long)]
         force: bool,
     },
 }
@@ -934,7 +938,7 @@ mod tests {
     #[test]
     fn min_size_takes_the_flag_then_the_file_then_a_default_that_knows_the_mode() {
         let path = rooted("x");
-        let file = "[duplicates]\nmin-size = \"4M\"\n";
+        let file = "duplicates:\n  min-size: \"4M\"\n";
 
         assert_eq!(
             duplicating("", &["preview", &path, "--dup"])
@@ -980,7 +984,7 @@ mod tests {
     #[test]
     fn keep_takes_the_flag_then_the_file_then_the_original() {
         let path = rooted("x");
-        let file = "[duplicates]\nkeep = \"newest-modified\"\n";
+        let file = "duplicates:\n  keep: \"newest-modified\"\n";
 
         assert_eq!(
             duplicating("", &["preview", &path, "--dup"])
@@ -1033,7 +1037,7 @@ mod tests {
         // matching. CI caught exactly this, on a runner whose drive was `D:`.
         // Single quotes because a basic TOML string would read `\f` as an escape.
         let configured = rooted("from");
-        let file = format!("[duplicates]\nkeep-in = ['{configured}']\n");
+        let file = format!("duplicates:\n  keep-in: ['{configured}']\n");
 
         let from_file = duplicating(&file, &["preview", &path, "--dup"]).expect("dup");
         assert_eq!(from_file.keep_in, vec![PathBuf::from(&configured)]);
@@ -1063,7 +1067,7 @@ mod tests {
     #[test]
     fn a_configured_keep_in_expands_the_same_tokens_a_rule_root_does() {
         let path = rooted("x");
-        let config = crate::config::parse_for_test("[duplicates]\nkeep-in = [\"~/Photos\"]\n");
+        let config = crate::config::parse_for_test("duplicates:\n  keep-in: [\"~/Photos\"]\n");
         let home = PathBuf::from(rooted("home/me"));
         let mode = parse(&["preview", &path, "--dup"])
             .expect("parse")
@@ -1091,7 +1095,7 @@ mod tests {
     fn a_keep_in_root_with_no_home_drops_out() {
         let path = rooted("x");
         let found = duplicating(
-            "[duplicates]\nkeep-in = [\"~/Photos\"]\n",
+            "duplicates:\n  keep-in: [\"~/Photos\"]\n",
             &["preview", &path, "--dup"],
         )
         .expect("dup");
@@ -1159,7 +1163,7 @@ mod tests {
     #[test]
     fn every_setting_takes_the_flag_then_the_file_then_the_default() {
         // (setting, config, flag, expected)
-        let file = "[report]\nmin-size = \"1M\"\nn = 5\ndepth = 3\n";
+        let file = "report:\n  min-size: \"1M\"\n  n: 5\n  depth: 3\n";
 
         assert_eq!(
             scan_with("", &["scan", "/x"]).min_size,
@@ -1201,7 +1205,7 @@ mod tests {
     /// short of dropping the clap default can tell them apart.
     #[test]
     fn an_explicit_zero_beats_the_file() {
-        let file = "[report]\nmin-size = \"1M\"\n";
+        let file = "report:\n  min-size: \"1M\"\n";
 
         assert_eq!(
             scan_with(file, &["scan", "/x", "--min-size", "0"]).min_size,
@@ -1221,7 +1225,7 @@ mod tests {
     #[test]
     fn zero_depth_means_the_root_alone_in_both_places() {
         assert_eq!(
-            scan_with("[report]\ndepth = 0\n", &["scan", "/x"]).depth,
+            scan_with("report:\n  depth: 0\n", &["scan", "/x"]).depth,
             Some(0)
         );
         assert_eq!(
@@ -1235,7 +1239,7 @@ mod tests {
     /// rather than left to be discovered.
     #[test]
     fn a_boolean_set_in_the_file_cannot_be_unset_by_a_flag() {
-        let file = "[scan]\none-file-system = true\n\n[report]\napparent = true\n";
+        let file = "scan:\n  one-file-system: true\n\nreport:\n  apparent: true\n";
 
         let from_file = scan_with(file, &["scan", "/x"]);
         assert!(from_file.apparent);
@@ -1255,7 +1259,7 @@ mod tests {
         };
 
         assert!(!clean("", &["clean", "/x"]).safe_only);
-        assert!(clean("[clean]\nsafe = true\n", &["clean", "/x"]).safe_only);
+        assert!(clean("clean:\n  safe: true\n", &["clean", "/x"]).safe_only);
         assert!(clean("", &["clean", "/x", "--safe"]).safe_only);
     }
 
@@ -1265,7 +1269,7 @@ mod tests {
     #[test]
     fn the_dangerous_flags_have_no_file_counterpart() {
         let warnings =
-            crate::config::parse_for_test("[clean]\nallow-dirty = true\npurge = true\n").warnings;
+            crate::config::parse_for_test("clean:\n  allow-dirty: true\n  purge: true\n").warnings;
 
         assert_eq!(warnings, vec!["clean.allow-dirty", "clean.purge"]);
     }
@@ -1800,8 +1804,7 @@ mod tests {
     #[test]
     fn without_a_path_the_rule_roots_are_walked() {
         let config = crate::config::parse_for_test(
-            "[[rules]]\nname = \"a\"\nroot = \"/tmp/a\"\nincludes = [\"**/x/\"]\n\n\
-             [[rules]]\nname = \"b\"\nroot = \"/tmp/b\"\nincludes = [\"**/y/\"]\n",
+            "rules:\n  - name: \"a\"\n    root: \"/tmp/a\"\n    includes: [\"**/x/\"]\n\n  - name: \"b\"\n    root: \"/tmp/b\"\n    includes: [\"**/y/\"]\n",
         );
         let mode = parse(&["clean"])
             .expect("parse")
@@ -1823,7 +1826,7 @@ mod tests {
     #[test]
     fn a_path_is_the_only_thing_walked() {
         let config = crate::config::parse_for_test(
-            "[[rules]]\nname = \"a\"\nroot = \"/tmp/a\"\nincludes = [\"**/x/\"]\n",
+            "rules:\n  - name: \"a\"\n    root: \"/tmp/a\"\n    includes: [\"**/x/\"]\n",
         );
         let path = rooted("elsewhere");
         let mode = parse(&["clean", &path])
