@@ -13,13 +13,16 @@
 use super::clean::write_notices;
 use super::{age, tree::format_size};
 use crate::args::{Intent, Report, Sort};
-use disk_tools_core::{Candidate, CleanPlan, Keep, Kept};
+use disk_tools_core::{Candidate, CleanPlan, Keep, Kept, Searched};
 use std::fmt::Write;
 use std::time::SystemTime;
 
 /// One group as the report sees it: the copy that stays, and what goes with it.
 struct Group<'a> {
     kept: &'a Kept,
+    /// The pool this group formed in — why these copies were compared with each
+    /// other and not with anything else.
+    rule: &'a str,
     copies: Vec<&'a Candidate>,
     /// What removing every copy here would free.
     reclaimable: u64,
@@ -40,18 +43,21 @@ pub fn render_dup(
     intent: Intent,
     report: Report,
     now: SystemTime,
+    pools: &[Searched],
 ) -> String {
     let mut out = String::new();
     let groups = group(&plan.candidates, report.sort);
 
     if groups.is_empty() {
-        // Two knobs explain almost every empty run, and naming them is the
-        // difference between "there are none" and "you did not look there".
+        // What was searched comes **first**, because it is what tells "there are
+        // none here" from "here was nowhere". A count of pools and their sizes
+        // is the only thing that can.
+        let _ = writeln!(out, "No duplicates found.\n");
+        write_pools(pools, &mut out);
         let _ = writeln!(
             out,
-            "No duplicates found.\n\n\
-             Files below --min-size are never compared, and anything inside a directory \
-             your rules claim — a node_modules, a target — is skipped whole."
+            "\nFiles below --min-size are never compared, and anything inside a directory \
+             your clean rules claim — a node_modules, a target — is skipped whole."
         );
         write_notices(plan, hidden_by_safe, intent, &mut out);
         return out;
@@ -73,6 +79,7 @@ pub fn render_dup(
 
     let _ = writeln!(out);
     write_total(plan, &groups, &mut out);
+    write_pools(pools, &mut out);
     write_degraded(&groups, &mut out);
     write_notices(plan, hidden_by_safe, intent, &mut out);
 
@@ -100,6 +107,7 @@ fn group<'a>(candidates: &'a [Candidate], sort: Sort) -> Vec<Group<'a>> {
             }
             None => groups.push(Group {
                 kept,
+                rule: &candidate.rule,
                 reclaimable: candidate.allocated,
                 each: candidate.allocated,
                 copies: vec![candidate],
@@ -132,16 +140,23 @@ fn write_groups(groups: &[Group<'_>], out: &mut String) {
         .map(|g| (g.copies.len() + 1).to_string().len())
         .max()
         .unwrap_or(1);
+    let rule_width = groups
+        .iter()
+        .map(|g| g.rule.chars().count())
+        .max()
+        .unwrap_or(0);
 
     for group in groups {
         let _ = writeln!(
             out,
-            "{size:>8}  ×{count:<cw$}  keeps {path}{degraded}",
+            "{size:>8}  ×{count:<cw$}  {rule:<rw$}  keeps {path}{degraded}",
             size = format_size(group.reclaimable),
             count = group.copies.len() + 1,
+            rule = group.rule,
             path = group.kept.path.display(),
             degraded = if group.kept.fell_back { "  (*)" } else { "" },
             cw = count_width,
+            rw = rule_width,
         );
     }
 }
@@ -154,10 +169,11 @@ fn write_copies(groups: &[Group<'_>], now: SystemTime, out: &mut String) {
         }
         let _ = writeln!(
             out,
-            "{size:>8}  ×{count}  {each} each",
+            "{size:>8}  ×{count}  {each} each  in {rule}",
             size = format_size(group.reclaimable),
             count = group.copies.len() + 1,
             each = format_size(group.each),
+            rule = group.rule,
         );
         let _ = writeln!(
             out,
@@ -231,6 +247,46 @@ fn write_total(plan: &CleanPlan, groups: &[Group<'_>], out: &mut String) {
         if shared == 1 { "shares" } else { "share" },
         if shared == 1 { "it" } else { "them" },
     );
+}
+
+/// What was searched, pool by pool.
+///
+/// Groups form **within** a pool, so two copies in different pools are never
+/// compared however identical they are. That is a decision the configuration
+/// made, and it is invisible unless the report says it: a run over two areas
+/// holding four thousand files and finding nothing is a different answer from a
+/// run over one area holding three.
+fn write_pools(pools: &[Searched], out: &mut String) {
+    if pools.is_empty() {
+        let _ = writeln!(
+            out,
+            "Nothing was searched: no duplicate rule matched anything here."
+        );
+        return;
+    }
+
+    let files: usize = pools.iter().map(|pool| pool.files).sum();
+    let _ = writeln!(
+        out,
+        "Searched {} {} of {files} {}, and copies are only ever compared within one:",
+        pools.len(),
+        if pools.len() == 1 { "pool" } else { "pools" },
+        if files == 1 { "file" } else { "files" },
+    );
+    let width = pools
+        .iter()
+        .map(|pool| pool.rule.chars().count())
+        .max()
+        .unwrap_or(0);
+    for pool in pools {
+        let _ = writeln!(
+            out,
+            "  {rule:<width$}  {count} {noun}",
+            rule = pool.rule,
+            count = pool.files,
+            noun = if pool.files == 1 { "file" } else { "files" },
+        );
+    }
 }
 
 /// Say how many keepers were not chosen the way that was asked.
@@ -310,7 +366,7 @@ mod tests {
     fn copy(path: &str, allocated: u64, kept: &Kept) -> Candidate {
         Candidate {
             path: PathBuf::from(path),
-            rule: "duplicate".into(),
+            rule: "everywhere".into(),
             tier: Tier::Confirm,
             purge: false,
             duplicate_of: Some(kept.clone()),
@@ -337,6 +393,14 @@ mod tests {
         ])
     }
 
+    /// What a run over the shipped rule reports having searched.
+    fn searched() -> Vec<Searched> {
+        vec![Searched {
+            rule: "everywhere".into(),
+            files: 9,
+        }]
+    }
+
     fn report(depth: usize, sort: Sort) -> Report {
         Report {
             depth,
@@ -360,6 +424,7 @@ mod tests {
             Intent::Preview,
             report(depth, Sort::Size),
             now(),
+            &searched(),
         )
     }
 
@@ -368,14 +433,82 @@ mod tests {
         let shown = rendered(&a_plan(), 0, Keep::OldestCreated);
 
         assert!(
-            shown.contains("×3  keeps /p/keep-one.bin"),
+            shown.contains("×3  everywhere  keeps /p/keep-one.bin"),
             "two copies and the one that stays make three: {shown}"
         );
-        assert!(shown.contains("×2  keeps /p/keep-two.bin"), "{shown}");
+        assert!(
+            shown.contains("×2  everywhere  keeps /p/keep-two.bin"),
+            "and the pool it formed in, which is why these were compared: {shown}"
+        );
         assert!(
             !shown.contains("  remove  "),
             "the paths themselves belong to -d 1: {shown}"
         );
+    }
+
+    /// The whole point of saying it: an empty answer and an empty search look
+    /// identical otherwise, and only one of them is about the disk.
+    #[test]
+    fn an_empty_run_says_what_it_searched_before_anything_else() {
+        let shown = render_dup(
+            &CleanPlan::default(),
+            None,
+            Intent::Preview,
+            report(0, Sort::Size),
+            now(),
+            &[
+                Searched {
+                    rule: "photos".into(),
+                    files: 4_000,
+                },
+                Searched {
+                    rule: "scans".into(),
+                    files: 120,
+                },
+            ],
+        );
+
+        let searched = shown.find("Searched 2 pools").expect("the counts");
+        let knobs = shown.find("--min-size").expect("the knobs");
+        assert!(searched < knobs, "the counts come first: {shown}");
+        assert!(shown.contains("photos"), "{shown}");
+        assert!(shown.contains("4000 files"), "{shown}");
+        assert!(
+            shown.contains("only ever compared within one"),
+            "and why that matters: {shown}"
+        );
+    }
+
+    /// A search that matched nothing at all is a different sentence again: not
+    /// "these areas held nothing" but "no area was named".
+    #[test]
+    fn no_pool_at_all_says_so() {
+        let shown = render_dup(
+            &CleanPlan::default(),
+            None,
+            Intent::Preview,
+            report(0, Sort::Size),
+            now(),
+            &[],
+        );
+
+        assert!(shown.contains("Nothing was searched"), "{shown}");
+    }
+
+    /// The counts stand under a report that found something too — how much was
+    /// looked at is the denominator of what was found.
+    #[test]
+    fn the_counts_stand_under_a_report_that_found_something() {
+        let shown = rendered(&a_plan(), 0, Keep::OldestCreated);
+        assert!(shown.contains("Searched 1 pool of 9 files"), "{shown}");
+    }
+
+    /// At depth 1 the pool is named beside the size, because a reader looking at
+    /// one group wants to know which rule put those files together.
+    #[test]
+    fn depth_one_names_the_pool_too() {
+        let shown = rendered(&a_plan(), 1, Keep::OldestCreated);
+        assert!(shown.contains("in everywhere"), "{shown}");
     }
 
     /// The one thing this report may not leave to inference.
@@ -463,6 +596,7 @@ mod tests {
             Intent::Preview,
             report(0, Sort::Name),
             now(),
+            &searched(),
         );
         assert!(
             by_name.find("keep-one").expect("group one")
@@ -515,6 +649,7 @@ mod tests {
             Intent::Removing,
             report(0, Sort::Size),
             now(),
+            &searched(),
         );
         assert!(
             !removing.contains("nothing was removed"),

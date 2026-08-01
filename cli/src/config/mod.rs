@@ -544,15 +544,6 @@ fn convert(entries: Vec<RuleEntry>) -> Result<Vec<Rule>, String> {
         }
         let where_ = format!("rule `{name}`");
 
-        // The report prints this name in every candidate's row, and a duplicate
-        // candidate carries the fixed one. Letting a rule take it would make one
-        // line of a plan mean two different things.
-        if name == disk_tools_core::DUPLICATE_RULE {
-            return Err(format!(
-                "{where_}: `{name}` is reserved — it is the name the report gives to a copy found by `--dup`"
-            ));
-        }
-
         if rules.iter().any(|rule| rule.name == name) {
             return Err(format!(
                 "{where_}: duplicate name; each rule needs its own, since that is what the report and the plan refer to"
@@ -1357,18 +1348,6 @@ duplicate-rules:
             vec!["duplicates.dup", "duplicates.enabled"]
         );
         assert_eq!(config.duplicates, DuplicateSettings::default());
-    }
-
-    /// One line of a plan must not be able to mean two things — and they differ
-    /// where it matters: a rule may say `tier = "purge"`, a duplicate never can.
-    #[test]
-    fn a_rule_may_not_take_the_name_the_report_gives_a_duplicate() {
-        let message = message(
-            "clean-rules:\n  - name: \"duplicate\"\n    parts:\n      - root: \"*\"\n        includes: [\"x\"]\n",
-        );
-
-        assert!(message.contains("reserved"), "{message}");
-        assert!(message.contains("--dup"), "{message}");
     }
 
     // ---- the shape a rule must have --------------------------------------

@@ -209,6 +209,22 @@ pub struct DuplicateGroup {
     pub reclaimable: u64,
 }
 
+/// One pool, and how much of the tree fell into it.
+///
+/// Reported whether or not it produced a group, because "two areas, 4,120 files,
+/// no group" and "one area, three files" are different problems and an empty
+/// report cannot be read without knowing which one it is. That an area was never
+/// searched is a **configuration** answer, and configuration is invisible unless
+/// something says it out loud.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Searched {
+    pub rule: String,
+    /// Files that reached the comparison — after the rules, the floors and the
+    /// hardlink collapse, before a single byte was read.
+    pub files: usize,
+}
+
 /// What the pass found, and what it could not read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -219,6 +235,10 @@ pub struct Duplicates {
     /// Anything unreadable, vanished, or changed under us between the scan and
     /// the hash — as data, never printed.
     pub skipped: Vec<SkippedEntry>,
+
+    /// Every pool that was searched, in rule order, whether or not it produced
+    /// anything.
+    pub pools: Vec<Searched>,
 
     pub files_hashed: usize,
     pub bytes_read: u64,
@@ -318,7 +338,9 @@ pub fn duplicates(
     // identical files the rules put in different pools are not duplicates of
     // each other, which is the answer the rules exist to give.
     let mut buckets: HashMap<(usize, u64), Vec<Member>> = HashMap::new();
+    let mut population: HashMap<usize, usize> = HashMap::new();
     for member in eligible {
+        *population.entry(member.pool).or_default() += 1;
         buckets
             .entry((member.pool, member.apparent))
             .or_default()
@@ -328,6 +350,19 @@ pub fn duplicates(
         .into_iter()
         .filter(|(_, members)| members.len() > 1)
         .collect();
+
+    // Counted before the hashing narrows anything, so the figure answers "how
+    // much was even looked at here" rather than "how much survived".
+    let mut pools: Vec<Searched> = Vec::new();
+    for (index, files) in &population {
+        if let Some(pool) = options.rules.at(*index) {
+            pools.push(Searched {
+                rule: pool.name.to_owned(),
+                files: *files,
+            });
+        }
+    }
+    pools.sort_by(|a, b| a.rule.cmp(&b.rule));
 
     let progress = Progress {
         skipped: Mutex::new(Vec::new()),
@@ -353,6 +388,7 @@ pub fn duplicates(
 
     Duplicates {
         groups,
+        pools,
         skipped,
         files_hashed: progress.files_hashed.load(Ordering::Relaxed) as usize,
         bytes_read: progress.bytes_read.load(Ordering::Relaxed),

@@ -14,7 +14,7 @@
 //! and the other an outcome. Giving them one shape with half the fields null
 //! would make every consumer branch on emptiness to discover which it had.
 
-use disk_tools_core::{CleanOutcome, CleanPlan, Excluded, Kept, ScanTree};
+use disk_tools_core::{CleanOutcome, CleanPlan, Excluded, Kept, ScanTree, Searched};
 use serde::Serialize;
 use std::path::Path;
 
@@ -47,7 +47,7 @@ pub fn render_plan(plan: &CleanPlan) -> serde_json::Result<String> {
 ///
 /// Built from the **plan**, like the human report, so a copy the denylist
 /// refused is absent from both.
-pub fn render_dup_plan(plan: &CleanPlan) -> serde_json::Result<String> {
+pub fn render_dup_plan(plan: &CleanPlan, pools: &[Searched]) -> serde_json::Result<String> {
     let mut groups: Vec<DupGroup<'_>> = Vec::new();
     for candidate in &plan.candidates {
         let Some(kept) = &candidate.duplicate_of else {
@@ -65,6 +65,7 @@ pub fn render_dup_plan(plan: &CleanPlan) -> serde_json::Result<String> {
             }
             None => groups.push(DupGroup {
                 keeper: kept,
+                rule: &candidate.rule,
                 reclaimable: candidate.allocated,
                 copies: vec![copy],
             }),
@@ -73,6 +74,7 @@ pub fn render_dup_plan(plan: &CleanPlan) -> serde_json::Result<String> {
 
     serde_json::to_string_pretty(&DupPlan {
         groups,
+        pools,
         reclaimable: plan.reclaimable,
         excluded: &plan.excluded,
         filtered_out: plan.filtered_out,
@@ -89,6 +91,9 @@ pub fn render_dup_plan(plan: &CleanPlan) -> serde_json::Result<String> {
 #[derive(Serialize)]
 struct DupPlan<'a> {
     groups: Vec<DupGroup<'a>>,
+    /// What was searched, whether or not it produced anything — the only thing
+    /// that tells an empty answer from an empty search.
+    pools: &'a [Searched],
     reclaimable: u64,
     excluded: &'a [Excluded],
     filtered_out: usize,
@@ -98,6 +103,8 @@ struct DupPlan<'a> {
 #[derive(Serialize)]
 struct DupGroup<'a> {
     keeper: &'a Kept,
+    /// The pool it formed in.
+    rule: &'a str,
     /// What removing every copy in this group frees.
     reclaimable: u64,
     copies: Vec<DupCopy<'a>>,
@@ -190,6 +197,14 @@ mod tests {
         }
     }
 
+    /// What a run reports having searched, for the document tests.
+    fn searched() -> Vec<Searched> {
+        vec![Searched {
+            rule: "everywhere".into(),
+            files: 4,
+        }]
+    }
+
     fn parsed(payload: String) -> serde_json::Value {
         serde_json::from_str(&payload).expect("parse")
     }
@@ -199,7 +214,7 @@ mod tests {
     /// to rebuild them by keeper path.
     #[test]
     fn the_duplicate_document_is_groups() {
-        let value = parsed(render_dup_plan(&dup_plan()).expect("serialize"));
+        let value = parsed(render_dup_plan(&dup_plan(), &searched()).expect("serialize"));
 
         let groups = value["groups"].as_array().expect("groups");
         assert_eq!(groups.len(), 1);
@@ -210,11 +225,32 @@ mod tests {
         assert_eq!(value["reclaimable"], 8192);
     }
 
+    /// The same fact the human report leads with, in the document: what was
+    /// searched, whether or not it produced anything.
+    #[test]
+    fn the_document_says_what_was_searched() {
+        let value = parsed(render_dup_plan(&dup_plan(), &searched()).expect("serialize"));
+
+        let pools = value["pools"].as_array().expect("pools");
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0]["rule"], "everywhere");
+        assert_eq!(pools[0]["files"], 4);
+    }
+
+    /// And each group names the pool it formed in — the answer to "why were
+    /// these compared with each other".
+    #[test]
+    fn each_group_names_its_pool() {
+        let value = parsed(render_dup_plan(&dup_plan(), &searched()).expect("serialize"));
+
+        assert_eq!(value["groups"][0]["rule"], "duplicate");
+    }
+
     /// Whatever the report shows, the document says — including the one thing a
     /// reader has to know to judge the choice.
     #[test]
     fn the_keeper_carries_its_date_and_whether_the_rule_held() {
-        let value = parsed(render_dup_plan(&dup_plan()).expect("serialize"));
+        let value = parsed(render_dup_plan(&dup_plan(), &searched()).expect("serialize"));
 
         assert_eq!(value["groups"][0]["keeper"]["date"], 1_700_000_000);
         assert_eq!(value["groups"][0]["keeper"]["fell_back"], false);
@@ -228,7 +264,7 @@ mod tests {
         plan.filtered_out = 2;
         plan.too_small = 3;
 
-        let value = parsed(render_dup_plan(&plan).expect("serialize"));
+        let value = parsed(render_dup_plan(&plan, &searched()).expect("serialize"));
 
         assert_eq!(value["filtered_out"], 2);
         assert_eq!(value["too_small"], 3);
@@ -239,7 +275,7 @@ mod tests {
     /// document quietly shortened by one of them says nothing about having been.
     #[test]
     fn the_duplicate_document_is_whole_whatever_the_display_flags_said() {
-        let value = parsed(render_dup_plan(&dup_plan()).expect("serialize"));
+        let value = parsed(render_dup_plan(&dup_plan(), &searched()).expect("serialize"));
         assert_eq!(
             value["groups"][0]["copies"]
                 .as_array()

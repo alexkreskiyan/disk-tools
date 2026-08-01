@@ -13,8 +13,8 @@ mod ui;
 use args::{Args, Cleanup, Environment, Intent, Mode, Report, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOutcome, CleanPlan, DuplicateOptions, Duplicates, ScanOptions, ScanTree, SkippedEntry,
-    apply, duplicates, plan, plan_duplicates, scan,
+    CleanOutcome, CleanPlan, DuplicateOptions, Duplicates, ScanOptions, ScanTree, Searched,
+    SkippedEntry, apply, duplicates, plan, plan_duplicates, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{render_clean, render_outcome};
@@ -174,11 +174,13 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
         ..
     } = &cleanup;
     let (roots_from_rules, intent, report) = (*roots_from_rules, *intent, *report);
-    // Settled once, from the mode rather than from the plan: an empty duplicate
-    // run still has to print the duplicate report, which is the one that says
-    // why it might be empty.
-    let keeping = cleanup.duplicates.as_ref().map(|_| Keeping {
+    // Which report is printed is settled by the mode, not by the plan: an empty
+    // duplicate run still has to print the duplicate report, which is the one
+    // that says why it might be empty. What it needs beyond the plan is filled
+    // in as the roots are searched.
+    let mut keeping = cleanup.duplicates.as_ref().map(|_| Keeping {
         now: cleanup.options.detect.now,
+        pools: Vec::new(),
     });
 
     if roots.is_empty() {
@@ -253,6 +255,9 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
             Some(duplicating) => {
                 let found = search_with_spinner(&tree, duplicating, options);
                 skipped.extend(found.skipped.iter().cloned());
+                if let Some(keeping) = &mut keeping {
+                    merge_pools(&mut keeping.pools, found.pools.clone());
+                }
                 plan_duplicates(&tree, &found, options)
             }
             None => plan(&tree, options),
@@ -288,7 +293,7 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
 /// settled by the mode** rather than inferred from the plan's contents. An empty
 /// duplicate run has to say "no duplicates found" and name why, which a plan
 /// with no candidates in it cannot distinguish from any other empty plan.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Keeping {
     /// The clock the keeper's date is shown against, taken once at the top of
     /// the run like every other "now" here.
@@ -296,6 +301,14 @@ struct Keeping {
     /// The keeper *rule* is not here: each pool has its own, so it travels on
     /// the candidate instead.
     now: SystemTime,
+
+    /// Every pool that was searched, and how much fell into it.
+    ///
+    /// Not in the plan, and rightly: the plan says what will happen, and this
+    /// says what was **looked at**. It is the only thing that can tell an empty
+    /// report caused by a disk with no duplicates from one caused by a
+    /// configuration that searched nowhere.
+    pools: Vec<Searched>,
 }
 
 /// The plan as text or as JSON, in whichever of the two shapes it is about.
@@ -308,8 +321,8 @@ fn text(
     keeping: Option<Keeping>,
 ) -> serde_json::Result<String> {
     if report.json {
-        return match keeping {
-            Some(_) => render_dup_plan(planned).map(|payload| payload + "\n"),
+        return match &keeping {
+            Some(keeping) => render_dup_plan(planned, &keeping.pools).map(|payload| payload + "\n"),
             None => render_plan(planned).map(|payload| payload + "\n"),
         };
     }
@@ -338,7 +351,9 @@ fn human(
     keeping: Option<Keeping>,
 ) -> String {
     match keeping {
-        Some(Keeping { now }) => render_dup(planned, hidden_by_safe, intent, report, now),
+        Some(Keeping { now, pools }) => {
+            render_dup(planned, hidden_by_safe, intent, report, now, &pools)
+        }
         None => render_clean(planned, hidden_by_safe, intent, report, inside),
     }
 }
@@ -513,6 +528,21 @@ fn scan_with_spinner(options: &ScanOptions, message: &'static str) -> ScanTree {
     spinner.finish_and_clear();
 
     tree
+}
+
+/// Add one root's pool counts to the run's.
+///
+/// `clean` with no path walks a root per rule, so one pool can be filled from
+/// several of them — and a report saying "everywhere: 40 files" twice would be
+/// describing the walk rather than the search.
+fn merge_pools(into: &mut Vec<Searched>, found: Vec<Searched>) {
+    for pool in found {
+        match into.iter_mut().find(|kept| kept.rule == pool.rule) {
+            Some(kept) => kept.files += pool.files,
+            None => into.push(pool),
+        }
+    }
+    into.sort_by(|a, b| a.rule.cmp(&b.rule));
 }
 
 /// Hash what needs hashing, saying how much of it there is.
