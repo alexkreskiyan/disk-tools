@@ -1792,16 +1792,58 @@ fn preview_dup_finds_identical_files_and_says_which_one_stays() {
     assert!(root.join("a-copy.bin").exists());
 }
 
-/// `--dup` needs a scope; the roots of the rules are not one. The message says
-/// so without blaming the config file, which has nothing to do with it.
+/// With no path the duplicate rules say where to look, exactly as the clean
+/// rules do for an ordinary run. The shipped rule is unrooted, so a bare
+/// `preview --dup` has nowhere to go — and says which list to edit.
 #[test]
-fn dup_without_a_path_explains_itself_and_exits_two() {
+fn dup_without_a_path_names_the_list_it_consulted() {
     let output = run(&["preview", "--dup"]);
 
-    assert_eq!(output.status.code(), Some(2));
+    assert!(output.status.success(), "{:?}", output.status);
     let stderr = String::from_utf8(output.stderr).expect("utf-8");
-    assert!(stderr.contains("--dup needs a PATH"), "{stderr}");
-    assert!(!stderr.contains("config:"), "{stderr}");
+    assert!(stderr.contains("no duplicate rule"), "{stderr}");
+    assert!(
+        !stderr.contains("to clean"),
+        "the clean rules are not what was consulted: {stderr}"
+    );
+}
+
+/// And a rooted duplicate rule is walked without a path being typed.
+#[test]
+fn a_rooted_duplicate_rule_is_walked_with_no_path() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(root.join("one.bin"), &bytes).expect("write");
+    std::fs::write(root.join("two.bin"), &bytes).expect("write");
+
+    let config = write(
+        home.path(),
+        "config.yml",
+        &format!(
+            "duplicate-rules:\n  - name: here\n    parts:\n      - root: {:?}\n        includes: [\"**\"]\n",
+            root.to_str().expect("utf8")
+        ),
+    );
+
+    let output = spawn(
+        &[
+            "--config",
+            config.to_str().expect("utf8"),
+            "preview",
+            "--dup",
+        ],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let report = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(report.contains("keeps"), "{report}");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("examining"), "and it says where: {stderr}");
 }
 
 /// A duplicate is confirm-tier, always. `clean --dup` without `--yes` therefore

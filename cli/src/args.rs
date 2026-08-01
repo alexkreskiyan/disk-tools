@@ -577,16 +577,18 @@ impl Args {
         // and one rooted elsewhere simply matches nothing — `Rules::prunes` sees
         // to that. With no path, the rules say where to look, which is what
         // `root` is required for.
-        // A duplicate is a relation between files, so the question needs a scope
-        // to hold both of them. The rule roots are not one: they answer "where
-        // does this rule apply", and a `--dup` run applies no rule.
-        if clean.dup && clean.path.is_none() {
-            return Err(ResolveError::DuplicatesNeedPath);
-        }
+        let duplicate_rules =
+            DuplicateRules::new(config.duplicate_rules, &user_dirs).map_err(ResolveError::Rule)?;
 
+        // A path narrows the walk to itself. Without one, **the rules of the
+        // mode being run** say where to look: the clean rules for an ordinary
+        // run, the duplicate rules for `--dup`. v0.6 made `--dup` demand a path
+        // because there was no such list to ask; there is now, and the special
+        // case goes with it.
         let roots_from_rules = clean.path.is_none();
         let roots = match clean.path {
             Some(path) => vec![absolute(path)],
+            None if clean.dup => duplicate_rules.scan_roots(),
             None => rules.scan_roots(),
         };
 
@@ -596,9 +598,6 @@ impl Args {
             .min_size
             .or(clean.dup.then_some(config.duplicates.min_size).flatten())
             .unwrap_or(if clean.dup { MIN_DUPLICATE_SIZE } else { 0 });
-
-        let duplicate_rules =
-            DuplicateRules::new(config.duplicate_rules, &user_dirs).map_err(ResolveError::Rule)?;
 
         let duplicates = clean.dup.then_some(()).map(|()| Duplicating {
             rules: duplicate_rules,
@@ -674,10 +673,6 @@ pub enum ResolveError {
     /// `%APPDATA%`, no `XDG_CONFIG_HOME`. Guessing would put a file somewhere
     /// the user would never look for it.
     NoConfigPath,
-    /// `--dup` with no path. Not a clap `required_if_eq`, because the reason is
-    /// worth a sentence: the rule roots exist to answer a question this mode
-    /// does not ask.
-    DuplicatesNeedPath,
 }
 
 impl ResolveError {
@@ -690,7 +685,6 @@ impl ResolveError {
     pub fn about(&self) -> Option<&'static str> {
         match self {
             ResolveError::Rule(_) | ResolveError::NoConfigPath => Some("config"),
-            ResolveError::DuplicatesNeedPath => None,
         }
     }
 }
@@ -702,10 +696,6 @@ impl std::fmt::Display for ResolveError {
             ResolveError::NoConfigPath => write!(
                 f,
                 "cannot tell where your config directory is; pass --config with a path"
-            ),
-            ResolveError::DuplicatesNeedPath => write!(
-                f,
-                "--dup needs a PATH: duplicates are found within one scope, and the roots of your rules are not one"
             ),
         }
     }
@@ -917,21 +907,69 @@ mod tests {
         );
     }
 
-    /// A duplicate is a relation between files, so the question needs a scope
-    /// holding both. The rule roots answer a different question.
+    /// The special case v0.6 needed is gone: with rules that have roots, this is
+    /// the sentence `preview` with no path already speaks — of the other list.
     #[test]
-    fn dup_without_a_path_says_why_it_cannot_run() {
-        let err = parse(&["preview", "--dup"])
+    fn dup_without_a_path_walks_the_duplicate_rule_roots() {
+        let config = crate::config::parse_for_test(
+            "duplicate-rules:\n  - name: photos\n    parts:\n      - root: \"/tmp/photos\"\n        includes: [\"**\"]\n      - root: \"/tmp/scans\"\n        includes: [\"**\"]\n",
+        );
+        let mode = parse(&["preview", "--dup"])
             .expect("parse")
-            .resolve(env(Config::default()))
-            .expect_err("no scope to search");
+            .resolve(env(config))
+            .expect("resolve");
 
-        assert!(matches!(err, ResolveError::DuplicatesNeedPath));
-        assert!(err.to_string().contains("PATH"));
+        let Mode::Clean(cleanup) = mode else {
+            panic!("expected a cleanup")
+        };
         assert_eq!(
-            err.about(),
-            None,
-            "this is about the command line; `config:` would send them to edit a file"
+            cleanup.roots,
+            vec![PathBuf::from("/tmp/photos"), PathBuf::from("/tmp/scans")],
+            "every part of every rule, not just the first"
+        );
+        assert!(cleanup.roots_from_rules);
+    }
+
+    /// And it is the *duplicate* rules it asks, not the clean ones — sending a
+    /// user to edit the wrong half of their file is the mistake this prevents.
+    #[test]
+    fn dup_without_a_path_ignores_the_clean_rule_roots() {
+        let config = crate::config::parse_for_test(
+            "clean-rules:\n  - name: junk\n    parts:\n      - root: \"/tmp/junk\"\n        includes: [\"**/target/\"]\nduplicate-rules: []\n",
+        );
+        let mode = parse(&["preview", "--dup"])
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve");
+
+        let Mode::Clean(cleanup) = mode else {
+            panic!("expected a cleanup")
+        };
+        assert!(
+            cleanup.roots.is_empty(),
+            "no duplicate rule names a directory: {:?}",
+            cleanup.roots
+        );
+    }
+
+    /// Without `--dup` the clean rules are still the ones asked.
+    #[test]
+    fn an_ordinary_run_still_walks_the_clean_rule_roots() {
+        let config = crate::config::parse_for_test(
+            "clean-rules:\n  - name: junk\n    parts:\n      - root: \"/tmp/junk\"\n        includes: [\"**/target/\"]\n",
+        );
+        let mode = parse(&["preview"])
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve");
+
+        let Mode::Clean(cleanup) = mode else {
+            panic!("expected a cleanup")
+        };
+        assert_eq!(cleanup.roots, vec![PathBuf::from("/tmp/junk")]);
+        assert!(
+            cleanup.duplicates.is_none(),
+            "and nothing consults the pools"
         );
     }
 

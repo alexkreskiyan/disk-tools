@@ -1148,6 +1148,217 @@ mod tests {
         assert_eq!(found.bytes_read, 2 * PREFIX);
     }
 
+    /// A part rooted at `root`, matching everything under it.
+    fn part(root: std::path::PathBuf) -> crate::rules::Part {
+        crate::rules::Part {
+            root: Some(root.to_string_lossy().into_owned()),
+            includes: vec!["**".into()],
+            ..crate::rules::Part::default()
+        }
+    }
+
+    /// One pool per name, each rooted where it is named.
+    fn pools(areas: &[(&str, std::path::PathBuf)]) -> DuplicateOptions {
+        DuplicateOptions {
+            rules: crate::dup_rules::DuplicateRules::new(
+                areas
+                    .iter()
+                    .map(|(name, root)| crate::dup_rules::DuplicateRule {
+                        name: (*name).to_owned(),
+                        parts: vec![part(root.clone())],
+                        ..crate::dup_rules::DuplicateRule::default()
+                    })
+                    .collect(),
+                &crate::rules::UserDirs::default(),
+            )
+            .expect("compiles"),
+            ..DuplicateOptions::default()
+        }
+    }
+
+    /// One pool over the whole fixture, with a keeper policy of its own.
+    fn one_pool(root: &Path, keep: Option<Keep>) -> crate::dup_rules::DuplicateRules {
+        crate::dup_rules::DuplicateRules::new(
+            vec![crate::dup_rules::DuplicateRule {
+                name: "here".into(),
+                keep,
+                parts: vec![part(root.to_path_buf())],
+                ..crate::dup_rules::DuplicateRule::default()
+            }],
+            &crate::rules::UserDirs::default(),
+        )
+        .expect("compiles")
+    }
+
+    // ---- the rules, and the flags over them ------------------------------
+
+    /// Two pools, and files in different ones are not duplicates of each other
+    /// however identical they are. That is the answer the rules exist to give.
+    #[test]
+    fn identical_files_in_different_pools_are_not_a_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let bytes = content(30, 8192);
+        fs::create_dir(root.join("photos")).expect("mkdir");
+        fs::create_dir(root.join("downloads")).expect("mkdir");
+        write(&root.join("photos/a.bin"), &bytes);
+        write(&root.join("downloads/a.bin"), &bytes);
+
+        let split = pools(&[
+            ("photos", root.join("photos")),
+            ("downloads", root.join("downloads")),
+        ]);
+        assert!(
+            found(root, &split).groups.is_empty(),
+            "one pool each, so nothing to pair with"
+        );
+
+        // The same two files under one rule with two parts *are* a group — the
+        // difference is the configuration, not the disk.
+        let together = DuplicateOptions {
+            rules: crate::dup_rules::DuplicateRules::new(
+                vec![crate::dup_rules::DuplicateRule {
+                    name: "both".into(),
+                    parts: vec![part(root.join("photos")), part(root.join("downloads"))],
+                    ..crate::dup_rules::DuplicateRule::default()
+                }],
+                &crate::rules::UserDirs::default(),
+            )
+            .expect("compiles"),
+            ..DuplicateOptions::default()
+        };
+        assert_eq!(found(root, &together).groups.len(), 1);
+    }
+
+    /// The pool's own policy decides, so two areas may answer differently in one
+    /// run.
+    #[test]
+    fn each_pool_keeps_by_its_own_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for (area, seed) in [("first", 31u8), ("second", 32)] {
+            fs::create_dir(root.join(area)).expect("mkdir");
+            // Written in this order, so `z` is the older of the two.
+            write(&root.join(format!("{area}/z.bin")), &content(seed, 8192));
+            std::thread::sleep(Duration::from_millis(20));
+            write(&root.join(format!("{area}/a.bin")), &content(seed, 8192));
+        }
+
+        let mut rules = vec![
+            crate::dup_rules::DuplicateRule {
+                name: "first".into(),
+                keep: Some(Keep::OldestCreated),
+                parts: vec![part(root.join("first"))],
+                ..crate::dup_rules::DuplicateRule::default()
+            },
+            crate::dup_rules::DuplicateRule {
+                name: "second".into(),
+                keep: Some(Keep::First),
+                parts: vec![part(root.join("second"))],
+                ..crate::dup_rules::DuplicateRule::default()
+            },
+        ];
+        rules.sort_by(|a, b| a.name.cmp(&b.name));
+        let options = DuplicateOptions {
+            rules: crate::dup_rules::DuplicateRules::new(rules, &crate::rules::UserDirs::default())
+                .expect("compiles"),
+            ..DuplicateOptions::default()
+        };
+
+        let found = found(root, &options);
+        let keeper = |area: &str| {
+            found
+                .groups
+                .iter()
+                .find(|group| group.rule == area)
+                .map(|group| group.keeper.file_name().expect("name").to_owned())
+                .expect(area)
+        };
+        assert_eq!(keeper("first"), "z.bin", "the earlier file, by creation");
+        assert_eq!(keeper("second"), "a.bin", "the earlier path, by bytes");
+    }
+
+    /// The flag replaces what every rule said — that is what a flag is for.
+    #[test]
+    fn the_keep_flag_overrules_every_pool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("z.bin"), &content(33, 8192));
+        std::thread::sleep(Duration::from_millis(20));
+        write(&root.join("a.bin"), &content(33, 8192));
+
+        let by_rule = DuplicateOptions {
+            rules: one_pool(root, Some(Keep::OldestCreated)),
+            ..DuplicateOptions::default()
+        };
+        assert_eq!(
+            found(root, &by_rule).groups[0]
+                .keeper
+                .file_name()
+                .expect("name"),
+            "z.bin"
+        );
+
+        let flagged = DuplicateOptions {
+            keep: Some(Keep::First),
+            ..by_rule
+        };
+        assert_eq!(
+            found(root, &flagged).groups[0]
+                .keeper
+                .file_name()
+                .expect("name"),
+            "a.bin",
+            "the flag beat the rule"
+        );
+    }
+
+    /// Both floors apply and the larger decides: a flag narrows what a part
+    /// said, it never widens it.
+    #[test]
+    fn the_larger_of_the_two_floors_decides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(&root.join("a.bin"), &content(34, 4096));
+        write(&root.join("b.bin"), &content(34, 4096));
+
+        let with_floor = |rule_floor: u64, flag: u64| {
+            let rules = crate::dup_rules::DuplicateRules::new(
+                vec![crate::dup_rules::DuplicateRule {
+                    name: "here".into(),
+                    parts: vec![crate::rules::Part {
+                        root: Some(root.to_string_lossy().into_owned()),
+                        includes: vec!["**".into()],
+                        min_size: rule_floor,
+                        ..crate::rules::Part::default()
+                    }],
+                    ..crate::dup_rules::DuplicateRule::default()
+                }],
+                &crate::rules::UserDirs::default(),
+            )
+            .expect("compiles");
+            found(
+                root,
+                &DuplicateOptions {
+                    rules,
+                    min_size: flag,
+                    ..DuplicateOptions::default()
+                },
+            )
+            .groups
+            .len()
+        };
+
+        assert_eq!(with_floor(0, 0), 1, "neither floor keeps them out");
+        assert_eq!(with_floor(8192, 0), 0, "the part's floor is the larger");
+        assert_eq!(with_floor(0, 8192), 0, "the flag's floor is the larger");
+        assert_eq!(
+            with_floor(1024, 1024),
+            1,
+            "and equal floors let them through"
+        );
+    }
+
     // ---- the keeper rules, as a pure function -----------------------------
 
     /// `created` and `modified`, in that order — the two the rules read.

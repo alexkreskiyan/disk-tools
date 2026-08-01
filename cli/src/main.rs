@@ -185,9 +185,17 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
         // Not an error and not an empty plan. "Nothing to clean" would be a
         // claim about the disk; this is a statement about the configuration, and
         // the two remedies are different things to go and do.
+        //
+        // Which list is named matters: under `--dup` the clean rules' roots are
+        // not what was consulted, and sending someone to edit them would send
+        // them to the wrong half of their file.
+        let (list, verb) = match cleanup.duplicates {
+            Some(_) => ("duplicate rule", "search"),
+            None => ("rule", "clean"),
+        };
         eprintln!(
-            "disk-tools: no rule names a directory to clean.\n\
-             Pass a path, or give a rule a `root` other than \"*\"."
+            "disk-tools: no {list} names a directory to {verb}.\n\
+             Pass a path, or give one of its parts a `root` other than \"*\"."
         );
         return ExitCode::SUCCESS;
     }
