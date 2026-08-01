@@ -1650,11 +1650,34 @@ mod diagnostics {
             home: std::env::var_os("HOME").map(Into::into),
             ..UserDirs::default()
         };
+        // The rules a first `--dup` run gets. Without them nothing is in a pool
+        // and the whole pass finds nothing — which it would do **silently**, so
+        // the report below says how many pools there were.
+        let pool_root = std::env::var("DT_DUP_ROOT").ok();
+        let dup_rules = match &pool_root {
+            Some(root) => crate::dup_rules::DuplicateRules::new(
+                vec![crate::dup_rules::DuplicateRule {
+                    name: "rooted".into(),
+                    parts: vec![crate::rules::Part {
+                        root: Some(root.clone()),
+                        includes: vec!["**".into()],
+                        excludes: vec!["**/.git/".into(), "**/.git/**".into()],
+                        ..crate::rules::Part::default()
+                    }],
+                    ..crate::dup_rules::DuplicateRule::default()
+                }],
+                &dirs,
+            )
+            .expect("compiles"),
+            None => crate::dup_rules::DuplicateRules::builtin(&dirs),
+        };
+
         let options = DuplicateOptions {
             detect: DetectOptions {
                 rules: Rules::builtin(&dirs),
                 now: SystemTime::now(),
             },
+            rules: dup_rules,
             min_size,
             ..DuplicateOptions::default()
         };
@@ -1703,6 +1726,19 @@ mod diagnostics {
             found.files_hashed
         );
         println!("  skipped      {}", found.skipped.len());
+        println!(
+            "  pools        {}",
+            if found.pools.is_empty() {
+                "none — nothing was searched at all".to_owned()
+            } else {
+                found
+                    .pools
+                    .iter()
+                    .map(|pool| format!("{} ({} files)", pool.rule, pool.files))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
 
         for group in found.groups.iter().take(20) {
             println!(
