@@ -46,6 +46,15 @@ pub struct Args {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
+    /// Say what this command would do, and do nothing else.
+    ///
+    /// Names the config file actually read, which rules are in force and which
+    /// were dropped and why, where it would look, and — for `clean` — where
+    /// things would go and whether it would stop. Exits without walking,
+    /// reading or removing anything.
+    #[arg(long, global = true)]
+    pub explain: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

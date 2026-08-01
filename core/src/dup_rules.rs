@@ -140,6 +140,11 @@ impl DuplicateRules {
         self.matching.is_empty()
     }
 
+    /// The compiled rules, for a caller that wants to show them.
+    pub fn compiled(&self) -> &crate::rules::Rules {
+        &self.matching
+    }
+
     /// A pool by the index [`Pool::index`] carried.
     ///
     /// The same position the file was admitted under, so this cannot name a

@@ -1922,3 +1922,54 @@ fn dup_json_is_groups_on_stdout_and_nothing_else() {
     assert_eq!(groups[0]["copies"].as_array().expect("copies").len(), 1);
     assert!(groups[0]["keeper"]["path"].is_string());
 }
+
+// ---- --explain ------------------------------------------------------------
+
+/// It explains and **stops**. A check that acted afterwards would be a log line.
+#[test]
+fn explain_walks_nothing_and_removes_nothing() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    std::fs::create_dir(root.join("node_modules")).expect("mkdir");
+    std::fs::write(root.join("node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+    let output = spawn(
+        &["clean", "--yes", "--explain", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success(), "{:?}", output.status);
+    assert!(
+        root.join("node_modules/a.bin").exists(),
+        "--yes and all, it removed nothing"
+    );
+    let said = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(said.contains("Would examine"), "{said}");
+    assert!(said.contains("node-modules"), "the rules in force: {said}");
+    assert!(
+        !said.contains("Reclaimable"),
+        "and no report, because nothing was walked: {said}"
+    );
+}
+
+/// Explaining is not a way to skip validation: the rules decide what may be
+/// deleted, and a file that cannot be read leaves that unknown.
+#[test]
+fn explain_still_refuses_a_config_it_cannot_read() {
+    let home = isolated();
+    let config = write(home.path(), "config.yml", "clean-rules:\n  - name: mine\n");
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf-8"),
+        "--explain",
+        "preview",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("`parts` is required"), "{stderr}");
+}

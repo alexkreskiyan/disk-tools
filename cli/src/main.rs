@@ -7,6 +7,7 @@
 mod args;
 mod config;
 mod env;
+mod explain;
 mod render;
 mod ui;
 
@@ -29,6 +30,7 @@ use std::time::{Duration, SystemTime};
 fn main() -> ExitCode {
     let args = Args::parse();
     let verbose = args.verbose;
+    let explaining = args.explain;
 
     // The core reads no clock, no environment and no config file, so all three
     // are resolved here and handed over. The clock once, at the top, so every
@@ -36,6 +38,10 @@ fn main() -> ExitCode {
     let user_dirs = env::user_dirs();
     let xdg = env::xdg_config_home();
     let config_path = config::locate(args.config.as_deref(), &user_dirs, xdg.clone());
+    // Kept for `--explain`, which names the file that was actually **read** —
+    // located and absent is an ordinary state, and saying "none found" is the
+    // answer a user chasing a rule that does nothing needs.
+    let named = config_path.clone().filter(|path| path.exists());
 
     // Before anything is scanned: a config that cannot be understood means the
     // rules are unknown, and the rules decide what may be deleted.
@@ -73,6 +79,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Before anything is walked, read or removed. Explaining and then acting
+    // would make this a log line rather than a check.
+    if explaining {
+        let said = explain::explain(&mode, named.as_deref());
+        return match write_report(&said) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
 
     match mode {
         Mode::Scan {

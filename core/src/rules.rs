@@ -192,6 +192,48 @@ impl Default for Rule {
     }
 }
 
+/// A part that could not be expressed, and why.
+///
+/// Dropping is silent by design — the alternative is refusing to run because a
+/// machine has no `%LOCALAPPDATA%` — but silence is only defensible while
+/// something can be asked. This is what `--explain` asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dropped {
+    pub rule: String,
+    /// Which part of it, counting from 1. `None` when the whole rule went.
+    pub part: Option<usize>,
+    pub why: Why,
+}
+
+/// Why a part or a rule matches nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Why {
+    /// `enabled: false`. The user's own doing, and the only one of these that
+    /// is not a limitation.
+    Disabled,
+    /// A `~` or `%APPDATA%` this frontend could not resolve. Unknown reads as
+    /// nowhere, never as anywhere.
+    UnknownRoot(String),
+    /// A resolved root that is not UTF-8, which globset cannot be given.
+    RootNotText,
+    /// Every part of it went, so there is nothing left to match with.
+    NoPartsLeft,
+}
+
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Why::Disabled => write!(f, "disabled"),
+            Why::UnknownRoot(token) => write!(
+                f,
+                "`{token}` names a directory this machine has no value for"
+            ),
+            Why::RootNotText => write!(f, "its root is not valid UTF-8"),
+            Why::NoPartsLeft => write!(f, "every one of its parts was dropped"),
+        }
+    }
+}
+
 /// A rule whose text cannot be compiled.
 ///
 /// Distinct from a rule that is merely *dropped*: a bad glob is something the
@@ -249,6 +291,9 @@ pub struct Rules {
     excludes: GlobSet,
     exclude_owner: Vec<usize>,
 
+    /// What was dropped at compile time, in the order it was dropped.
+    dropped: Vec<Dropped>,
+
     /// Each part's `requires`, compiled, positionally.
     ///
     /// Separate matchers rather than one [`GlobSet`], because these are `all`
@@ -288,6 +333,11 @@ impl Rules {
 
         for rule in rules {
             if !rule.enabled {
+                compiled.dropped.push(Dropped {
+                    rule: rule.name,
+                    part: None,
+                    why: Why::Disabled,
+                });
                 continue;
             }
             let rule_index = compiled.rules.len();
@@ -298,13 +348,25 @@ impl Rules {
                 // same way. `None` here is never "match anything" — and it drops
                 // **this part**, leaving the rule's others standing.
                 let Some(root) = resolve_root(part.root.as_deref(), dirs) else {
+                    compiled.dropped.push(Dropped {
+                        rule: rule.name.clone(),
+                        part: Some(part_index + 1),
+                        why: Why::UnknownRoot(part.root.clone().unwrap_or_default()),
+                    });
                     continue;
                 };
                 let prefix = match root.as_deref().map(glob_prefix) {
                     Some(Some(prefix)) => Some(prefix),
                     // A root that exists but is not UTF-8: globset speaks `&str`,
                     // so the part cannot be compiled at all.
-                    Some(None) => continue,
+                    Some(None) => {
+                        compiled.dropped.push(Dropped {
+                            rule: rule.name.clone(),
+                            part: Some(part_index + 1),
+                            why: Why::RootNotText,
+                        });
+                        continue;
+                    }
                     None => None,
                 };
 
@@ -342,6 +404,11 @@ impl Rules {
             // the browser has to be able to tell from "my rule does not cover
             // this", and it could not if the rule were still listed.
             if compiled.owner.len() == before {
+                compiled.dropped.push(Dropped {
+                    rule: rule.name,
+                    part: None,
+                    why: Why::NoPartsLeft,
+                });
                 continue;
             }
             compiled.rules.push(rule);
@@ -388,6 +455,26 @@ impl Rules {
 
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
+    }
+
+    /// What was dropped, and why — the answer to "my rule is not doing
+    /// anything" that the silence of dropping cannot give on its own.
+    pub fn dropped(&self) -> &[Dropped] {
+        &self.dropped
+    }
+
+    /// Every rule in force, with its parts.
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    /// The resolved root of a part, positionally — what a token expanded to.
+    pub fn resolved_roots(&self) -> Vec<(&str, Option<&Path>)> {
+        self.owner
+            .iter()
+            .enumerate()
+            .map(|(part, (rule, _))| (self.rules[*rule].name.as_str(), self.roots[part].as_deref()))
+            .collect()
     }
 
     /// What `clean` with no path walks: the resolved roots of the rules that

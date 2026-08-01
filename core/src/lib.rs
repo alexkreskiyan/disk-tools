@@ -59,8 +59,8 @@ pub use duplicates::{
 pub use measure::{Claim, Finished, Measured, measure};
 pub use options::ScanOptions;
 pub use rules::{
-    AnySibling, Facts, NameTest, Part, Rule, RuleError, Rules, State, Tier, UserDirs, age_rule,
-    builtin_rules, user_path,
+    AnySibling, Dropped, Facts, NameTest, Part, Rule, RuleError, Rules, State, Tier, UserDirs, Why,
+    age_rule, builtin_rules, user_path,
 };
 pub use size::allocated_size;
 #[cfg(feature = "trash")]
