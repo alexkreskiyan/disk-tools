@@ -209,6 +209,7 @@ meant to stop.
 | `/` | Filter this listing. Letters narrow it as you type, `↵` keeps it, `Esc` drops it |
 | `r` | Measure this directory's subdirectories again |
 | `R` | Read `config.yml` again |
+| `D` | Remove what the rules claim under this row — see below |
 | `q` | Leave |
 
 The parent row (`..`) is an ordinary entry, so `↵` on it goes up. It is never
@@ -274,7 +275,49 @@ whether a rule claims the path.
 
 `ui` needs a terminal and refuses a pipe with a sentence rather than escape
 sequences; use `scan` or `preview` for something you can redirect. It never
-deletes: removal is `clean`'s, with its tiers, its refusal and its denylist.
+deletes on its own account: `D` runs `clean`'s plan, with its tiers, its
+refusals and its denylist, and asks before any of it happens.
+
+### Removing from the browser
+
+`D` cleans what the rules claim under the row the cursor is on — the same plan
+`clean <that path>` would make, from the screen that already shows you which
+rows are junk and how much of each is reclaimable.
+
+Three things keep it a keystroke rather than a hazard.
+
+**It only removes what a rule already claims.** On a row nothing claims it says
+so and stops. Anything else would make the browser a general file deleter and
+the tiers and the denylist decoration on it.
+
+**It always asks**, and what changes with the tier is the price of a mistake,
+not whether you are asked. On the command line the confirmation is the verb —
+you type `clean` yourself, and that is the moment of intent. A keypress has no
+such moment, so the modal supplies one:
+
+```console
+This destroys files. There is no way back.
+/Users/you/Projects/thing
+    2.4G  rust-target     3 items  destroyed
+  392.0K  node-modules    1 item   to the Trash
+
+  Frees 2.4G
+
+  type `purge` to confirm: pu         esc cancel
+```
+
+A plan that only trashes takes a `y`. A plan with **anything** destroying in it
+takes the word — the strictest tier in the plan decides, because a subtree
+usually holds both and asking by the gentlest would let a purge-tier candidate
+through on one letter.
+
+**It plans on a worker.** Walking a tree and asking git about every repository
+in it takes seconds; doing that on the UI thread would freeze the one screen
+whose point is that it does not. `Esc` abandons a plan still being walked, and
+costs nothing, because nothing has happened.
+
+`Backspace` is deliberately *not* the key: it means "up one level" today, and a
+destructive action must not share a finger with a navigation habit.
 
 **It no longer edits rules either.** The browser used to compose a rule and write
 it back into the config with every comment intact; that rested on `toml_edit`,

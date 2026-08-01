@@ -21,8 +21,9 @@
 
 use super::listing::{self, Entry};
 use super::measure::Sizer;
+use super::removal::Removal;
 use super::sort::{Applied, Order, sort};
-use disk_tools_core::{Facts, Rules, State};
+use disk_tools_core::{CleanOptions, DetectOptions, Facts, Rules, State, UserDirs};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,6 +78,16 @@ pub struct App {
     /// stays open.
     now: SystemTime,
 
+    /// Everything a removal needs that the browser does not otherwise have: the
+    /// rules to plan by, and the user's directories the denylist is built from.
+    ///
+    /// Held rather than passed at the keystroke because a plan must be made
+    /// against the rules **on screen** — the colours the user is looking at.
+    options: CleanOptions,
+
+    /// A removal, from the moment `D` is pressed until it is dismissed.
+    removal: Option<Removal>,
+
     /// Why the browser has stopped taking keys, when it has.
     ///
     /// `Some` only after a reload that failed: the rules on screen are then the
@@ -94,7 +105,12 @@ impl App {
     ///
     /// Fails only if `root` itself cannot be read — the caller has already
     /// checked it exists, and there would be nothing to show.
-    pub fn open(root: &Path, rules: Rules, now: SystemTime) -> std::io::Result<Self> {
+    pub fn open(
+        root: &Path,
+        rules: Rules,
+        now: SystemTime,
+        user_dirs: UserDirs,
+    ) -> std::io::Result<Self> {
         let rules = Arc::new(rules);
         let mut app = App {
             cwd: root.to_path_buf(),
@@ -111,6 +127,15 @@ impl App {
                 fell_back: false,
             },
             notice: None,
+            options: CleanOptions {
+                detect: DetectOptions {
+                    rules: (*rules).clone(),
+                    now,
+                },
+                user_dirs,
+                ..CleanOptions::default()
+            },
+            removal: None,
             blocked: None,
             sizer: Sizer::new(Arc::clone(&rules), now),
             rules,
@@ -167,6 +192,79 @@ impl App {
     /// Put something in the header until the next thing that succeeds.
     pub fn say(&mut self, what: String) {
         self.notice = Some(what);
+    }
+
+    // ---- removing what the rules claim, from here ------------------------
+
+    pub fn removal(&self) -> Option<&Removal> {
+        self.removal.as_ref()
+    }
+
+    /// Start a removal of whatever the rules claim under the cursor.
+    ///
+    /// The **parent row is not a place**: `..` is the way out of here, not a
+    /// description of anywhere, and a key that removed through it would act on a
+    /// directory the screen is not about.
+    pub fn begin_removal(&mut self) {
+        let Some(entry) = self.selected() else {
+            return;
+        };
+        if entry.name == PARENT {
+            return;
+        }
+        let path = self.cwd.join(&entry.name);
+        self.removal = Some(Removal::begin(&path, self.options.clone()));
+    }
+
+    /// Collect the worker's plan if it has arrived.
+    pub fn settle_removal(&mut self) {
+        if let Some(removal) = &mut self.removal {
+            removal.settle();
+        }
+    }
+
+    /// A character typed towards the word that agrees to a destroying plan.
+    pub fn removal_push(&mut self, ch: char) {
+        if let Some(Removal::Asking { typed, .. }) = &mut self.removal {
+            typed.push(ch);
+        }
+    }
+
+    pub fn removal_pop(&mut self) {
+        if let Some(Removal::Asking { typed, .. }) = &mut self.removal {
+            typed.pop();
+        }
+    }
+
+    /// Agree, and carry it out — if enough has been said to agree.
+    ///
+    /// The gentle case is settled here: a plan that only trashes takes the key
+    /// itself as agreement, and a plan that destroys takes only the word.
+    pub fn confirm_removal(&mut self) {
+        let Some(removal) = &mut self.removal else {
+            return;
+        };
+        let ready = match removal {
+            Removal::Asking { destroys, .. } => !*destroys || removal.agreed(),
+            _ => false,
+        };
+        if !ready {
+            return;
+        }
+        removal.carry_out();
+
+        // What was measured against the rules is no longer there, so the figure
+        // beside it would be a claim about a directory that has changed under
+        // the screen.
+        let path = removal.path().to_path_buf();
+        self.sizer.forget(&path);
+        self.remeasure();
+    }
+
+    /// Abandon it. A plan still being walked is simply dropped: the worker
+    /// finds a closed channel and goes away.
+    pub fn dismiss_removal(&mut self) {
+        self.removal = None;
     }
 
     /// Stop taking keys, and say why.
@@ -441,6 +539,9 @@ impl App {
         // Reading a usable file is the only way out of the blocked state, and
         // this is the only place a usable file arrives.
         self.blocked = None;
+        // A removal plans against the rules on screen, so the two are replaced
+        // together or a plan could outlive the colours that justified it.
+        self.options.detect.rules = rules.clone();
         self.rules = Arc::new(rules);
         self.sizer.retarget(Arc::clone(&self.rules));
 
@@ -695,7 +796,7 @@ fn blank(cwd: &Path) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_tools_core::{Part, Rule, UserDirs};
+    use disk_tools_core::{Part, Rule, Tier, UserDirs};
 
     /// A fixed clock, so an `older_than` rule decides the same way every run.
     fn now() -> SystemTime {
@@ -752,7 +853,8 @@ mod tests {
     fn opens_sorted_by_name_with_directories_first() {
         let dir = fixture();
 
-        let app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         // `..` is a directory named `..`, so it sorts among them.
         assert_eq!(names(&app), ["..", "alpha", "zulu", "big.bin", "small.bin"]);
@@ -764,7 +866,8 @@ mod tests {
     #[test]
     fn the_cursor_stays_on_the_same_entry_when_the_order_changes() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         point_at(&mut app, "small.bin");
 
@@ -781,7 +884,8 @@ mod tests {
     #[test]
     fn pressing_the_active_order_again_reverses_it() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         assert!(!app.reverse());
         app.sort_by(Order::Name);
@@ -794,7 +898,8 @@ mod tests {
     #[test]
     fn entering_and_leaving_a_directory() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         point_at(&mut app, "alpha");
         app.enter();
@@ -819,7 +924,8 @@ mod tests {
     #[test]
     fn entering_the_parent_row_goes_up() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         point_at(&mut app, "alpha");
         app.enter();
 
@@ -832,7 +938,8 @@ mod tests {
     #[test]
     fn a_file_under_the_cursor_is_not_something_to_enter() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         point_at(&mut app, "big.bin");
 
         app.enter();
@@ -859,7 +966,8 @@ mod tests {
             return;
         }
 
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         point_at(&mut app, "locked");
         let before = (app.cwd().to_path_buf(), app.cursor(), names(&app));
 
@@ -877,7 +985,8 @@ mod tests {
     #[test]
     fn a_successful_move_clears_the_notice() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         app.notice = Some("stale".into());
 
         point_at(&mut app, "alpha");
@@ -889,7 +998,8 @@ mod tests {
     #[test]
     fn the_cursor_cannot_leave_the_list() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         app.move_up();
         assert_eq!(app.cursor(), 0, "nothing above the first row");
@@ -931,7 +1041,8 @@ mod tests {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
 
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         assert!(
             app.entries()
@@ -953,7 +1064,8 @@ mod tests {
     fn the_parent_row_is_never_measured() {
         let dir = fixture();
 
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         await_sizes(&mut app);
 
         let parent = app
@@ -970,7 +1082,8 @@ mod tests {
     #[test]
     fn re_measuring_forgets_what_was_there_and_walks_again() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         await_sizes(&mut app);
         assert!(size_of(&app, "alpha").is_some());
 
@@ -992,7 +1105,8 @@ mod tests {
     fn returning_to_a_directory_reuses_the_sizes_already_computed() {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         await_sizes(&mut app);
         let before = size_of(&app, "alpha").expect("measured once");
 
@@ -1021,7 +1135,8 @@ mod tests {
             std::fs::write(sub.join("f.bin"), vec![b'x'; bytes]).expect("write");
         }
 
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         app.sort_by(Order::Size);
         await_sizes(&mut app);
 
@@ -1043,7 +1158,8 @@ mod tests {
             std::fs::write(sub.join("f.bin"), vec![b'x'; 4096]).expect("write");
         }
 
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         point_at(&mut app, "zulu");
         app.enter();
         app.leave();
@@ -1059,7 +1175,8 @@ mod tests {
     #[test]
     fn a_filter_narrows_the_listing_as_it_is_typed() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         app.start_filtering();
         assert!(app.is_filtering());
@@ -1075,7 +1192,8 @@ mod tests {
     fn matching_ignores_case() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("Projects")).expect("mkdir");
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         app.start_filtering();
         for ch in "proj".chars() {
@@ -1093,7 +1211,8 @@ mod tests {
     #[test]
     fn a_filter_matching_nothing_still_offers_the_way_out() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         app.start_filtering();
         for ch in "qqqq".chars() {
@@ -1108,7 +1227,8 @@ mod tests {
     #[test]
     fn backspace_widens_the_filter_again() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         app.start_filtering();
         for ch in "zulu".chars() {
@@ -1127,7 +1247,8 @@ mod tests {
     #[test]
     fn accepting_keeps_the_filter_and_clearing_drops_it() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         app.start_filtering();
         app.filter_push('z');
 
@@ -1145,7 +1266,8 @@ mod tests {
     #[test]
     fn moving_directory_drops_the_filter() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         app.start_filtering();
         app.filter_push('a');
         app.filter_accept();
@@ -1163,7 +1285,8 @@ mod tests {
     fn a_hidden_row_keeps_the_size_it_was_given() {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/f.bin"), vec![b'x'; 8192]).expect("write");
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         app.start_filtering();
         for ch in "zulu".chars() {
@@ -1181,7 +1304,8 @@ mod tests {
         for n in 0..30 {
             std::fs::write(dir.path().join(format!("f{n:02}.bin")), b"x").expect("write");
         }
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         app.set_page(10);
 
         app.page_down();
@@ -1205,7 +1329,8 @@ mod tests {
     #[test]
     fn home_and_end_go_the_whole_way() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         app.jump_to_bottom();
         assert_eq!(app.cursor(), app.entries().len() - 1);
@@ -1218,7 +1343,8 @@ mod tests {
     #[test]
     fn paging_an_empty_listing_does_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         app.start_filtering();
         for ch in "nothing".chars() {
             app.filter_push(ch);
@@ -1251,7 +1377,7 @@ mod tests {
         )
         .expect("compiles");
 
-        let app = App::open(dir.path(), rules, now()).expect("open");
+        let app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
         let state_of = |name: &str| {
             app.entries()
                 .iter()
@@ -1276,7 +1402,8 @@ mod tests {
     fn a_directory_no_rule_reaches_needs_no_legend() {
         let dir = fixture();
 
-        let app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         assert!(app.entries().iter().all(|e| e.state == State::Untracked));
         assert!(!app.any_rule_applies());
@@ -1303,7 +1430,7 @@ mod tests {
         )
         .expect("compiles");
 
-        let mut app = App::open(dir.path(), rules, now()).expect("open");
+        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
         assert!(
             !app.any_rule_applies()
                 || app
@@ -1349,7 +1476,8 @@ mod tests {
 
         let bare = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(bare.path().join("target")).expect("mkdir");
-        let app = App::open(bare.path(), rules(bare.path()), now()).expect("open");
+        let app =
+            App::open(bare.path(), rules(bare.path()), now(), UserDirs::default()).expect("open");
         assert_eq!(
             app.entries()
                 .iter()
@@ -1363,7 +1491,13 @@ mod tests {
         let crated = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(crated.path().join("target")).expect("mkdir");
         std::fs::write(crated.path().join("Cargo.toml"), b"[package]").expect("write");
-        let app = App::open(crated.path(), rules(crated.path()), now()).expect("open");
+        let app = App::open(
+            crated.path(),
+            rules(crated.path()),
+            now(),
+            UserDirs::default(),
+        )
+        .expect("open");
         assert_eq!(
             app.entries()
                 .iter()
@@ -1379,7 +1513,8 @@ mod tests {
     #[test]
     fn reloading_rules_repaints_without_moving_anything() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         point_at(&mut app, "zulu");
         let before = names(&app);
         assert!(!app.any_rule_applies());
@@ -1418,7 +1553,8 @@ mod tests {
             std::fs::write(inner.join("f.bin"), vec![b'x'; bytes]).expect("write");
         }
 
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         // Sizing `sub` reports everything beneath it on the way, so by now both
         // of its children are known and entering it starts no walk at all.
         await_sizes(&mut app);
@@ -1443,7 +1579,8 @@ mod tests {
     #[test]
     fn the_current_directory_is_a_row_of_its_own() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         await_sizes(&mut app);
 
         let here = app.here();
@@ -1462,7 +1599,8 @@ mod tests {
     fn the_current_directory_adds_up_its_listing() {
         let dir = fixture();
         std::fs::write(dir.path().join("alpha/inner.bin"), vec![b'x'; 8192]).expect("write");
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         await_sizes(&mut app);
 
         let listed: u64 = app
@@ -1483,7 +1621,8 @@ mod tests {
     fn the_current_directory_is_measuring_while_anything_under_it_is() {
         let dir = fixture();
 
-        let app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
 
         assert!(app.here().measuring, "{:?}", names(&app));
     }
@@ -1516,7 +1655,8 @@ mod tests {
         std::fs::write(dir.path().join("stale.pyc"), vec![b'x'; 4096]).expect("write");
         std::fs::write(dir.path().join("live.py"), vec![b'x'; 4096]).expect("write");
 
-        let mut app = App::open(dir.path(), claiming(dir.path()), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), claiming(dir.path()), now(), UserDirs::default()).expect("open");
         await_sizes(&mut app);
         let row = |name: &str| {
             app.entries()
@@ -1559,7 +1699,8 @@ mod tests {
         std::fs::create_dir_all(modules.join("dep")).expect("mkdir");
         std::fs::write(modules.join("dep/f.bin"), vec![b'x'; 16_384]).expect("write");
 
-        let mut app = App::open(dir.path(), claiming(dir.path()), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), claiming(dir.path()), now(), UserDirs::default()).expect("open");
         await_sizes(&mut app);
         let row = app
             .entries()
@@ -1582,7 +1723,8 @@ mod tests {
         std::fs::create_dir(&modules).expect("mkdir");
         std::fs::write(modules.join("dep.bin"), vec![b'x'; 16_384]).expect("write");
 
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         await_sizes(&mut app);
         let claimed = |app: &App| {
             app.entries()
@@ -1599,11 +1741,178 @@ mod tests {
         assert!(claimed(&app).is_some_and(|bytes| bytes >= 16_384));
     }
 
+    // ---- removing from the browser ---------------------------------------
+
+    /// A rule set that claims `node_modules` under `root`, as the built-ins do.
+    fn claiming_here(root: &Path) -> Rules {
+        Rules::new(
+            vec![Rule {
+                name: "junk".into(),
+                tier: Tier::Trash,
+                parts: vec![Part {
+                    root: Some(root.to_string_lossy().into_owned()),
+                    includes: vec!["**/node_modules/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
+            }],
+            &UserDirs::default(),
+        )
+        .expect("compiles")
+    }
+
+    /// Wait for the worker's plan, which is a real walk on a real directory.
+    fn await_plan(app: &mut App) {
+        for _ in 0..200 {
+            app.settle_removal();
+            if !matches!(app.removal(), Some(Removal::Planning { .. })) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the plan never arrived");
+    }
+
+    #[test]
+    fn removing_asks_before_it_does_anything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        let mut app =
+            App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+        point_at(&mut app, "project");
+        app.begin_removal();
+        await_plan(&mut app);
+
+        assert!(
+            matches!(
+                app.removal(),
+                Some(Removal::Asking {
+                    destroys: false,
+                    ..
+                })
+            ),
+            "a trash-tier plan asks, and asks gently: {:?}",
+            app.removal()
+        );
+        assert!(
+            root.join("project/node_modules/a.bin").exists(),
+            "and nothing has happened yet"
+        );
+    }
+
+    /// The parent row is the way out of here, not a description of anywhere —
+    /// removing "through" it would act on a directory the screen is not about.
+    #[test]
+    fn the_parent_row_removes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("project/node_modules")).expect("mkdir");
+
+        let mut app = App::open(
+            dir.path(),
+            claiming_here(dir.path()),
+            now(),
+            UserDirs::default(),
+        )
+        .expect("open");
+        // Opening lands on `..`.
+        app.begin_removal();
+
+        assert!(app.removal().is_none());
+    }
+
+    /// Only what a rule claims can go from here. A row nothing claims says so
+    /// rather than silently doing nothing, which would be indistinguishable
+    /// from a key that did not register.
+    #[test]
+    fn a_row_no_rule_claims_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir(root.join("ordinary")).expect("mkdir");
+        std::fs::write(root.join("ordinary/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        let mut app =
+            App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+        point_at(&mut app, "ordinary");
+        app.begin_removal();
+        await_plan(&mut app);
+
+        assert!(matches!(app.removal(), Some(Removal::Nothing { .. })));
+        assert!(root.join("ordinary/a.bin").exists());
+    }
+
+    /// The word is the whole guard on a destroying plan: agreeing without it
+    /// must do nothing at all.
+    #[test]
+    fn a_destroying_plan_is_not_agreed_to_by_pressing_return() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        let mut rules = claiming_here(root).to_vec();
+        rules[0].tier = Tier::Purge;
+        let mut app = App::open(
+            root,
+            Rules::new(rules, &UserDirs::default()).expect("compiles"),
+            now(),
+            UserDirs::default(),
+        )
+        .expect("open");
+        point_at(&mut app, "project");
+        app.begin_removal();
+        await_plan(&mut app);
+
+        assert!(matches!(
+            app.removal(),
+            Some(Removal::Asking { destroys: true, .. })
+        ));
+
+        app.confirm_removal();
+        assert!(
+            root.join("project/node_modules/a.bin").exists(),
+            "return alone must not destroy anything"
+        );
+
+        for ch in "purg".chars() {
+            app.removal_push(ch);
+        }
+        app.confirm_removal();
+        assert!(
+            root.join("project/node_modules/a.bin").exists(),
+            "and neither must most of the word"
+        );
+    }
+
+    /// Abandoning leaves the disk and the screen exactly as they were.
+    #[test]
+    fn dismissing_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        let mut app =
+            App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+        point_at(&mut app, "project");
+        let before = app.cursor();
+        app.begin_removal();
+        await_plan(&mut app);
+        app.dismiss_removal();
+
+        assert!(app.removal().is_none());
+        assert_eq!(app.cursor(), before);
+        assert!(root.join("project/node_modules/a.bin").exists());
+    }
+
     /// The root of the filesystem has no parent, so there is no `..` and
     /// leaving is a no-op rather than an error.
     #[test]
     fn there_is_no_way_up_from_the_top() {
-        let mut app = App::open(Path::new("/"), Rules::default(), now()).expect("open /");
+        let mut app = App::open(Path::new("/"), Rules::default(), now(), UserDirs::default())
+            .expect("open /");
 
         assert!(
             !names(&app).contains(&PARENT.to_owned()),

@@ -216,6 +216,13 @@ Invariants worth keeping in mind:
 - **`..` is refused in every pattern field.** It is the only way a pattern can
   leave its root, and every way it could is a mistake that would otherwise be
   silent — the glob never matches and the part stops claiming anything.
+- **The browser removes only what a rule claims, and always asks.** `D` plans
+  the subtree under the cursor exactly as `clean <path>` would, on a **worker**
+  so the screen keeps drawing. The **strictest tier in the plan** decides how it
+  is agreed to: anything destroying takes the word `purge` typed out, everything
+  else takes a `y`. On the command line the verb is the moment of intent; a
+  keypress has none, so the modal supplies one. `Backspace` is not the key — it
+  navigates, and a destructive action must not share a finger with a habit.
 - **`--explain` exits without walking, reading or removing.** Explaining and then
   acting would make it a log line; the point of a check is that it happens first.
   It names every flag passed, including the display-only ones, because a flag

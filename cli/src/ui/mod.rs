@@ -13,10 +13,12 @@ mod app;
 mod layout;
 mod listing;
 mod measure;
+mod removal;
 mod sort;
 mod term;
 
 use crate::args::Reload;
+use crate::render::tree::format_size;
 use app::App;
 use disk_tools_core::{Rules, State};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -34,7 +36,7 @@ use term::{Crossterm, Screen};
 /// terminal — both refusals belong *outside* the alternate screen, or their
 /// message would be printed onto a screen that is about to be torn down.
 pub fn run(root: &Path, rules: Rules, reload: Reload, now: SystemTime) -> io::Result<()> {
-    let mut app = App::open(root, rules, now)?;
+    let mut app = App::open(root, rules, now, reload.user_dirs.clone())?;
 
     term::install_panic_hook();
     let mut screen = Screen::enter(Crossterm)?;
@@ -50,6 +52,7 @@ pub fn run(root: &Path, rules: Rules, reload: Reload, now: SystemTime) -> io::Re
         // directory and the key line.
         app.set_page((terminal.size()?.height as usize).saturating_sub(4));
         app.absorb_sizes();
+        app.settle_removal();
         terminal.draw(|frame| draw(frame, &app, now))?;
 
         // A timeout rather than a blocking read: without one, a resize or a
@@ -80,6 +83,14 @@ pub fn run(root: &Path, rules: Rules, reload: Reload, now: SystemTime) -> io::Re
 /// Separated from the loop so the bindings are one readable table rather than
 /// something to reconstruct from a match buried in I/O.
 fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
+    // A removal takes every key while it is on screen. Leaving the browser's
+    // bindings live underneath would let `q` quit out of a half-typed
+    // confirmation, and `j` move the cursor off the row being asked about.
+    if app.removal().is_some() {
+        removing(app, code);
+        return true;
+    }
+
     // Blocked: two keys, and both of them are ways out. Everything else would
     // act on rules the tool no longer has.
     if app.blocked().is_some() {
@@ -112,6 +123,11 @@ fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.leave(),
 
         KeyCode::Char('/') => app.start_filtering(),
+        // Remove what the rules claim under this row. Capital, like `R`: the
+        // keys that do something out of the ordinary are the shifted ones, and
+        // `Backspace` — the obvious guess — already means "up one level", which
+        // is the last thing a destructive key should share a finger with.
+        KeyCode::Char('D') => app.begin_removal(),
         // The same key whether the filter is being typed or merely in force.
         KeyCode::Esc => app.filter_clear(),
 
@@ -130,6 +146,37 @@ fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
         _ => {}
     }
     true
+}
+
+/// Keys while a removal is on screen.
+///
+/// `Esc` always abandons it, at every stage — including while the plan is still
+/// being walked, where it costs nothing because nothing has happened yet.
+fn removing(app: &mut App, code: KeyCode) {
+    use removal::Removal;
+
+    match app.removal() {
+        Some(Removal::Asking { destroys, .. }) => {
+            let destroys = *destroys;
+            match code {
+                KeyCode::Esc => app.dismiss_removal(),
+                KeyCode::Enter => app.confirm_removal(),
+                // The gentle case takes the letter as agreement. The destroying
+                // one takes only the word, so `y` there is just a letter of it.
+                KeyCode::Char('y') if !destroys => app.confirm_removal(),
+                KeyCode::Backspace => app.removal_pop(),
+                KeyCode::Char(ch) => app.removal_push(ch),
+                _ => {}
+            }
+        }
+        // Planning, done, or nothing to do: one key out, and no key in.
+        Some(_) => {
+            if matches!(code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                app.dismiss_removal();
+            }
+        }
+        None => {}
+    }
 }
 
 /// Keys while a filter is being typed.
@@ -164,6 +211,13 @@ fn filtering(app: &mut App, code: KeyCode) {
 /// everything on this screen was about its contents and nothing was about it.
 /// `..` is the way out of here, not a description of here.
 fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
+    // A removal is drawn over everything, because everything under it is frozen
+    // and a screen that looked live would invite keys that go nowhere.
+    if let Some(pending) = app.blocked().is_none().then(|| app.removal()).flatten() {
+        draw_removal(frame, pending);
+        return;
+    }
+
     // Blocked: the listing is not drawn at all. Leaving it under the message
     // would leave a screenful of colours standing as an answer, and they are
     // answers from rules the tool no longer has.
@@ -240,6 +294,131 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
     frame.render_widget(
         Paragraph::new(keys(app)).style(Style::default().add_modifier(Modifier::DIM)),
         bands[5],
+    );
+}
+
+/// A removal, at whatever stage it has reached.
+///
+/// The plan is shown **grouped by rule**, which is what `preview -d 0` prints
+/// about the same paths: the modal and the report must not be able to describe
+/// one plan differently.
+fn draw_removal(frame: &mut Frame<'_>, pending: &removal::Removal) {
+    use removal::Removal;
+
+    let bands = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(frame.area());
+
+    let (title, style) = match pending {
+        Removal::Asking { destroys: true, .. } => (
+            "This destroys files. There is no way back.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Removal::Asking { .. } => (
+            "Remove what the rules claim here?",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Removal::Planning { .. } => ("Working out what would go…", Style::default()),
+        Removal::Done { .. } => ("Done.", Style::default().add_modifier(Modifier::BOLD)),
+        Removal::Nothing { .. } => ("Nothing here is claimed by any rule.", Style::default()),
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{title}\n{}", pending.path().display()))
+            .style(style)
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        bands[0],
+    );
+
+    let body: Vec<Line<'static>> = match pending {
+        Removal::Asking { plan, .. } => {
+            let mut lines: Vec<Line<'static>> = removal::shares(plan)
+                .into_iter()
+                .map(|share| {
+                    Line::from(format!(
+                        "  {:>8}  {:<16} {:>4} {}  {}",
+                        format_size(share.allocated),
+                        share.rule,
+                        share.count,
+                        if share.count == 1 { "item " } else { "items" },
+                        if share.purge {
+                            "destroyed"
+                        } else {
+                            "to the Trash"
+                        },
+                    ))
+                })
+                .collect();
+            lines.push(Line::from(String::new()));
+            lines.push(Line::from(format!(
+                "  Frees {}",
+                format_size(plan.reclaimable)
+            )));
+            if !plan.excluded.is_empty() {
+                lines.push(Line::from(format!(
+                    "  {} refused and left alone",
+                    plan.excluded.len()
+                )));
+            }
+            lines
+        }
+        Removal::Done { outcome, .. } => {
+            let mut lines = vec![Line::from(format!(
+                "  Removed {} of them, freeing {}.",
+                outcome.count(),
+                format_size(outcome.reclaimed())
+            ))];
+            if !outcome.trashed.paths.is_empty() {
+                lines.push(Line::from(format!(
+                    "  {} in the Trash, and can be put back.",
+                    outcome.trashed.paths.len()
+                )));
+            }
+            if !outcome.purged.paths.is_empty() {
+                lines.push(Line::from(format!(
+                    "  {} destroyed.",
+                    outcome.purged.paths.len()
+                )));
+            }
+            for failure in &outcome.failed {
+                lines.push(Line::from(format!(
+                    "  not removed: {} — {}",
+                    failure.path.display(),
+                    failure.reason
+                )));
+            }
+            lines
+        }
+        Removal::Planning { .. } => vec![Line::from(
+            "  Walking the tree and asking git about any repository in it.",
+        )],
+        Removal::Nothing { .. } => vec![
+            Line::from(
+                "  Only what a rule claims can be removed from here — which is what keeps the",
+            ),
+            Line::from("  tiers and the denylist from being decoration on a file deleter."),
+        ],
+    };
+    frame.render_widget(Paragraph::new(body), bands[1]);
+
+    let keys = match pending {
+        Removal::Asking {
+            destroys: true,
+            typed,
+            ..
+        } => format!(
+            "  type `{}` to confirm: {typed:<8}   esc cancel",
+            removal::Removal::WORD
+        ),
+        Removal::Asking { .. } => "  y confirm    esc cancel".to_owned(),
+        Removal::Planning { .. } => "  esc cancel".to_owned(),
+        _ => "  esc close".to_owned(),
+    };
+    frame.render_widget(
+        Paragraph::new(keys).style(Style::default().add_modifier(Modifier::DIM)),
+        bands[2],
     );
 }
 
@@ -339,7 +518,7 @@ fn keys(app: &App) -> &'static str {
     if app.is_filtering() {
         "esc cancel  ↵ keep  ↑↓ move"
     } else {
-        "q quit  ↵ enter  ← up  / filter  n/s/c/m sort  r sizes  R config"
+        "q quit  ↵ enter  ← up  / filter  n/s/c/m sort  r sizes  R config  D remove"
     }
 }
 
@@ -431,7 +610,7 @@ mod tests {
     /// size of 0x0, so nothing renders and layout cannot be seen at all.
     fn painted(root: &Path, width: u16, height: u16) -> Vec<String> {
         paint(
-            App::open(root, Rules::default(), now()).expect("open"),
+            App::open(root, Rules::default(), now(), UserDirs::default()).expect("open"),
             width,
             height,
         )
@@ -441,10 +620,11 @@ mod tests {
     ///
     /// Bounded, so a worker that never finishes fails rather than hangs.
     fn painted_settled(root: &Path, width: u16, height: u16) -> Vec<String> {
-        let mut app = App::open(root, Rules::default(), now()).expect("open");
+        let mut app = App::open(root, Rules::default(), now(), UserDirs::default()).expect("open");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             app.absorb_sizes();
+            app.settle_removal();
             if app.entries().iter().all(|entry| !entry.measuring) {
                 return paint(app, width, height);
             }
@@ -474,7 +654,8 @@ mod tests {
     #[ignore = "diagnostic: prints the screen, asserts nothing"]
     fn show_blocked() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         let reload = reload_from(Some(broken_config(dir.path())));
         reread(&mut app, &reload);
         for line in paint(app, 78, 12) {
@@ -487,7 +668,8 @@ mod tests {
     #[test]
     fn a_config_that_stops_parsing_blocks_the_browser() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         let reload = reload_from(Some(broken_config(dir.path())));
 
         reread(&mut app, &reload);
@@ -514,7 +696,8 @@ mod tests {
     #[test]
     fn a_blocked_browser_takes_only_reload_and_quit() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         let reload = reload_from(Some(broken_config(dir.path())));
         reread(&mut app, &reload);
         let before = app.cursor();
@@ -542,7 +725,8 @@ mod tests {
     #[test]
     fn a_config_that_parses_again_unblocks_it() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         let path = broken_config(dir.path());
         let reload = reload_from(Some(path.clone()));
         reread(&mut app, &reload);
@@ -560,6 +744,49 @@ mod tests {
             app.any_rule_applies(),
             "and in force: the listing is painted by them"
         );
+    }
+
+    /// The destroying modal, printed. Ignored for the same reason as `show`.
+    #[test]
+    #[ignore = "diagnostic: prints the screen, asserts nothing"]
+    fn show_removal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 400_000])
+            .expect("write");
+
+        let rules = Rules::new(
+            vec![Rule {
+                name: "node-modules".into(),
+                tier: disk_tools_core::Tier::Purge,
+                parts: vec![Part {
+                    root: Some(root.to_string_lossy().into_owned()),
+                    includes: vec!["**/node_modules/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
+            }],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+
+        let mut app = App::open(root, rules, now(), UserDirs::default()).expect("open");
+        app.move_down();
+        app.begin_removal();
+        for _ in 0..200 {
+            app.settle_removal();
+            if !matches!(app.removal(), Some(removal::Removal::Planning { .. })) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.removal_push('p');
+        app.removal_push('u');
+
+        for line in paint(app, 78, 12) {
+            println!("|{line}");
+        }
     }
 
     fn paint(app: App, width: u16, height: u16) -> Vec<String> {
@@ -774,7 +1001,8 @@ mod tests {
     #[test]
     fn the_filter_is_on_screen_while_it_is_being_typed() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         app.start_filtering();
         app.filter_push('s');
 
@@ -793,7 +1021,8 @@ mod tests {
     #[test]
     fn an_accepted_filter_says_how_to_get_rid_of_it() {
         let dir = fixture();
-        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
         app.start_filtering();
         app.filter_push('s');
         app.filter_accept();
@@ -823,7 +1052,11 @@ mod tests {
         )
         .expect("compiles");
 
-        let lines = paint(App::open(dir.path(), rules, now()).expect("open"), 78, 10);
+        let lines = paint(
+            App::open(dir.path(), rules, now(), UserDirs::default()).expect("open"),
+            78,
+            10,
+        );
         let legend = lines
             .iter()
             .find(|line| line.contains("rules:"))
