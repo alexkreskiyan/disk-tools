@@ -963,6 +963,12 @@ fn compile(
         // where it does not would put a directory the user never named up for
         // deletion.
         .case_insensitive(cfg!(windows))
+        // `*` stops at a separator; only `**` crosses one. Without this globset
+        // lets `*` reach to any depth, which made `**` and `*` synonyms — so the
+        // distinction every comment in this file draws, and the one gitignore
+        // draws, was fiction. It also made "only the direct children of this
+        // directory" inexpressible: `parent/*/` claimed grandchildren too.
+        .literal_separator(true)
         .build()
         .map_err(|err| RuleError {
             rule: rule.to_owned(),
@@ -1047,6 +1053,49 @@ mod tests {
             .into_iter()
             .map(|index| rules.rule_at(index).name.clone())
             .collect()
+    }
+
+    /// `*` stops at a separator and `**` crosses one — the distinction gitignore
+    /// draws, and the one every comment in this file assumed. Until v0.7 they
+    /// were synonyms: globset lets `*` reach to any depth unless told otherwise,
+    /// so `parent/*/` quietly claimed grandchildren, and "only the direct
+    /// children of this directory" could not be said at all.
+    #[test]
+    fn one_star_stops_at_a_separator_and_two_cross_it() {
+        let rules = Rules::new(
+            vec![rooted("shallow", "/store", &["*/"])],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+
+        assert_eq!(matches(&rules, "/store/package", true), vec!["shallow"]);
+        assert!(
+            matches(&rules, "/store/package/version", true).is_empty(),
+            "a grandchild is not a direct child"
+        );
+
+        let deep = Rules::new(
+            vec![rooted("deep", "/store", &["**/"])],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+        assert_eq!(matches(&deep, "/store/package/version", true), vec!["deep"]);
+    }
+
+    /// The same rule inside a name: `*.pyc` is a name, not a path.
+    #[test]
+    fn a_star_in_a_name_does_not_reach_into_a_directory() {
+        let rules = Rules::new(
+            vec![rooted("names", "/p", &["*.log"])],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+
+        assert_eq!(matches(&rules, "/p/app.log", false), vec!["names"]);
+        assert!(
+            matches(&rules, "/p/nested/app.log", false).is_empty(),
+            "which is why the built-ins are written `**/*.pyc` and not `*.pyc`"
+        );
     }
 
     /// The property the whole design rests on: precedence is the order the rules

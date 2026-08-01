@@ -746,7 +746,7 @@ two lines per rule is the cheaper side of that.
 | In a part | |
 |---|---|
 | `root` | required. `"*"` means wherever the scan goes. `~`, `%LOCALAPPDATA%` and `%APPDATA%` expand from your environment — and **a token that cannot be resolved drops that part**, never widens it |
-| `includes` | globs relative to `root`. A trailing `/` means **directory only**, as in gitignore: `**/*.pyc` matches files, `**/node_modules/` does not match a file of that name |
+| `includes` | globs relative to `root`. A trailing `/` means **directory only**, as in gitignore: `**/*.pyc` matches files, `**/node_modules/` does not match a file of that name. **`*` stops at a separator, `**` crosses one** — `*/` is the direct children of `root`, `**/` is everything under it |
 | `excludes` | matched by `includes`, but left alone |
 | `requires` | paths relative to the directory holding the match, each of which must find something. `Cargo.toml` is the file beside it; `src/main.rs` descends from there. Globs, because build systems name their marker after the project. Matched **all** |
 | `requires-clean-repo` | skip a match whose repository has uncommitted work |

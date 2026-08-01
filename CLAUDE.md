@@ -186,6 +186,10 @@ Invariants worth keeping in mind:
   size and file identity both come from one `GetFileInformationByHandleEx` call
   per directory; `size.rs` is only the fallback there. Unix takes the per-file
   path and is unchanged.
+- **`*` stops at a separator; only `**` crosses one.** globset does not do this
+  by default, and until v0.7 the two were synonyms — so `parent/*/` claimed
+  grandchildren and "the direct children of this directory" was inexpressible.
+  Set once, in `rules::compile`, because both rule kinds compile through it.
 - **A part is a self-contained statement.** Everything deciding *whether* an
   object qualifies is in the part; everything about the *consequence* is on the
   rule. A tier on a part would make the part a rule, and the rule would stop

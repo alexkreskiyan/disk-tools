@@ -122,6 +122,12 @@ duplicates:
 #   includes  globs relative to `root`. A trailing `/` means directory only,
 #             as in gitignore — which is why `**/*.pyc` matches files and
 #             `**/node_modules/` does not match a file of that name.
+#
+#             `*` stops at a separator and `**` crosses one, also as in
+#             gitignore: `*/` is the direct children of `root` and nothing
+#             deeper, while `**/` is everything under it. That is why the rules
+#             below are written `**/target/` — a bare `target/` would only match
+#             one directly inside the root.
 #   excludes  likewise relative: matched by `includes`, but left alone.
 #   requires  paths relative to the directory holding the match, each of which
 #             must find something of its own. `Cargo.toml` means the file
