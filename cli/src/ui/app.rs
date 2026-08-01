@@ -77,6 +77,12 @@ pub struct App {
     /// stays open.
     now: SystemTime,
 
+    /// Why the browser has stopped taking keys, when it has.
+    ///
+    /// `Some` only after a reload that failed: the rules on screen are then the
+    /// previous ones, and nothing here may pretend otherwise.
+    blocked: Option<String>,
+
     /// How many rows the list band has. Set by the drawing code, which is the
     /// only place that knows — a page is a screenful, so it cannot be a
     /// constant.
@@ -105,6 +111,7 @@ impl App {
                 fell_back: false,
             },
             notice: None,
+            blocked: None,
             sizer: Sizer::new(Arc::clone(&rules), now),
             rules,
             now,
@@ -160,6 +167,27 @@ impl App {
     /// Put something in the header until the next thing that succeeds.
     pub fn say(&mut self, what: String) {
         self.notice = Some(what);
+    }
+
+    /// Stop taking keys, and say why.
+    ///
+    /// Reached when the config no longer parses. Every colour, every `clean`
+    /// column and every legend row on this screen is a claim about rules the
+    /// tool no longer has, and a one-line notice under a screenful of them is
+    /// not a correction — it is a caption on something that is now wrong.
+    ///
+    /// v0.4 decided the other way: a bad file left the working rules in place
+    /// with a notice, so a typo would not turn every colour off. That was right
+    /// when the alternative was an empty screen. It is wrong now that the
+    /// alternative is the CLI's own rule — rules that cannot be read stop the
+    /// work — which is what keeps the two saying the same thing about one file.
+    pub fn block(&mut self, why: String) {
+        self.blocked = Some(why);
+    }
+
+    /// Why the browser is not taking keys, if it is not.
+    pub fn blocked(&self) -> Option<&str> {
+        self.blocked.as_deref()
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -410,6 +438,9 @@ impl App {
     /// leave the screen answering the previous question — which is precisely the
     /// question the user changed the rule to stop asking.
     pub fn reload_rules(&mut self, rules: Rules) {
+        // Reading a usable file is the only way out of the blocked state, and
+        // this is the only place a usable file arrives.
+        self.blocked = None;
         self.rules = Arc::new(rules);
         self.sizer.retarget(Arc::clone(&self.rules));
 

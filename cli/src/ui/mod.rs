@@ -80,6 +80,17 @@ pub fn run(root: &Path, rules: Rules, reload: Reload, now: SystemTime) -> io::Re
 /// Separated from the loop so the bindings are one readable table rather than
 /// something to reconstruct from a match buried in I/O.
 fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
+    // Blocked: two keys, and both of them are ways out. Everything else would
+    // act on rules the tool no longer has.
+    if app.blocked().is_some() {
+        match code {
+            KeyCode::Char('q') => return false,
+            KeyCode::Char('R') => reread(app, reload),
+            _ => {}
+        }
+        return true;
+    }
+
     // While a filter is being typed, letters are letters. Anything else would
     // mean a directory called `q` could not be searched for.
     if app.is_filtering() {
@@ -153,6 +164,14 @@ fn filtering(app: &mut App, code: KeyCode) {
 /// everything on this screen was about its contents and nothing was about it.
 /// `..` is the way out of here, not a description of here.
 fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
+    // Blocked: the listing is not drawn at all. Leaving it under the message
+    // would leave a screenful of colours standing as an answer, and they are
+    // answers from rules the tool no longer has.
+    if let Some(why) = app.blocked() {
+        draw_blocked(frame, why);
+        return;
+    }
+
     // The legend costs a row, so it is only there when the colours it explains
     // are. A directory no rule reaches has nothing to explain.
     let legend_rows = u16::from(app.any_rule_applies());
@@ -224,12 +243,42 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
     );
 }
 
+/// The whole screen, given over to a config that cannot be read.
+///
+/// The error goes out **in full** — a parse error names a line and a column, and
+/// truncating it to fit a notice line would remove the only part worth having.
+fn draw_blocked(frame: &mut Frame<'_>, why: &str) {
+    let bands = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(
+            "The configuration could not be read, so nothing on screen would mean anything.",
+        )
+        .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .wrap(ratatui::widgets::Wrap { trim: false }),
+        bands[0],
+    );
+    frame.render_widget(
+        Paragraph::new(why.to_owned()).wrap(ratatui::widgets::Wrap { trim: false }),
+        bands[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Fix the file, then press R. q leaves.")
+            .style(Style::default().add_modifier(Modifier::DIM)),
+        bands[2],
+    );
+}
+
 /// Read the config again and repaint against it.
 ///
-/// A bad file leaves the rules that were working in place and says why. Dropping
-/// them would mean a typo silently turns every colour off, which looks exactly
-/// like "my rules stopped matching" — the one thing the user is here to
-/// diagnose.
+/// A file that no longer parses **blocks** the browser rather than leaving a
+/// note under a screen still painted in the previous rules' colours. See
+/// [`App::block`] for why that reversed a v0.4 decision.
 fn reread(app: &mut App, reload: &Reload) {
     match crate::config::load(reload.path.as_deref(), &reload.user_dirs, None)
         .map_err(|err| err.to_string())
@@ -243,7 +292,7 @@ fn reread(app: &mut App, reload: &Reload) {
                 None => "reloaded the built-in rules".to_owned(),
             });
         }
-        Err(problem) => app.say(format!("config unchanged — {problem}")),
+        Err(problem) => app.block(problem),
     }
 }
 
@@ -284,6 +333,9 @@ fn legend() -> Vec<Span<'static>> {
 /// What the keys do — different while a filter is being typed, because most of
 /// them are then just letters.
 fn keys(app: &App) -> &'static str {
+    if app.blocked().is_some() {
+        return "R re-read the config  q quit";
+    }
     if app.is_filtering() {
         "esc cancel  ↵ keep  ↑↓ move"
     } else {
@@ -368,8 +420,9 @@ pub fn stdout_is_terminal() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_tools_core::{Part, Rule};
+    use disk_tools_core::{Part, Rule, UserDirs};
     use ratatui::backend::TestBackend;
+    use std::path::PathBuf;
 
     /// Draw into a fake terminal of a known size and read the text back.
     ///
@@ -398,6 +451,115 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "sizes never settled");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    // ---- a config that cannot be read ------------------------------------
+
+    /// A file with a genuine mistake in it, for the two tests below.
+    fn broken_config(home: &Path) -> PathBuf {
+        let path = home.join("config.yml");
+        std::fs::write(&path, "clean-rules:\n  - name: mine\n    tier: trash\n").expect("write");
+        path
+    }
+
+    fn reload_from(path: Option<PathBuf>) -> Reload {
+        Reload {
+            path,
+            user_dirs: UserDirs::default(),
+        }
+    }
+
+    /// The blocked screen, printed. Ignored for the same reason as `show`.
+    #[test]
+    #[ignore = "diagnostic: prints the screen, asserts nothing"]
+    fn show_blocked() {
+        let dir = fixture();
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let reload = reload_from(Some(broken_config(dir.path())));
+        reread(&mut app, &reload);
+        for line in paint(app, 78, 12) {
+            println!("|{line}");
+        }
+    }
+
+    /// The whole screen, because every colour on the previous one was a claim
+    /// about rules the tool no longer has.
+    #[test]
+    fn a_config_that_stops_parsing_blocks_the_browser() {
+        let dir = fixture();
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let reload = reload_from(Some(broken_config(dir.path())));
+
+        reread(&mut app, &reload);
+
+        assert!(app.blocked().is_some());
+        let lines = paint(app, 78, 12);
+        assert!(
+            lines.iter().any(|line| line.contains("could not be read")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("`parts` is required")),
+            "the error goes out in full, not summarised: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("press R")),
+            "and the way out is on screen: {lines:?}"
+        );
+    }
+
+    /// Two keys, and both of them are ways out.
+    #[test]
+    fn a_blocked_browser_takes_only_reload_and_quit() {
+        let dir = fixture();
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let reload = reload_from(Some(broken_config(dir.path())));
+        reread(&mut app, &reload);
+        let before = app.cursor();
+
+        for code in [
+            KeyCode::Down,
+            KeyCode::Char('j'),
+            KeyCode::Enter,
+            KeyCode::Char('/'),
+            KeyCode::Char('s'),
+            KeyCode::Char('r'),
+        ] {
+            assert!(handle(&mut app, code, &reload), "{code:?} must not quit");
+            assert_eq!(app.cursor(), before, "{code:?} moved something");
+            assert!(app.blocked().is_some(), "{code:?} left the blocked state");
+        }
+
+        assert!(
+            !handle(&mut app, KeyCode::Char('q'), &reload),
+            "q still leaves"
+        );
+    }
+
+    /// The only way out that is not the door: a file that parses.
+    #[test]
+    fn a_config_that_parses_again_unblocks_it() {
+        let dir = fixture();
+        let mut app = App::open(dir.path(), Rules::default(), now()).expect("open");
+        let path = broken_config(dir.path());
+        let reload = reload_from(Some(path.clone()));
+        reread(&mut app, &reload);
+        assert!(app.blocked().is_some());
+
+        std::fs::write(
+            &path,
+            "clean-rules:\n  - name: mine\n    tier: trash\n    parts:\n      - root: \"*\"\n        includes: [\"**/node_modules/\"]\n",
+        )
+        .expect("write");
+        handle(&mut app, KeyCode::Char('R'), &reload);
+
+        assert!(app.blocked().is_none(), "the rules are readable again");
+        assert!(
+            app.any_rule_applies(),
+            "and in force: the listing is painted by them"
+        );
     }
 
     fn paint(app: App, width: u16, height: u16) -> Vec<String> {
