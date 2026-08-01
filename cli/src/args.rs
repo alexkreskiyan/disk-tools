@@ -333,6 +333,69 @@ pub struct Duplicating {
     pub keep_in: Option<Vec<PathBuf>>,
 }
 
+/// Where a resolved value came from.
+///
+/// Kept only so `--explain` can name the line to change. A report saying
+/// `floor 5.0M` sends a user to the wrong place half the time: the flag and the
+/// file arrive here as the same value, and only the resolution knew which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A flag on this command line.
+    Flag(&'static str),
+    /// A key in the configuration file.
+    File(&'static str),
+    /// Nothing said anything; this is the built-in.
+    Default,
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::Flag(name) => write!(f, "{name}"),
+            Source::File(key) => write!(f, "{key}, from the file"),
+            Source::Default => write!(f, "the built-in default"),
+        }
+    }
+}
+
+/// A value that has no file key: the flag, or the built-in.
+fn source_of<T>(flag: Option<T>, name: &'static str) -> Source {
+    match flag {
+        Some(_) => Source::Flag(name),
+        None => Source::Default,
+    }
+}
+
+/// Take the first of flag, file, default — and remember which it was.
+///
+/// The one place the precedence order is written for a value that `--explain`
+/// shows, so the answer and the explanation cannot disagree about it.
+fn from<T>(
+    flag: Option<T>,
+    file: Option<T>,
+    fallback: T,
+    flag_name: &'static str,
+    file_key: &'static str,
+) -> (T, Source) {
+    match (flag, file) {
+        (Some(value), _) => (value, Source::Flag(flag_name)),
+        (None, Some(value)) => (value, Source::File(file_key)),
+        (None, None) => (fallback, Source::Default),
+    }
+}
+
+/// Where each shown value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sources {
+    pub min_size: Source,
+    pub keep: Source,
+    pub keep_in: Source,
+    pub safe: Source,
+    pub confirm: Source,
+    pub depth: Source,
+    pub sort: Source,
+}
+
 /// What the report is ordered by.
 ///
 /// A value rather than a `--by-size` flag, so that ordering by a timestamp can
@@ -426,6 +489,9 @@ pub struct Cleanup {
     /// How the plan is **shown**. Never how it is chosen: nothing in here can
     /// keep a candidate out of the removal, only out of the printout.
     pub report: Report,
+
+    /// Where each of the above came from, for `--explain`.
+    pub sources: Sources,
 }
 
 /// What the parsed arguments actually asked for.
@@ -603,15 +669,49 @@ impl Args {
 
         // Flag, then file, then a default that depends on the mode: hashing has
         // a floor worth having and rule-claimed directories do not.
-        let min_size = clean
-            .min_size
-            .or(clean.dup.then_some(config.duplicates.min_size).flatten())
-            .unwrap_or(if clean.dup { MIN_DUPLICATE_SIZE } else { 0 });
+        let (min_size, min_size_source) = from(
+            clean.min_size,
+            clean.dup.then_some(config.duplicates.min_size).flatten(),
+            if clean.dup { MIN_DUPLICATE_SIZE } else { 0 },
+            "--min-size",
+            "[duplicates] min-size",
+        );
+        let (safe_only, safe_source) = from(
+            clean.safe.then_some(true),
+            clean_settings.safe,
+            false,
+            "--safe",
+            "[clean] safe",
+        );
+        let (require_confirmation, confirm_source) = from(
+            clean.yes.then_some(false),
+            clean_settings.require_confirmation,
+            true,
+            "--yes",
+            "[clean] require-confirmation",
+        );
+        let (keep, keep_source) = from(
+            clean.keep.map(Keep::from),
+            config.duplicates.keep,
+            Keep::default(),
+            "--keep",
+            "[duplicates] keep",
+        );
+
+        let keep_in_source = if !clean.keep_in.is_empty() {
+            Source::Flag("--keep-in")
+        } else if !config.duplicates.keep_in.is_empty() {
+            Source::File("[duplicates] keep-in")
+        } else {
+            Source::Default
+        };
 
         let duplicates = clean.dup.then_some(()).map(|()| Duplicating {
             rules: duplicate_rules,
             min_size,
-            keep: clean.keep.map(Keep::from).or(config.duplicates.keep),
+            // `None` means no one overrode the rules, which is a different
+            // statement from "the default was used".
+            keep: (keep_source != Source::Default).then_some(keep),
             // The flag **replaces** the file's list rather than extending it:
             // these are ordered preferences, and a command line that could only
             // ever add to them could not say "not the usual place, this one".
@@ -643,7 +743,7 @@ impl Args {
             options: CleanOptions {
                 detect: DetectOptions { rules, now },
                 user_dirs,
-                safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
+                safe_only,
                 purge_all: clean.purge,
                 min_size,
             },
@@ -653,7 +753,7 @@ impl Args {
             // confirmation on this tier, and the asymmetry the denylist already
             // states applies: refusing too readily costs a user one extra flag,
             // refusing too rarely costs them data.
-            confirm_tier_allowed: clean.yes || !clean_settings.require_confirmation.unwrap_or(true),
+            confirm_tier_allowed: !require_confirmation,
             report: Report {
                 // Grouped by rule unless asked for more. The overview is what
                 // the question "what would this take" wants first; the list is
@@ -668,6 +768,15 @@ impl Args {
                     .sort
                     .unwrap_or(if clean.dup { Sort::Size } else { Sort::Name }),
                 json: clean.json,
+            },
+            sources: Sources {
+                min_size: min_size_source,
+                keep: keep_source,
+                keep_in: keep_in_source,
+                safe: safe_source,
+                confirm: confirm_source,
+                depth: source_of(clean.depth, "--depth"),
+                sort: source_of(clean.sort, "--sort"),
             },
         })))
     }

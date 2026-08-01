@@ -83,7 +83,7 @@ fn main() -> ExitCode {
     // Before anything is walked, read or removed. Explaining and then acting
     // would make this a log line rather than a check.
     if explaining {
-        let said = explain::explain(&mode, named.as_deref());
+        let said = explain::explain(&mode, named.as_deref(), verbose);
         return match write_report(&said) {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,

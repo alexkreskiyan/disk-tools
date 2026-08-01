@@ -19,7 +19,7 @@ use std::path::Path;
 ///
 /// Built from the resolved [`Mode`], so it describes the run that *would* have
 /// happened rather than a second reading of the same arguments.
-pub fn explain(mode: &Mode, config: Option<&Path>) -> String {
+pub fn explain(mode: &Mode, config: Option<&Path>, verbose: bool) -> String {
     let mut out = String::new();
 
     match config {
@@ -39,8 +39,12 @@ pub fn explain(mode: &Mode, config: Option<&Path>) -> String {
     let _ = writeln!(out);
 
     match mode {
-        Mode::Scan { options, .. } => scan(options, &mut out),
-        Mode::Clean(cleanup) => cleanup_mode(cleanup, &mut out),
+        Mode::Scan {
+            options,
+            number,
+            json,
+        } => scan(options, *number, *json, verbose, &mut out),
+        Mode::Clean(cleanup) => cleanup_mode(cleanup, verbose, &mut out),
         Mode::Ui { root, rules, .. } => {
             let _ = writeln!(out, "Would open the browser at {}.", root.display());
             let _ = writeln!(
@@ -64,7 +68,7 @@ pub fn explain(mode: &Mode, config: Option<&Path>) -> String {
     out
 }
 
-fn scan(options: &ScanOptions, out: &mut String) {
+fn scan(options: &ScanOptions, number: Option<usize>, json: bool, verbose: bool, out: &mut String) {
     let _ = writeln!(out, "Would measure {}.", options.root.display());
     let _ = writeln!(
         out,
@@ -82,9 +86,38 @@ fn scan(options: &ScanOptions, out: &mut String) {
     if options.one_file_system {
         let _ = writeln!(out, "  boundaries     stops at other filesystems");
     }
+
+    // Every one of `scan`'s narrowings is display-only, which is the opposite of
+    // what the same words mean to `preview` — and the one thing worth saying
+    // twice, since `--min-size` is spelled identically in both.
+    let _ = writeln!(out, "\nShown, not measured:");
+    if let Some(number) = number {
+        let _ = writeln!(out, "  entries        at most {number} (-n)");
+    }
+    if let Some(depth) = options.depth {
+        let _ = writeln!(out, "  depth          {depth} levels (--depth)");
+    }
+    if options.min_size > 0 {
+        let _ = writeln!(
+            out,
+            "  floor          {} (--min-size)",
+            size(options.min_size)
+        );
+    }
+    if json {
+        let _ = writeln!(out, "  output         JSON, whole (--json)");
+    }
+    if verbose {
+        let _ = writeln!(out, "  skipped        every one listed (--verbose)");
+    }
+    let _ = writeln!(
+        out,
+        "A directory's size is always its whole subtree, exactly as `du` reports it: hiding a\n\
+         child never shrinks its parent's number."
+    );
 }
 
-fn cleanup_mode(cleanup: &Cleanup, out: &mut String) {
+fn cleanup_mode(cleanup: &Cleanup, verbose: bool, out: &mut String) {
     let verb = match cleanup.intent {
         Intent::Preview => "Would examine",
         Intent::Removing => "Would examine, and then remove from",
@@ -122,7 +155,12 @@ fn cleanup_mode(cleanup: &Cleanup, out: &mut String) {
                 "Your clean rules are still consulted, but only to keep the search out of what\n\
                  they claim — a node_modules goes whole, and is not a place to remove one file from.\n"
             );
-            let _ = writeln!(out, "  floor          {}", size(duplicating.min_size));
+            let _ = writeln!(
+                out,
+                "  floor          {} ({})",
+                size(duplicating.min_size),
+                cleanup.sources.min_size
+            );
             // "--keep or the file" rather than "--keep": both arrive here as
             // the same `Some`, and naming the flag for a value that came from
             // the file would send a user to change something they never passed.
@@ -130,7 +168,8 @@ fn cleanup_mode(cleanup: &Cleanup, out: &mut String) {
                 Some(keep) => {
                     let _ = writeln!(
                         out,
-                        "  keeper         {keep:?}, over every rule (--keep, or [duplicates] keep)"
+                        "  keeper         {keep:?}, over every rule ({})",
+                        cleanup.sources.keep
                     );
                 }
                 None => {
@@ -139,7 +178,12 @@ fn cleanup_mode(cleanup: &Cleanup, out: &mut String) {
             }
             if let Some(keep_in) = &duplicating.keep_in {
                 for root in keep_in {
-                    let _ = writeln!(out, "  prefer to keep {}", root.display());
+                    let _ = writeln!(
+                        out,
+                        "  prefer to keep {} ({})",
+                        root.display(),
+                        cleanup.sources.keep_in
+                    );
                 }
             }
             let _ = writeln!(out);
@@ -158,8 +202,9 @@ fn cleanup_mode(cleanup: &Cleanup, out: &mut String) {
             if cleanup.options.min_size > 0 {
                 let _ = writeln!(
                     out,
-                    "  floor          {} (--min-size)",
-                    size(cleanup.options.min_size)
+                    "  floor          {} ({})",
+                    size(cleanup.options.min_size),
+                    cleanup.sources.min_size
                 );
             }
             let _ = writeln!(out);
@@ -168,6 +213,53 @@ fn cleanup_mode(cleanup: &Cleanup, out: &mut String) {
     }
 
     write_fate(cleanup, out);
+    write_shown(cleanup, verbose, out);
+}
+
+/// The flags that decide what reaches the screen, and the sentence that keeps
+/// them in their place.
+///
+/// They are here because a user who passed one deserves to see it accounted
+/// for, and separated because the difference matters: a candidate a shallow
+/// report does not name is one `clean` removes anyway.
+fn write_shown(cleanup: &Cleanup, verbose: bool, out: &mut String) {
+    let report = cleanup.report;
+    let _ = writeln!(out, "\nShown, not decided:");
+    let _ = writeln!(
+        out,
+        "  depth          {} — {} ({})",
+        report.depth,
+        match (report.depth, cleanup.duplicates.is_some()) {
+            (0, true) => "one line per group",
+            (0, false) => "grouped by rule",
+            (_, true) => "every path, kept and removed",
+            (_, false) => "every candidate",
+        },
+        cleanup.sources.depth
+    );
+    let _ = writeln!(
+        out,
+        "  order          {} ({})",
+        match report.sort {
+            crate::args::Sort::Name => "by name",
+            crate::args::Sort::Size => "largest first",
+        },
+        cleanup.sources.sort
+    );
+    if report.json {
+        let _ = writeln!(
+            out,
+            "  output         JSON, whole — no display flag shortens it (--json)"
+        );
+    }
+    if verbose {
+        let _ = writeln!(out, "  skipped        every one listed (--verbose)");
+    }
+    let _ = writeln!(
+        out,
+        "None of this changes the plan: a candidate a shallow report does not name is one\n\
+         that would still be removed."
+    );
 }
 
 /// Where each tier sends things, and whether the run would stop.
@@ -176,8 +268,9 @@ fn write_fate(cleanup: &Cleanup, out: &mut String) {
     if cleanup.options.safe_only {
         let _ = writeln!(
             out,
-            "--safe: only what needs no confirmation is offered. Under --dup that is nothing at\n\
-             all, since every duplicate needs confirming."
+            "Only what needs no confirmation is offered ({}). Under --dup that is nothing at\n\
+             all, since every duplicate needs confirming.",
+            cleanup.sources.safe
         );
     }
     if cleanup.options.purge_all {
@@ -199,7 +292,8 @@ fn write_fate(cleanup: &Cleanup, out: &mut String) {
         Intent::Removing if cleanup.confirm_tier_allowed => {
             let _ = writeln!(
                 out,
-                "\n--yes: confirm-tier candidates would be removed too, without being asked about."
+                "\nConfirm-tier candidates would be removed too, without being asked about ({}).",
+                cleanup.sources.confirm
             );
         }
         Intent::Removing => {
@@ -296,7 +390,11 @@ mod tests {
     /// The explanation for `args`, against a config built from `text`.
     fn explaining(args: &[&str], text: &str) -> String {
         let config = crate::config::parse_for_test(text);
-        explain(&resolved(args, config), Some(Path::new("/cfg/config.yml")))
+        explain(
+            &resolved(args, config),
+            Some(Path::new("/cfg/config.yml")),
+            false,
+        )
     }
 
     fn rooted(name: &str) -> String {
@@ -318,7 +416,7 @@ mod tests {
     #[test]
     fn no_file_is_said_out_loud() {
         let config = crate::config::Config::default();
-        let said = explain(&resolved(&["preview", &rooted("x")], config), None);
+        let said = explain(&resolved(&["preview", &rooted("x")], config), None, false);
 
         assert!(said.contains("none found"), "{said}");
         assert!(said.contains("built-in"), "{said}");
@@ -396,12 +494,102 @@ mod tests {
         assert!(said.contains("First"), "{said}");
         assert!(said.contains("over every rule"), "{said}");
         assert!(
-            said.contains("[duplicates] keep"),
-            "and it does not claim the flag for a value the file may have set: {said}"
+            said.contains("(--keep)"),
+            "named as the flag, because that is where it came from: {said}"
         );
 
         let by_rule = explaining(&["preview", "--dup", &rooted("x")], "");
         assert!(by_rule.contains("each rule's own"), "{by_rule}");
+    }
+
+    /// The mistake this exists for: the flag and the file arrive as the same
+    /// value, and naming the wrong one sends a user to edit something they
+    /// never wrote.
+    #[test]
+    fn every_threshold_names_where_it_came_from() {
+        let file = "duplicates:\n  min-size: \"2M\"\n  keep: newest-created\n";
+
+        let from_file = explaining(&["preview", "--dup", &rooted("x")], file);
+        assert!(
+            from_file.contains("2.0M ([duplicates] min-size"),
+            "{from_file}"
+        );
+        assert!(from_file.contains("([duplicates] keep"), "{from_file}");
+
+        let from_flag = explaining(
+            &[
+                "preview",
+                "--dup",
+                "--min-size",
+                "5M",
+                "--keep",
+                "first",
+                &rooted("x"),
+            ],
+            file,
+        );
+        assert!(from_flag.contains("5.0M (--min-size)"), "{from_flag}");
+        assert!(from_flag.contains("(--keep)"), "{from_flag}");
+
+        let neither = explaining(&["preview", "--dup", &rooted("x")], "");
+        assert!(
+            neither.contains("1.0M (the built-in default)"),
+            "and the third case is a case: {neither}"
+        );
+    }
+
+    /// A flag that was passed and never accounted for reads as a flag that was
+    /// ignored.
+    #[test]
+    fn the_display_flags_are_accounted_for_and_kept_in_their_place() {
+        let said = explaining(
+            &[
+                "preview",
+                "-d",
+                "1",
+                "--sort",
+                "size",
+                "--json",
+                &rooted("x"),
+            ],
+            "",
+        );
+
+        assert!(said.contains("Shown, not decided"), "{said}");
+        assert!(said.contains("depth          1"), "{said}");
+        assert!(said.contains("largest first (--sort)"), "{said}");
+        assert!(said.contains("JSON"), "{said}");
+        assert!(
+            said.contains("would still be removed"),
+            "and the sentence that keeps them display-only: {said}"
+        );
+    }
+
+    /// `--min-size` means one thing to `scan` and another to `preview`, and the
+    /// heading is where that is said.
+    #[test]
+    fn a_scan_calls_its_narrowings_display_only() {
+        let said = explaining(&["scan", "--min-size", "1M", "-n", "5", &rooted("x")], "");
+
+        assert!(said.contains("Shown, not measured"), "{said}");
+        assert!(said.contains("at most 5"), "{said}");
+        assert!(
+            said.contains("whole subtree"),
+            "and why a hidden child changes no total: {said}"
+        );
+    }
+
+    /// `--verbose` is global, so it is explained wherever it was passed.
+    #[test]
+    fn verbose_is_accounted_for_too() {
+        let config = crate::config::parse_for_test("");
+        let said = explain(
+            &resolved(&["preview", &rooted("x")], config),
+            Some(Path::new("/cfg/config.yml")),
+            true,
+        );
+
+        assert!(said.contains("every one listed (--verbose)"), "{said}");
     }
 
     #[test]
