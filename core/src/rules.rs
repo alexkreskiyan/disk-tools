@@ -424,6 +424,26 @@ impl Rules {
         &self.rules[self.owner[part].0]
     }
 
+    /// Which rule a compiled part belongs to, by position.
+    ///
+    /// For callers keeping something of their own beside each rule — a duplicate
+    /// rule's keeper policy, so far.
+    pub(crate) fn rule_index_at(&self, part: usize) -> usize {
+        self.owner[part].0
+    }
+
+    /// The first part that claims this path, or `None`.
+    ///
+    /// The same three tests in the same order as [`crate::detect`] and
+    /// [`Self::state`] — matched, not excluded, predicates hold — so nothing
+    /// built on this can reach a different conclusion about one path.
+    pub(crate) fn claiming(&self, path: &Path, facts: &Facts<'_>) -> Option<usize> {
+        let candidate = Candidate::new(path);
+        self.matching(&candidate, facts.is_dir)
+            .into_iter()
+            .find(|&part| !self.excluded(part, &candidate) && self.predicates_hold(part, facts))
+    }
+
     /// The compiled part itself — where every predicate that decided the match
     /// lives, including the two `plan` reads afterwards.
     pub(crate) fn part_at(&self, part: usize) -> &Part {
@@ -447,6 +467,32 @@ impl Rules {
             // territory is somewhere below the directory and still to be reached.
             Some(root) => is_within(dir, root) || is_within(root, dir),
         })
+    }
+
+    /// Is this directory named to be left alone by everything that could reach
+    /// into it?
+    ///
+    /// True when at least one part governs it, **every** part that governs it
+    /// excludes it, and no part is rooted below it — so nothing under it can be
+    /// claimed by anyone. One comparison at the top of a `.git` saves walking
+    /// the hundreds of thousands of nodes inside it.
+    pub(crate) fn excludes_subtree(&self, dir: &Path) -> bool {
+        let candidate = Candidate::new(dir);
+        let mut governed = false;
+
+        for (part, root) in self.roots.iter().enumerate() {
+            match root {
+                // Rooted below: its territory is still to be reached.
+                Some(root) if is_within(root, dir) && root != dir => return false,
+                Some(root) if !is_within(dir, root) => continue,
+                _ => {}
+            }
+            governed = true;
+            if !self.excluded(part, &candidate) {
+                return false;
+            }
+        }
+        governed
     }
 
     /// Indices of the rules whose includes match, lowest first, deduplicated.

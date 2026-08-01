@@ -13,8 +13,8 @@ mod ui;
 use args::{Args, Cleanup, Environment, Intent, Mode, Report, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOutcome, CleanPlan, DuplicateOptions, Duplicates, Keep, ScanOptions, ScanTree,
-    SkippedEntry, apply, duplicates, plan, plan_duplicates, scan,
+    CleanOutcome, CleanPlan, DuplicateOptions, Duplicates, ScanOptions, ScanTree, SkippedEntry,
+    apply, duplicates, plan, plan_duplicates, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{render_clean, render_outcome};
@@ -177,8 +177,7 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
     // Settled once, from the mode rather than from the plan: an empty duplicate
     // run still has to print the duplicate report, which is the one that says
     // why it might be empty.
-    let keeping = cleanup.duplicates.as_ref().map(|duplicating| Keeping {
-        keep: duplicating.keep,
+    let keeping = cleanup.duplicates.as_ref().map(|_| Keeping {
         now: cleanup.options.detect.now,
     });
 
@@ -283,9 +282,11 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
 /// with no candidates in it cannot distinguish from any other empty plan.
 #[derive(Clone, Copy)]
 struct Keeping {
-    keep: Keep,
     /// The clock the keeper's date is shown against, taken once at the top of
     /// the run like every other "now" here.
+    ///
+    /// The keeper *rule* is not here: each pool has its own, so it travels on
+    /// the candidate instead.
     now: SystemTime,
 }
 
@@ -329,9 +330,7 @@ fn human(
     keeping: Option<Keeping>,
 ) -> String {
     match keeping {
-        Some(Keeping { keep, now }) => {
-            render_dup(planned, hidden_by_safe, intent, report, keep, now)
-        }
+        Some(Keeping { now }) => render_dup(planned, hidden_by_safe, intent, report, now),
         None => render_clean(planned, hidden_by_safe, intent, report, inside),
     }
 }
@@ -531,6 +530,7 @@ fn search_with_spinner(
             // The rules prune and claim nothing: this is the same detection the
             // other source would have run, put to the opposite use.
             detect: options.detect.clone(),
+            rules: duplicating.rules.clone(),
             min_size: duplicating.min_size,
             keep: duplicating.keep,
             keep_in: duplicating.keep_in.clone(),

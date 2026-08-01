@@ -30,6 +30,8 @@ mod clean;
 mod dedup;
 mod detect;
 #[cfg(feature = "duplicates")]
+mod dup_rules;
+#[cfg(feature = "duplicates")]
 mod duplicates;
 mod git;
 mod measure;
@@ -48,6 +50,8 @@ pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, Kep
 #[cfg(feature = "duplicates")]
 pub use clean::{DUPLICATE_RULE, plan_duplicates};
 pub use detect::{DetectOptions, Detection, detect};
+#[cfg(feature = "duplicates")]
+pub use dup_rules::{DuplicateRule, DuplicateRules, Pool, builtin_duplicate_rules};
 #[cfg(feature = "duplicates")]
 pub use duplicates::{
     Copy, DuplicateGroup, DuplicateOptions, Duplicates, Hashed, Keep, duplicates,

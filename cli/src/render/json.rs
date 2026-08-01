@@ -160,6 +160,7 @@ mod tests {
         disk_tools_core::Kept {
             path: PathBuf::from(path),
             date: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            keep: disk_tools_core::Keep::OldestCreated,
             fell_back: false,
         }
     }

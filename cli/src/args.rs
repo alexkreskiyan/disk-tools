@@ -8,7 +8,8 @@
 use crate::config::Config;
 use clap::{Parser, Subcommand};
 use disk_tools_core::{
-    CleanOptions, DetectOptions, Keep, RuleError, Rules, ScanOptions, UserDirs, age_rule, user_path,
+    CleanOptions, DetectOptions, DuplicateRules, Keep, RuleError, Rules, ScanOptions, UserDirs,
+    age_rule, user_path,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -302,15 +303,25 @@ impl From<KeepArg> for Keep {
 /// contents and not from the rules. A boolean beside the settings could be true
 /// with nothing to search by, and would have to be checked everywhere the
 /// settings are read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `PartialEq`: the compiled rules hold glob automata, which have no useful
+// equality. The tests below compare the fields they are about.
+#[derive(Debug, Clone)]
 pub struct Duplicating {
+    /// Where duplicates may be looked for, and what to do with the copies.
+    pub rules: DuplicateRules,
+
     /// Below this, a file is not even hashed. Defaults to 1 MiB — reading
     /// megabytes of dotfiles to reclaim kilobytes is the wrong trade for a disk
     /// tool, and this is the one flag that decides how much is read at all.
+    /// Applied beside each part's own floor, the larger of the two deciding.
     pub min_size: u64,
-    pub keep: Keep,
-    /// Absolute, like every path this tool acts on.
-    pub keep_in: Vec<PathBuf>,
+
+    /// `--keep`, when it was passed. `None` leaves every rule its own.
+    pub keep: Option<Keep>,
+
+    /// `--keep-in`, when it was passed: it replaces a rule's list rather than
+    /// extending it. Absolute, like every path this tool acts on.
+    pub keep_in: Option<Vec<PathBuf>>,
 }
 
 /// What the report is ordered by.
@@ -586,13 +597,13 @@ impl Args {
             .or(clean.dup.then_some(config.duplicates.min_size).flatten())
             .unwrap_or(if clean.dup { MIN_DUPLICATE_SIZE } else { 0 });
 
-        let duplicates = clean.dup.then(|| Duplicating {
+        let duplicate_rules =
+            DuplicateRules::new(config.duplicate_rules, &user_dirs).map_err(ResolveError::Rule)?;
+
+        let duplicates = clean.dup.then_some(()).map(|()| Duplicating {
+            rules: duplicate_rules,
             min_size,
-            keep: clean
-                .keep
-                .map(Keep::from)
-                .or(config.duplicates.keep)
-                .unwrap_or_default(),
+            keep: clean.keep.map(Keep::from).or(config.duplicates.keep),
             // The flag **replaces** the file's list rather than extending it:
             // these are ordered preferences, and a command line that could only
             // ever add to them could not say "not the usual place, this one".
@@ -600,19 +611,22 @@ impl Args {
             // A root the file writes with a token this build cannot resolve
             // drops out, exactly as an unresolvable rule root does: unknown
             // reads as nowhere, never as anywhere.
-            keep_in: if clean.keep_in.is_empty() {
-                config
-                    .duplicates
-                    .keep_in
-                    .iter()
-                    .filter_map(|text| user_path(text, &user_dirs))
-                    .collect()
-            } else {
-                clean.keep_in
-            }
-            .into_iter()
-            .map(absolute)
-            .collect(),
+            keep_in: match (
+                clean.keep_in.is_empty(),
+                config.duplicates.keep_in.is_empty(),
+            ) {
+                (true, true) => None,
+                (true, false) => Some(
+                    config
+                        .duplicates
+                        .keep_in
+                        .iter()
+                        .filter_map(|text| user_path(text, &user_dirs))
+                        .map(absolute)
+                        .collect(),
+                ),
+                _ => Some(clean.keep_in.into_iter().map(absolute).collect()),
+            },
         });
 
         Ok(Mode::Clean(Box::new(Cleanup {
@@ -990,19 +1004,20 @@ mod tests {
             duplicating("", &["preview", &path, "--dup"])
                 .expect("dup")
                 .keep,
-            Keep::OldestCreated
+            None,
+            "unstated leaves every rule its own"
         );
         assert_eq!(
             duplicating(file, &["preview", &path, "--dup"])
                 .expect("dup")
                 .keep,
-            Keep::NewestModified
+            Some(Keep::NewestModified)
         );
         assert_eq!(
             duplicating(file, &["preview", &path, "--dup", "--keep", "first"])
                 .expect("dup")
                 .keep,
-            Keep::First
+            Some(Keep::First)
         );
     }
 
@@ -1022,7 +1037,7 @@ mod tests {
                 duplicating("", &["preview", &path, "--dup", "--keep", word])
                     .expect("dup")
                     .keep,
-                expected,
+                Some(expected),
                 "--keep {word}"
             );
         }
@@ -1040,7 +1055,7 @@ mod tests {
         let file = format!("duplicates:\n  keep-in: ['{configured}']\n");
 
         let from_file = duplicating(&file, &["preview", &path, "--dup"]).expect("dup");
-        assert_eq!(from_file.keep_in, vec![PathBuf::from(&configured)]);
+        assert_eq!(from_file.keep_in, Some(vec![PathBuf::from(&configured)]));
 
         let flagged = duplicating(
             &file,
@@ -1049,16 +1064,16 @@ mod tests {
         .expect("dup");
         assert_eq!(
             flagged.keep_in,
-            vec![PathBuf::from(rooted("named"))],
+            Some(vec![PathBuf::from(rooted("named"))]),
             "ordered preferences: the command line replaces them, it does not append"
         );
 
         let relative =
             duplicating("", &["preview", &path, "--dup", "--keep-in", "here"]).expect("dup");
         assert!(
-            relative.keep_in[0].is_absolute(),
+            relative.keep_in.as_ref().expect("a list")[0].is_absolute(),
             "every path this tool acts on is absolute: {:?}",
-            relative.keep_in[0]
+            relative.keep_in
         );
     }
 
@@ -1085,7 +1100,7 @@ mod tests {
         };
         assert_eq!(
             cleanup.duplicates.expect("dup").keep_in,
-            vec![home.join("Photos")]
+            Some(vec![home.join("Photos")])
         );
     }
 
@@ -1099,7 +1114,11 @@ mod tests {
             &["preview", &path, "--dup"],
         )
         .expect("dup");
-        assert!(found.keep_in.is_empty());
+        assert_eq!(
+            found.keep_in,
+            Some(Vec::new()),
+            "the file named one and it did not resolve, which is not the same as naming none"
+        );
     }
 
     /// The only default in this file that depends on another flag, and it is

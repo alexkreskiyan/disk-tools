@@ -61,6 +61,12 @@ pub struct Kept {
     #[cfg_attr(feature = "serde", serde(with = "crate::tree::unix_seconds"))]
     pub date: Option<SystemTime>,
 
+    /// Which rule decided. Per candidate rather than per run: each pool has its
+    /// own, and a report labelling one group with another's basis would be
+    /// wrong in exactly the way the label exists to prevent.
+    #[cfg(feature = "duplicates")]
+    pub keep: crate::duplicates::Keep,
+
     /// The rule asked for could not be applied to this group, and a weaker one
     /// chose. The report says so; silently answering a different question is
     /// the thing this field exists to prevent.
@@ -473,8 +479,10 @@ pub fn plan_duplicates(
 
             candidates.push(Candidate {
                 path: copy.path.clone(),
-                rule: DUPLICATE_RULE.to_string(),
-                tier: Tier::Confirm,
+                // The pool's own name. Two lists never meet in one plan, so a
+                // name shared with a clean rule cannot be ambiguous.
+                rule: group.rule.clone(),
+                tier: group.tier,
                 // `--purge` decides the destination and nothing else; the tier
                 // above stays what it is, so the confirmation it demands cannot
                 // be cancelled by a flag about where files go.
@@ -482,6 +490,7 @@ pub fn plan_duplicates(
                 duplicate_of: Some(Kept {
                     path: group.keeper.clone(),
                     date: group.keeper_date,
+                    keep: group.keep,
                     fell_back: group.keeper_fell_back,
                 }),
                 allocated: copy.allocated,
@@ -2073,6 +2082,9 @@ mod tests {
         fn group(keeper: &str, copies: Vec<crate::duplicates::Copy>) -> DuplicateGroup {
             DuplicateGroup {
                 apparent: 4096,
+                rule: "everywhere".into(),
+                tier: Tier::Confirm,
+                keep: crate::duplicates::Keep::default(),
                 keeper: PathBuf::from(keeper),
                 keeper_date: None,
                 keeper_fell_back: false,
@@ -2120,7 +2132,10 @@ mod tests {
                 );
                 let kept = candidate.duplicate_of.as_ref().expect("a keeper");
                 assert_eq!(kept.path, PathBuf::from("/p/a.bin"));
-                assert_eq!(candidate.rule, DUPLICATE_RULE);
+                assert_eq!(
+                    candidate.rule, "everywhere",
+                    "the pool's own name, which the report groups by"
+                );
                 assert!(!candidate.purge, "the trash, unless asked otherwise");
             }
         }
@@ -2274,6 +2289,9 @@ mod tests {
             });
             let found = found(vec![DuplicateGroup {
                 apparent: 1,
+                rule: "everywhere".into(),
+                tier: Tier::Confirm,
+                keep: crate::duplicates::Keep::default(),
                 keeper: keeper.clone(),
                 keeper_date: None,
                 keeper_fell_back: false,

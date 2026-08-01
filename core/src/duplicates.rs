@@ -25,6 +25,8 @@
 //! nothing, and returns its failures as data.
 
 use crate::detect::{DetectOptions, detect};
+use crate::dup_rules::DuplicateRules;
+use crate::rules::{Facts, Tier};
 use crate::tree::{ScanNode, ScanTree, SkipReason, SkippedEntry};
 use crate::walk::skip_reason;
 use rayon::prelude::*;
@@ -125,19 +127,28 @@ pub struct DuplicateOptions {
     /// how a tree that should have gone wholesale gets broken instead.
     pub detect: DetectOptions,
 
+    /// Where duplicates may be looked for, and what to do with the copies.
+    ///
+    /// Everything a rule's parts match is **one pool**, and groups form only
+    /// within a pool — so a rule's keeper policy and tier are never ambiguous.
+    /// Membership is exclusive: the first rule that matches a file takes it.
+    pub rules: DuplicateRules,
+
     /// Apparent bytes. A file smaller than this is not considered, whatever its
-    /// content; a zero-length one never is, at any setting.
+    /// content; a zero-length one never is, at any setting. Applied **beside**
+    /// each part's own floor, the larger of the two deciding.
     pub min_size: u64,
 
-    pub keep: Keep,
+    /// `--keep`, when it was passed: it beats what every rule says.
+    pub keep: Option<Keep>,
 
-    /// Preferred roots, in order.
+    /// `--keep-in`, when it was passed: it replaces every rule's own list.
     ///
     /// A group with a member under one of these keeps that member, whatever
-    /// [`Self::keep`] says — "keep whatever is in ~/Photos, remove the copies
+    /// `keep` says — "keep whatever is in ~/Photos, remove the copies
     /// elsewhere" is the thing users actually want. `keep` then only breaks
     /// ties inside the winning root.
-    pub keep_in: Vec<PathBuf>,
+    pub keep_in: Option<Vec<PathBuf>>,
 }
 
 /// One redundant copy: what would go, and what that frees.
@@ -154,6 +165,18 @@ pub struct Copy {
 pub struct DuplicateGroup {
     /// One copy's logical length — the identity this group was bucketed on.
     pub apparent: u64,
+
+    /// The duplicate rule whose pool this group formed in — the name the report
+    /// carries, and the answer to "why were these compared with each other".
+    pub rule: String,
+
+    /// What `clean` does with the copies, from that same rule.
+    pub tier: Tier,
+
+    /// The keeper rule that actually decided, after the flags were applied over
+    /// the pool's own. Carried per group because two pools may answer
+    /// differently, and the report says what the choice was made on.
+    pub keep: Keep,
 
     pub keeper: PathBuf,
 
@@ -223,6 +246,10 @@ pub struct Hashed<'a> {
 #[derive(Debug, Clone)]
 struct Member {
     path: PathBuf,
+    /// Which pool it belongs to. Groups form within one, so this is half the
+    /// bucket key — two identical files in different pools are not duplicates
+    /// of each other, and saying so is the whole point of the rules.
+    pool: usize,
     allocated: u64,
     apparent: u64,
     created: Option<SystemTime>,
@@ -283,16 +310,21 @@ pub fn duplicates(
         .collect();
 
     let mut eligible = Vec::new();
-    collect(&tree.root, &claimed, options.min_size, &mut eligible);
+    collect(&tree.root, &[], &claimed, options, &mut eligible);
 
-    // Bucketing by size costs nothing — the scan measured every one of these —
-    // and it is what makes the whole pass affordable: a unique size is proof of
-    // a unique file, and most files have one.
-    let mut buckets: HashMap<u64, Vec<Member>> = HashMap::new();
+    // Bucketing costs nothing — the scan measured every one of these — and it is
+    // what makes the whole pass affordable: a unique size is proof of a unique
+    // file, and most files have one. The **pool** is part of the key: two
+    // identical files the rules put in different pools are not duplicates of
+    // each other, which is the answer the rules exist to give.
+    let mut buckets: HashMap<(usize, u64), Vec<Member>> = HashMap::new();
     for member in eligible {
-        buckets.entry(member.apparent).or_default().push(member);
+        buckets
+            .entry((member.pool, member.apparent))
+            .or_default()
+            .push(member);
     }
-    let contested: Vec<(u64, Vec<Member>)> = buckets
+    let contested: Vec<((usize, u64), Vec<Member>)> = buckets
         .into_iter()
         .filter(|(_, members)| members.len() > 1)
         .collect();
@@ -306,7 +338,7 @@ pub fn duplicates(
 
     let mut groups: Vec<DuplicateGroup> = contested
         .into_par_iter()
-        .flat_map_iter(|(size, members)| resolve(size, members, options, &progress))
+        .flat_map_iter(|((pool, size), members)| resolve(pool, size, members, options, &progress))
         .collect();
 
     // The buckets came out of a `HashMap` and the work ran in parallel, so
@@ -327,26 +359,61 @@ pub fn duplicates(
     }
 }
 
-/// Every file that could still be a duplicate, from the scanned tree.
+/// Every file that could still be a duplicate, and the pool it is in.
 ///
-/// A hardlink's non-keeper names were zeroed by attribution and fail the
-/// `apparent > 0` test, which is the hardlink collapse. Directories are not
-/// files; a claimed subtree is not entered.
-fn collect(node: &ScanNode, claimed: &HashSet<PathBuf>, min_size: u64, out: &mut Vec<Member>) {
+/// Four ways not to be here, and each says something different:
+///
+/// - a **clean** rule claims the subtree — it goes whole, and removing one file
+///   out of it is how the rest gets broken;
+/// - no **duplicate** rule's parts match the file, so nothing asked for it;
+/// - it is below the floor, the part's or the flag's, whichever is larger;
+/// - its bytes were zeroed by hardlink attribution, which is the collapse:
+///   removing one name of an inode frees nothing.
+fn collect(
+    node: &ScanNode,
+    siblings: &[ScanNode],
+    claimed: &HashSet<PathBuf>,
+    options: &DuplicateOptions,
+    out: &mut Vec<Member>,
+) {
     if claimed.contains(&node.path) {
         return;
     }
     if node.is_dir {
+        if options.rules.prunes(&node.path) {
+            return;
+        }
         for child in &node.children {
-            collect(child, claimed, min_size, out);
+            collect(child, &node.children, claimed, options, out);
         }
         return;
     }
-    if node.apparent == 0 || node.apparent < min_size {
+    if node.apparent == 0 {
         return;
     }
+
+    let facts = Facts {
+        is_dir: false,
+        modified: node.modified,
+        now: options.detect.now,
+        any_sibling: &|wanted| {
+            siblings
+                .iter()
+                .any(|sibling| sibling.path.file_name().is_some_and(wanted))
+        },
+    };
+    let Some(pool) = options.rules.pool(&node.path, &facts) else {
+        return;
+    };
+    // Both floors apply and the larger wins, as with the clean rules: a flag
+    // narrows what a file said, it does not widen it.
+    if node.apparent < pool.min_size.max(options.min_size) {
+        return;
+    }
+
     out.push(Member {
         path: node.path.clone(),
+        pool: pool.index,
         allocated: node.allocated,
         apparent: node.apparent,
         // Both filled by `still_there`, from the stat it makes anyway.
@@ -357,6 +424,7 @@ fn collect(node: &ScanNode, claimed: &HashSet<PathBuf>, min_size: u64, out: &mut
 
 /// Take one same-size bucket down to the groups that are genuinely identical.
 fn resolve(
+    pool: usize,
     size: u64,
     members: Vec<Member>,
     options: &DuplicateOptions,
@@ -397,7 +465,7 @@ fn resolve(
                 progress,
             )
         })
-        .filter_map(|identical| group(size, identical, options))
+        .filter_map(|identical| group(pool, size, identical, options))
         .collect()
 }
 
@@ -472,6 +540,7 @@ where
 
 /// Turn a set of confirmed-identical files into a group with one keeper.
 fn group(
+    pool: usize,
     apparent: u64,
     mut members: Vec<Member>,
     options: &DuplicateOptions,
@@ -481,7 +550,11 @@ fn group(
     }
     members.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
 
-    let chosen = choose_keeper(&members, options);
+    // The pool's policy, and the flags over it. Resolved here rather than at the
+    // call site so that "the rule says, the flag overrules" is one sentence in
+    // one place.
+    let (rule, tier, keep, keep_in) = policy(pool, options);
+    let chosen = choose_keeper(&members, keep, keep_in);
     let keeper_path = members[chosen.index].path.clone();
     let copies: Vec<Copy> = members
         .into_iter()
@@ -495,6 +568,9 @@ fn group(
 
     Some(DuplicateGroup {
         apparent,
+        rule,
+        tier,
+        keep,
         keeper: keeper_path,
         keeper_date: chosen.date,
         keeper_fell_back: chosen.fell_back,
@@ -518,15 +594,38 @@ struct Chosen {
     fell_back: bool,
 }
 
+/// What a pool says about its copies, with the flags applied over it.
+fn policy(pool: usize, options: &DuplicateOptions) -> (String, Tier, Keep, &[PathBuf]) {
+    // The pool is looked up by the index the member carried out of `collect`,
+    // which is the rule's own position — so this cannot name a different rule
+    // than the one that admitted the file.
+    let found = options.rules.at(pool);
+    let keep = options
+        .keep
+        .or_else(|| found.as_ref().and_then(|rule| rule.keep))
+        .unwrap_or_default();
+    let keep_in: &[PathBuf] = match &options.keep_in {
+        Some(flagged) => flagged,
+        None => found.as_ref().map_or(&[][..], |rule| rule.keep_in),
+    };
+    (
+        found
+            .as_ref()
+            .map_or_else(String::new, |rule| rule.name.to_owned()),
+        found.as_ref().map_or(Tier::Confirm, |rule| rule.tier),
+        keep,
+        keep_in,
+    )
+}
+
 /// Which member stays, and what decided it.
 ///
 /// `members` is already sorted by path bytes, so every "first" below is the
 /// byte-lexicographic one and every tie breaks that way.
-fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> Chosen {
+fn choose_keeper(members: &[Member], keep: Keep, keep_in: &[PathBuf]) -> Chosen {
     // A preferred root beats the policy outright; the policy then only chooses
     // among the members inside it.
-    let inside: Vec<usize> = options
-        .keep_in
+    let inside: Vec<usize> = keep_in
         .iter()
         .find_map(|root| {
             let matching: Vec<usize> = members
@@ -539,7 +638,7 @@ fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> Chosen {
         })
         .unwrap_or_else(|| (0..members.len()).collect());
 
-    let Some(date) = options.keep.date() else {
+    let Some(date) = keep.date() else {
         // `First` reads nothing, so it cannot degrade and has nothing to show.
         return Chosen {
             index: inside[0],
@@ -547,7 +646,7 @@ fn choose_keeper(members: &[Member], options: &DuplicateOptions) -> Chosen {
             fell_back: false,
         };
     };
-    let earliest = options.keep.wants_earliest();
+    let earliest = keep.wants_earliest();
 
     let by_date = |which: Date| {
         // An unknown date never wins: `None` is "we do not know", and reading it
@@ -658,6 +757,15 @@ mod tests {
         (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
     }
 
+    /// The options a search gets before any config narrows it: the built-in
+    /// duplicate rule, which searches everywhere but a repository's own store.
+    fn searching() -> DuplicateOptions {
+        DuplicateOptions {
+            rules: crate::dup_rules::DuplicateRules::builtin(&crate::rules::UserDirs::default()),
+            ..DuplicateOptions::default()
+        }
+    }
+
     fn found(root: &Path, options: &DuplicateOptions) -> Duplicates {
         let tree = scan(&ScanOptions {
             root: root.to_path_buf(),
@@ -667,7 +775,7 @@ mod tests {
     }
 
     fn plain(root: &Path) -> Duplicates {
-        found(root, &DuplicateOptions::default())
+        found(root, &searching())
     }
 
     /// Create a hard link, or report that this filesystem cannot — the same
@@ -821,7 +929,7 @@ mod tests {
             ..ScanOptions::default()
         });
         fs::remove_file(root.join("c.bin")).expect("remove");
-        let found = duplicates(&tree, &DuplicateOptions::default(), &|_| {});
+        let found = duplicates(&tree, &searching(), &|_| {});
 
         assert_eq!(found.groups.len(), 1);
         assert_eq!(found.groups[0].copies.len(), 1, "two of three remain");
@@ -848,7 +956,7 @@ mod tests {
             ..ScanOptions::default()
         });
         fs::remove_file(root.join("b.bin")).expect("remove");
-        let found = duplicates(&tree, &DuplicateOptions::default(), &|_| {});
+        let found = duplicates(&tree, &searching(), &|_| {});
 
         assert!(found.groups.is_empty(), "{:?}", found.groups);
         assert_eq!(found.skipped.len(), 1);
@@ -876,7 +984,7 @@ mod tests {
 
         let options = DuplicateOptions {
             min_size: 4096,
-            ..DuplicateOptions::default()
+            ..searching()
         };
         assert!(found(root, &options).groups.is_empty());
         assert_eq!(plain(root).groups.len(), 1, "and they are a group below it");
@@ -988,8 +1096,8 @@ mod tests {
         );
 
         let options = DuplicateOptions {
-            keep_in: vec![root.join("keep")],
-            ..DuplicateOptions::default()
+            keep_in: Some(vec![root.join("keep")]),
+            ..searching()
         };
         let found = found(root, &options);
         assert_eq!(found.groups[0].keeper, root.join("keep/z.bin"));
@@ -1008,7 +1116,7 @@ mod tests {
             root: root.to_path_buf(),
             ..ScanOptions::default()
         });
-        let found = duplicates(&tree, &DuplicateOptions::default(), &|hashed| {
+        let found = duplicates(&tree, &searching(), &|hashed| {
             seen.lock().expect("seen").push(hashed.running_total);
         });
 
@@ -1046,6 +1154,7 @@ mod tests {
     fn member(path: &str, created: Option<SystemTime>, modified: Option<SystemTime>) -> Member {
         Member {
             path: PathBuf::from(path),
+            pool: 0,
             allocated: 4096,
             apparent: 4096,
             created,
@@ -1065,25 +1174,13 @@ mod tests {
     }
 
     fn choose(members: &[Member], keep: Keep, keep_in: Vec<PathBuf>) -> (&Path, bool) {
-        let options = DuplicateOptions {
-            keep,
-            keep_in,
-            ..DuplicateOptions::default()
-        };
-        let chosen = choose_keeper(members, &options);
+        let chosen = choose_keeper(members, keep, &keep_in);
         (&members[chosen.index].path, chosen.fell_back)
     }
 
     /// The date the rule read, which is what the report shows beside the keeper.
     fn decided_on(members: &[Member], keep: Keep) -> Option<SystemTime> {
-        choose_keeper(
-            members,
-            &DuplicateOptions {
-                keep,
-                ..DuplicateOptions::default()
-            },
-        )
-        .date
+        choose_keeper(members, keep, &[]).date
     }
 
     fn keeper(members: &[Member], keep: Keep, keep_in: Vec<PathBuf>) -> &Path {
@@ -1324,7 +1421,7 @@ mod diagnostics {
             .map(|found| found.path)
             .collect();
         let mut eligible = Vec::new();
-        collect(&tree.root, &claimed, options.min_size, &mut eligible);
+        collect(&tree.root, &[], &claimed, &options, &mut eligible);
         let mut buckets: HashMap<u64, usize> = HashMap::new();
         for member in &eligible {
             *buckets.entry(member.apparent).or_default() += 1;

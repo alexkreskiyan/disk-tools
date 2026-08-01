@@ -30,15 +30,15 @@ struct Group<'a> {
 
 /// Render a plan whose candidates are redundant copies.
 ///
-/// `keep` is the rule that was in force, needed for one sentence: a group whose
-/// keeper had to be settled some other way has to say **which** other way, and
-/// that only reads as an answer beside the rule that was asked for.
+/// The keeper rule is not a parameter: each pool has its own, and it travels on
+/// the candidate. A group whose keeper had to be settled some other way has to
+/// say **which** other way, and that only reads as an answer beside the rule
+/// that was asked for — which is why the label is per group.
 pub fn render_dup(
     plan: &CleanPlan,
     hidden_by_safe: Option<usize>,
     intent: Intent,
     report: Report,
-    keep: Keep,
     now: SystemTime,
 ) -> String {
     let mut out = String::new();
@@ -68,12 +68,12 @@ pub fn render_dup(
     if report.depth == 0 {
         write_groups(&groups, &mut out);
     } else {
-        write_copies(&groups, keep, now, &mut out);
+        write_copies(&groups, now, &mut out);
     }
 
     let _ = writeln!(out);
     write_total(plan, &groups, &mut out);
-    write_degraded(&groups, keep, &mut out);
+    write_degraded(&groups, &mut out);
     write_notices(plan, hidden_by_safe, intent, &mut out);
 
     out
@@ -147,7 +147,7 @@ fn write_groups(groups: &[Group<'_>], out: &mut String) {
 }
 
 /// Every path, said plainly: one `keep`, the rest `remove`.
-fn write_copies(groups: &[Group<'_>], keep: Keep, now: SystemTime, out: &mut String) {
+fn write_copies(groups: &[Group<'_>], now: SystemTime, out: &mut String) {
     for (index, group) in groups.iter().enumerate() {
         if index > 0 {
             let _ = writeln!(out);
@@ -163,7 +163,7 @@ fn write_copies(groups: &[Group<'_>], keep: Keep, now: SystemTime, out: &mut Str
             out,
             "  keep    {path}{basis}",
             path = group.kept.path.display(),
-            basis = basis(group.kept, keep, now),
+            basis = basis(group.kept, now),
         );
         for copy in &group.copies {
             let _ = writeln!(
@@ -182,7 +182,8 @@ fn write_copies(groups: &[Group<'_>], keep: Keep, now: SystemTime, out: &mut Str
 /// live data the byte-first path kept `IMG (1).jpg` over `IMG.jpg`, and nothing
 /// in the report said what it had gone on. A rule you cannot check is one you
 /// can only trust.
-fn basis(kept: &Kept, keep: Keep, now: SystemTime) -> String {
+fn basis(kept: &Kept, now: SystemTime) -> String {
+    let keep = kept.keep;
     let Some(date) = kept.date else {
         return match keep {
             // Nothing was read, and nothing is claimed.
@@ -237,27 +238,31 @@ fn write_total(plan: &CleanPlan, groups: &[Group<'_>], out: &mut String) {
 /// Never silent. "Kept the oldest" and "kept whatever had a date" are different
 /// claims, and a report that made the second while printing the first would be
 /// wrong in precisely the way the fallback exists to avoid.
-fn write_degraded(groups: &[Group<'_>], keep: Keep, out: &mut String) {
-    let degraded = groups.iter().filter(|g| g.kept.fell_back).count();
-    if degraded == 0 {
+fn write_degraded(groups: &[Group<'_>], out: &mut String) {
+    let degraded: Vec<&Group<'_>> = groups.iter().filter(|g| g.kept.fell_back).collect();
+    if degraded.is_empty() {
         return;
     }
-    let missing = match keep {
+    // Every degraded group asked for the same date in practice — and where they
+    // did not, the first one's is the one named, since the sentence is about
+    // what was missing rather than about which rule asked.
+    let missing = match degraded[0].kept.keep {
         Keep::OldestCreated | Keep::NewestCreated => "creation time",
         Keep::OldestModified | Keep::NewestModified => "modification time",
         // `First` reads no date, so it cannot degrade and this cannot be hit.
         Keep::First => return,
     };
+    let count = degraded.len();
     let _ = writeln!(
         out,
-        "\n(*) {degraded} {} no {missing} at all; {} keeper was settled by the other date, \
+        "\n(*) {count} {} no {missing} at all; {} keeper was settled by the other date, \
          or failing that by the path.",
-        if degraded == 1 {
+        if count == 1 {
             "group has"
         } else {
             "groups have"
         },
-        if degraded == 1 { "its" } else { "their" },
+        if count == 1 { "its" } else { "their" },
     );
 }
 
@@ -288,9 +293,16 @@ mod tests {
     }
 
     fn kept(path: &str, date: Option<SystemTime>, fell_back: bool) -> Kept {
+        kept_by(path, date, Keep::OldestCreated, fell_back)
+    }
+
+    /// The same, naming the rule that decided — which is the group's, not the
+    /// run's.
+    fn kept_by(path: &str, date: Option<SystemTime>, keep: Keep, fell_back: bool) -> Kept {
         Kept {
             path: PathBuf::from(path),
             date,
+            keep,
             fell_back,
         }
     }
@@ -333,13 +345,20 @@ mod tests {
         }
     }
 
+    /// `keep` names the rule the fixture's keepers were decided by — it travels
+    /// on the candidate now, so it is applied to the plan rather than passed in.
     fn rendered(plan: &CleanPlan, depth: usize, keep: Keep) -> String {
+        let mut plan = plan.clone();
+        for candidate in &mut plan.candidates {
+            if let Some(kept) = &mut candidate.duplicate_of {
+                kept.keep = keep;
+            }
+        }
         render_dup(
-            plan,
+            &plan,
             None,
             Intent::Preview,
             report(depth, Sort::Size),
-            keep,
             now(),
         )
     }
@@ -443,7 +462,6 @@ mod tests {
             None,
             Intent::Preview,
             report(0, Sort::Name),
-            Keep::OldestCreated,
             now(),
         );
         assert!(
@@ -496,7 +514,6 @@ mod tests {
             None,
             Intent::Removing,
             report(0, Sort::Size),
-            Keep::OldestCreated,
             now(),
         );
         assert!(
