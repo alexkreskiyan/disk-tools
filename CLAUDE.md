@@ -115,14 +115,16 @@ disc-tools/
 │   │   ├── main.rs     # verb dispatch (scan | preview | clean | ui); spinner to stderr
 │   │   ├── explain.rs  # --explain: what would happen, and where each value came from
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
-│   │   ├── config/     # locate/parse/validate the TOML file; `config init`
-│   │   │   ├── ui/         # the TUI
+│   │   ├── config/     # locate/parse/validate the YAML file; `config init`
+│   │   ├── ui/         # the TUI
 │   │   │   ├── term.rs     # restores the terminal on every path
 │   │   │   ├── app.rs      # cwd, cursor, order, filter — every key as a function
 │   │   │   ├── listing.rs  # one directory, one metadata call per entry
 │   │   │   ├── sort.rs     # five orders; reports the one it could apply
 │   │   │   ├── layout.rs   # the table: which columns fit, and what is in them
-│   │   │   └── measure.rs  # the sizing worker, its queue and its session cache
+│   │   │   ├── measure.rs  # the sizing worker, its queue and its session cache
+│   │   │   └── removal.rs  # `D`: plan on a worker, ask, remove on a worker, say
+│   │   │                   #   only what is true while it runs
 │   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
 │   │   └── render/
 │   │       ├── mod.rs
@@ -415,7 +417,7 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 
 | Folder | Purpose | Latest snapshot |
 |--------|---------|-----------------|
-| `kb/architecture/` | System design, key patterns | `2026.08/2026.08.01` |
+| `kb/architecture/` | System design, key patterns | `2026.08/2026.08.02` |
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
 | `kb/benchmarks/` | Recorded performance/memory measurements | `2026.08/2026.08.01` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
@@ -430,6 +432,7 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 ## Documentation
 
 **Architecture** (snapshots from `kb/architecture/`)
+- [After v0.7: removing from the browser, and what a progress report may claim](kb/architecture/2026.08/2026.08.02-removal-from-the-browser.md) — why a keypress needs a modal to supply intent, why the trash and purge halves count differently, where the tidying belongs
 - [After v0.7: parts, pools, and what a configuration cannot say for itself](kb/architecture/2026.08/2026.08.01-parts-and-pools.md) — why the cross product could not say "or", why pools are exclusive, and what `--explain` is answering
 - [After v0.6: a second source of candidates](kb/architecture/2026.07/2026.07.30-duplicates.md) — why `--dup` is a flag and not a verb, what the staged funnel costs, what the keeper rule went through
 - [After v0.5: two verbs, three tiers, and a plan that says what it will do](kb/architecture/2026.07/2026.07.30-preview-and-clean.md) — what was ceremony and what was a guard, why `--purge` must not rewrite a tier, display versus plan
