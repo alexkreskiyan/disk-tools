@@ -18,14 +18,31 @@
 //! announces itself in red and names every share as destroyed, because the
 //! information is the part that matters and the ceremony was not.
 //!
-//! **It plans on a worker.** Planning walks a tree and runs a `git status` per
-//! repository; doing that on the UI thread would freeze the browser for as long
-//! as it took, on the one screen whose whole point is that it stays responsive.
+//! **It plans and removes on a worker.** Planning walks a tree and runs a
+//! `git status` per repository; removing hands a batch to the OS trash, which on
+//! macOS is a round-trip to Finder. Doing either on the UI thread would freeze
+//! the browser for as long as it took, on the one screen whose whole point is
+//! that it stays responsive.
+//!
+//! What the progress can honestly say differs between the two halves, and the
+//! modal says the true thing rather than the tidy one. `apply` reports each
+//! trashed candidate **before** submitting the batch, so those callbacks mean
+//! *listed*, not *gone*; the removal itself is one call at the end that takes as
+//! long as it takes. Purging is per item, so there the count is the real one.
 
 use disk_tools_core::{CleanOptions, CleanOutcome, CleanPlan, ScanOptions, apply, plan, scan};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::thread;
+
+/// What the worker has to say while it works.
+#[derive(Debug)]
+pub enum Step {
+    /// One candidate reached — *listed* for the trash, or *destroyed*.
+    Reached { path: PathBuf, purge: bool },
+    /// All of it, and what became of it.
+    Finished(Box<CleanOutcome>),
+}
 
 /// Where a removal has got to.
 #[derive(Debug)]
@@ -42,6 +59,19 @@ pub enum Removal {
         /// Anything here is destroyed rather than trashed. It changes what the
         /// modal says, not what it takes to agree.
         destroys: bool,
+    },
+    /// Carrying it out, on a worker.
+    Removing {
+        path: PathBuf,
+        /// How many the plan holds of each kind — the denominators.
+        trashing: usize,
+        purging: usize,
+        /// How many of each the worker has reported.
+        listed: usize,
+        destroyed: usize,
+        /// The last path it named, so the modal shows something moving.
+        latest: Option<PathBuf>,
+        answer: Receiver<Step>,
     },
     /// What it did, until dismissed.
     Done {
@@ -78,6 +108,68 @@ impl Removal {
     /// Returns `true` when the state changed, so the caller knows a redraw is
     /// worth the frame.
     pub fn settle(&mut self) -> bool {
+        match self {
+            Removal::Planning { .. } => self.settle_plan(),
+            Removal::Removing { .. } => self.settle_removal(),
+            _ => false,
+        }
+    }
+
+    /// Take everything the removing worker has said since the last frame.
+    ///
+    /// Returns whether the state changed — including a counter moving, since
+    /// that is the whole point of showing it.
+    fn settle_removal(&mut self) -> bool {
+        let Removal::Removing {
+            path,
+            listed,
+            destroyed,
+            latest,
+            answer,
+            ..
+        } = self
+        else {
+            return false;
+        };
+
+        let mut moved = false;
+        let mut finished = None;
+        loop {
+            match answer.try_recv() {
+                Ok(Step::Reached { path, purge }) => {
+                    if purge {
+                        *destroyed += 1;
+                    } else {
+                        *listed += 1;
+                    }
+                    *latest = Some(path);
+                    moved = true;
+                }
+                Ok(Step::Finished(outcome)) => {
+                    finished = Some(outcome);
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                // The worker died mid-removal. Say what is true: it is over, and
+                // nothing here knows what it managed.
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Box::new(CleanOutcome::default()));
+                    break;
+                }
+            }
+        }
+
+        if let Some(outcome) = finished {
+            *self = Removal::Done {
+                path: path.clone(),
+                outcome,
+            };
+            return true;
+        }
+        moved
+    }
+
+    fn settle_plan(&mut self) -> bool {
         let Removal::Planning { path, answer } = self else {
             return false;
         };
@@ -108,15 +200,44 @@ impl Removal {
         }
     }
 
-    /// Carry it out. Only ever reached through the modal.
+    /// Carry it out, on a worker. Only ever reached through the modal.
     pub fn carry_out(&mut self) {
         let Removal::Asking { path, plan, .. } = self else {
             return;
         };
-        let outcome = apply(plan, |_| {});
-        *self = Removal::Done {
-            path: path.clone(),
-            outcome: Box::new(outcome),
+        let (send, answer) = channel();
+        let path = path.clone();
+        let plan = std::mem::take(plan);
+        let (purging, trashing) =
+            plan.candidates
+                .iter()
+                .fold((0, 0), |(purging, trashing), candidate| {
+                    if candidate.purge {
+                        (purging + 1, trashing)
+                    } else {
+                        (purging, trashing + 1)
+                    }
+                });
+
+        thread::spawn(move || {
+            let reporting = send.clone();
+            let outcome = apply(&plan, |candidate| {
+                let _ = reporting.send(Step::Reached {
+                    path: candidate.path.clone(),
+                    purge: candidate.purge,
+                });
+            });
+            let _ = send.send(Step::Finished(Box::new(outcome)));
+        });
+
+        *self = Removal::Removing {
+            path,
+            trashing,
+            purging,
+            listed: 0,
+            destroyed: 0,
+            latest: None,
+            answer,
         };
     }
 
@@ -125,6 +246,7 @@ impl Removal {
         match self {
             Removal::Planning { path, .. }
             | Removal::Asking { path, .. }
+            | Removal::Removing { path, .. }
             | Removal::Done { path, .. }
             | Removal::Nothing { path } => path,
         }
@@ -240,5 +362,89 @@ mod tests {
         assert_eq!(shares[0].allocated, 12_288);
         assert!(shares[0].purge);
         assert_eq!(shares[1].rule, "small");
+    }
+
+    /// The one thing the progress must not overstate. `apply` names a trashed
+    /// candidate **before** submitting the batch, so those callbacks mean
+    /// *listed*, and the removal itself is one call afterwards — a bar driven by
+    /// them would reach the end and then sit there while the work happened.
+    #[test]
+    fn trashing_and_destroying_are_counted_apart() {
+        let (send, answer) = channel();
+        let mut removal = Removal::Removing {
+            path: PathBuf::from("/p"),
+            trashing: 2,
+            purging: 1,
+            listed: 0,
+            destroyed: 0,
+            latest: None,
+            answer,
+        };
+
+        send.send(Step::Reached {
+            path: PathBuf::from("/p/a"),
+            purge: false,
+        })
+        .expect("send");
+        send.send(Step::Reached {
+            path: PathBuf::from("/p/b"),
+            purge: true,
+        })
+        .expect("send");
+
+        assert!(removal.settle(), "a counter moving is worth a frame");
+        let Removal::Removing {
+            listed,
+            destroyed,
+            latest,
+            ..
+        } = &removal
+        else {
+            panic!("still removing");
+        };
+        assert_eq!(*listed, 1);
+        assert_eq!(*destroyed, 1);
+        assert_eq!(latest.as_deref(), Some(Path::new("/p/b")));
+    }
+
+    /// Nothing new to say is not a redraw.
+    #[test]
+    fn nothing_arriving_is_not_a_change() {
+        let (send, answer) = channel();
+        let mut removal = Removal::Removing {
+            path: PathBuf::from("/p"),
+            trashing: 1,
+            purging: 0,
+            listed: 0,
+            destroyed: 0,
+            latest: None,
+            answer,
+        };
+
+        assert!(!removal.settle());
+        drop(send);
+    }
+
+    /// A worker that dies mid-removal ends it, and claims nothing about what it
+    /// managed — which is the safe direction for a figure nobody can check.
+    #[test]
+    fn a_worker_that_dies_ends_it_claiming_nothing() {
+        let (send, answer) = channel::<Step>();
+        let mut removal = Removal::Removing {
+            path: PathBuf::from("/p"),
+            trashing: 1,
+            purging: 0,
+            listed: 0,
+            destroyed: 0,
+            latest: None,
+            answer,
+        };
+        drop(send);
+
+        assert!(removal.settle());
+        let Removal::Done { outcome, .. } = &removal else {
+            panic!("over, one way or another");
+        };
+        assert_eq!(outcome.count(), 0);
     }
 }

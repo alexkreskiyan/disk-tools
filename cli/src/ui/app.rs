@@ -216,11 +216,27 @@ impl App {
         self.removal = Some(Removal::begin(&path, self.options.clone()));
     }
 
-    /// Collect the worker's plan if it has arrived.
+    /// Collect whatever the worker has said — a plan, progress, or the outcome.
+    ///
+    /// The tidying belongs **here** rather than beside the keypress that started
+    /// it: removing happens on a worker now, so the moment the disk changed is
+    /// the moment its answer arrives, not the moment it was agreed to.
     pub fn settle_removal(&mut self) {
-        if let Some(removal) = &mut self.removal {
-            removal.settle();
+        let Some(removal) = &mut self.removal else {
+            return;
+        };
+        if !removal.settle() || !matches!(removal, Removal::Done { .. }) {
+            return;
         }
+
+        // Only the row that changed. A removal under `project/` cannot have
+        // altered `other/`, and forgetting the whole listing — which is what
+        // `remeasure` is for, on the `r` key — would re-walk every sibling to
+        // learn what it already knew. `request` skips what it already holds, so
+        // the re-read below costs one walk: the forgotten one.
+        let path = removal.path().to_path_buf();
+        self.sizer.forget(&path);
+        self.refresh();
     }
 
     /// Agree, and carry it out.
@@ -231,19 +247,10 @@ impl App {
         if !matches!(removal, Removal::Asking { .. }) {
             return;
         }
+        // Hands it to a worker and returns: the OS trash is a round-trip to
+        // Finder on macOS, and a browser that stopped drawing for it would be
+        // indistinguishable from one that had hung.
         removal.carry_out();
-
-        // **Only the row that changed.** A removal under `project/` cannot have
-        // altered `other/`, and forgetting the whole listing — which is what
-        // `remeasure` is for, on the `r` key — would re-walk every sibling to
-        // learn what it already knew.
-        //
-        // `request` skips what it already has, so re-requesting the listing
-        // costs one walk: the forgotten one.
-        let path = removal.path().to_path_buf();
-        self.sizer.forget(&path);
-
-        self.refresh();
     }
 
     /// Read this directory again without leaving it.
@@ -1780,6 +1787,23 @@ mod tests {
         .expect("compiles")
     }
 
+    /// Wait for the removing worker to finish and the browser to take it in.
+    fn await_removal(app: &mut App) {
+        for _ in 0..500 {
+            app.settle_removal();
+            match app.removal() {
+                Some(Removal::Removing { .. }) | None => {}
+                Some(Removal::Done { .. }) => return,
+                Some(_) => return,
+            }
+            if app.removal().is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the removal never finished");
+    }
+
     /// Wait for the worker's plan, which is a real walk on a real directory.
     fn await_plan(app: &mut App) {
         for _ in 0..200 {
@@ -1913,6 +1937,7 @@ mod tests {
             app.begin_removal();
             await_plan(&mut app);
             crate::ui::press(&mut app, key);
+            await_removal(&mut app);
 
             assert_eq!(
                 !root.join("project/node_modules/a.bin").exists(),
@@ -1969,6 +1994,7 @@ mod tests {
         app.begin_removal();
         await_plan(&mut app);
         crate::ui::press(&mut app, 'y');
+        await_removal(&mut app);
 
         // Still there, and still known — no walk was needed to say so.
         let after = app
@@ -2019,6 +2045,7 @@ mod tests {
         app.begin_removal();
         await_plan(&mut app);
         crate::ui::press(&mut app, 'y');
+        await_removal(&mut app);
 
         assert!(
             !root.join("project").exists(),

@@ -173,6 +173,9 @@ fn removing(app: &mut App, code: KeyCode) {
             KeyCode::Char('n' | 'N') | KeyCode::Esc => app.dismiss_removal(),
             _ => {}
         },
+        // Under way: no key at all. Offering one would promise a stop that
+        // cannot be delivered once the batch is with the OS.
+        Some(Removal::Removing { .. }) => {}
         // Planning, done, or nothing to do: one key out, and no key in.
         Some(_) => {
             if matches!(code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
@@ -323,6 +326,7 @@ fn draw_removal(frame: &mut Frame<'_>, pending: &removal::Removal) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Removal::Planning { .. } => ("Working out what would go…", Style::default()),
+        Removal::Removing { .. } => ("Removing…", Style::default().add_modifier(Modifier::BOLD)),
         Removal::Done { .. } => ("Done.", Style::default().add_modifier(Modifier::BOLD)),
         Removal::Nothing { .. } => ("Nothing here is claimed by any rule.", Style::default()),
     };
@@ -395,6 +399,40 @@ fn draw_removal(frame: &mut Frame<'_>, pending: &removal::Removal) {
         Removal::Planning { .. } => vec![Line::from(
             "  Walking the tree and asking git about any repository in it.",
         )],
+        // What each half can honestly report differs, and this says the true
+        // thing rather than the tidy one: `apply` names a trashed candidate
+        // **before** submitting the batch, so that count is what has been listed
+        // for the Trash, not what has left. Purging is per item, so there the
+        // figure is the real one.
+        Removal::Removing {
+            trashing,
+            purging,
+            listed,
+            destroyed,
+            latest,
+            ..
+        } => {
+            let mut lines = Vec::new();
+            if *trashing > 0 {
+                lines.push(Line::from(if listed < trashing {
+                    format!("  Listing for the Trash: {listed} of {trashing}")
+                } else {
+                    format!(
+                        "  Handing {trashing} to the Trash — one call, and it takes as long as it takes"
+                    )
+                }));
+            }
+            if *purging > 0 {
+                lines.push(Line::from(format!(
+                    "  Destroying: {destroyed} of {purging}"
+                )));
+            }
+            if let Some(path) = latest {
+                lines.push(Line::from(String::new()));
+                lines.push(Line::from(format!("  {}", path.display())));
+            }
+            lines
+        }
         Removal::Nothing { .. } => vec![
             Line::from(
                 "  Only what a rule claims can be removed from here — which is what keeps the",
@@ -409,6 +447,9 @@ fn draw_removal(frame: &mut Frame<'_>, pending: &removal::Removal) {
         // the top of the modal, which is where the difference belongs.
         Removal::Asking { .. } => hints(&[("Y", "confirm"), ("N / Esc", "cancel")]),
         Removal::Planning { .. } => hints(&[("Esc", "cancel")]),
+        // Nothing to offer: it is happening, and stopping half way through a
+        // batch the OS is already carrying out is not a thing this can promise.
+        Removal::Removing { .. } => Line::from(String::new()),
         _ => hints(&[("Esc", "close")]),
     };
     frame.render_widget(Paragraph::new(keys), bands[2]);

@@ -313,10 +313,27 @@ destroying announces itself in red and names every share as destroyed, because a
 subtree usually holds both and the heading is the only place that difference can
 be seen before it happens.
 
-**It plans on a worker.** Walking a tree and asking git about every repository
-in it takes seconds; doing that on the UI thread would freeze the one screen
-whose point is that it does not. `Esc` abandons a plan still being walked, and
-costs nothing, because nothing has happened.
+**It plans and removes on a worker.** Walking a tree and asking git about every
+repository in it takes seconds, and handing a batch to the OS trash is a
+round-trip to Finder on macOS; doing either on the UI thread would freeze the one
+screen whose point is that it does not. `Esc` abandons a plan still being walked,
+and costs nothing, because nothing has happened.
+
+While it runs, the modal says what is honestly known — which differs between the
+two halves. Destroying is per item, so the count is real. Trashing is **one call
+at the end**, so what is counted before it is what has been *listed*:
+
+```console
+Removing…
+/Users/you/Projects/thing
+  Handing 4 to the Trash — one call, and it takes as long as it takes
+  Destroying: 2 of 3
+
+  /Users/you/Projects/thing/target
+```
+
+There is no key offered while it runs: stopping half way through a batch the OS
+is already carrying out is not something this could promise.
 
 `Backspace` is deliberately *not* the key: it means "up one level" today, and a
 destructive action must not share a finger with a navigation habit.

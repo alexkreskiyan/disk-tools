@@ -216,9 +216,17 @@ Invariants worth keeping in mind:
 - **`..` is refused in every pattern field.** It is the only way a pattern can
   leave its root, and every way it could is a mistake that would otherwise be
   silent — the glob never matches and the part stops claiming anything.
+- **Removing runs on a worker, and the progress says only what is true.**
+  `apply` reports a trashed candidate **before** submitting the batch, so those
+  callbacks mean *listed*, not *gone* — the modal counts them as such and then
+  says it is waiting on one call. Purging is per item, so there the figure is
+  real. No key is offered while it runs: stopping half way through a batch the OS
+  already has is not a promise this can keep.
 - **A removal re-walks only what changed.** `Sizer::forget` is called on the one
   path that was removed from and the listing is re-requested — `request` skips
-  what it already holds, so exactly one walk runs. `remeasure`, which forgets the
+  what it already holds, so exactly one walk runs. It happens where the
+  **outcome arrives**, not where the key was pressed, because the two are no
+  longer the same moment. `remeasure`, which forgets the
   whole listing, stays what the `r` key does. And the re-read goes through
   `refresh`, not `arrive`: the latter clears the filter, which is right for a
   move and wrong for standing still.
