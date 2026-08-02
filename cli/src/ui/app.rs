@@ -588,7 +588,9 @@ impl App {
         // on every climbing figure would have rows swap places continuously;
         // never sorting would leave "by size" showing an order that is no longer
         // true. The cursor holds its entry across the move, as always.
-        if completed && self.order == Order::Size {
+        // Both orders are read off figures the walk produces, so both go stale
+        // as it runs and both correct themselves when it finishes.
+        if completed && matches!(self.order, Order::Size | Order::Cleanable) {
             self.resort();
         }
     }

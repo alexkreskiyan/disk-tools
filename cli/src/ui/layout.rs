@@ -131,16 +131,12 @@ pub fn header(cols: &Columns, order: Order, reverse: bool) -> String {
             if order == column { arrow } else { ' ' }
         )
     };
-    // A column with no key that sorts it reserves the slot too, so its label
-    // ends where the others do rather than one place to the right.
-    let unsorted = |label: &str| format!("{label} ");
-
     let mut parts = Vec::new();
     if cols.size {
         parts.push(format!("{:>SIZE$}", mark(Order::Size)));
     }
     if cols.clean {
-        parts.push(format!("{:>CLEAN$}", unsorted("clean")));
+        parts.push(format!("{:>CLEAN$}", mark(Order::Cleanable)));
     }
     parts.push(fit(&mark(Order::Name), cols.name));
     if cols.created {
@@ -622,6 +618,21 @@ mod tests {
             spinner(now()),
             spinner(now() + Duration::from_secs(1)),
             "and it comes round"
+        );
+    }
+
+    /// The `clean` column sorts now, so it takes the arrow like the others —
+    /// and the width was already reserved for it, which is why nothing shifts.
+    #[test]
+    fn the_clean_column_can_carry_the_arrow() {
+        let cols = columns(120);
+        let line = header(&cols, Order::Cleanable, true);
+
+        assert!(line.contains("clean↓"), "{line}");
+        assert_eq!(
+            line.len(),
+            header(&cols, Order::Name, false).len(),
+            "and every separator stays where it was"
         );
     }
 }

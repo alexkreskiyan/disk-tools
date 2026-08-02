@@ -164,7 +164,7 @@ directory you are in.
        ⠹ │          │ current/     │      30d │        2h │
     4.0K │          │ README.md    │      30d │        2h │
 rules: included  excluded  in scope  untracked
-q quit  ↵ enter  ← up  / filter  n/s/c/m sort  r sizes  R config
+q quit  ↵ enter  ← up  / filter  n/s/f/c/m sort  r sizes  R config  D remove
 ```
 
 The row under the labels is **the directory you are in**, in the same columns as
@@ -205,7 +205,7 @@ meant to stop.
 | `PgUp` `PgDn`, `Home` `End` | A screenful, or the whole way |
 | `↵`, `l`, `→` | Enter the directory. On a file, nothing |
 | `←`, `h`, `Backspace` | Up one level, landing on the directory you left |
-| `n` `s` `c` `m` | Sort by name, size, created, modified — one press from anywhere. The same key again reverses |
+| `n` `s` `f` `c` `m` | Sort by name, size, **what would be freed**, created, modified — one press from anywhere. The same key again reverses |
 | `/` | Filter this listing. Letters narrow it as you type, `↵` keeps it, `Esc` drops it |
 | `r` | Measure this directory's subdirectories again |
 | `R` | Read `config.yml` again |

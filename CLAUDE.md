@@ -120,7 +120,7 @@ disc-tools/
 │   │   │   ├── term.rs     # restores the terminal on every path
 │   │   │   ├── app.rs      # cwd, cursor, order, filter — every key as a function
 │   │   │   ├── listing.rs  # one directory, one metadata call per entry
-│   │   │   ├── sort.rs     # four orders; reports the one it could apply
+│   │   │   ├── sort.rs     # five orders; reports the one it could apply
 │   │   │   ├── layout.rs   # the table: which columns fit, and what is in them
 │   │   │   └── measure.rs  # the sizing worker, its queue and its session cache
 │   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
@@ -216,6 +216,12 @@ Invariants worth keeping in mind:
 - **`..` is refused in every pattern field.** It is the only way a pattern can
   leave its root, and every way it could is a mistake that would otherwise be
   silent — the glob never matches and the part stops claiming anything.
+- **Sorting by what would be freed degrades like sorting by creation time.**
+  Both read a figure that may not be there — one because the platform never
+  recorded it, one because the walk has not finished — so both fall back to name
+  and **say so**, and an unknown sorts last in either direction. The difference
+  is that this one corrects itself: `absorb_sizes` re-sorts when a walk
+  completes, for `Size` and `Cleanable` alike.
 - **The browser removes only what a rule claims, and always asks.** `D` plans
   the subtree under the cursor exactly as `clean <path>` would, on a **worker**
   so the screen keeps drawing. The **strictest tier in the plan** decides how it

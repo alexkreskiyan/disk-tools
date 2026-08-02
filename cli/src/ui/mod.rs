@@ -140,6 +140,9 @@ fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
 
         KeyCode::Char('n') => app.sort_by(Order::Name),
         KeyCode::Char('s') => app.sort_by(Order::Size),
+        // `f` for what it frees: `c` is already creation time, and this is the
+        // order that matters while clearing space by hand — biggest win first.
+        KeyCode::Char('f') => app.sort_by(Order::Cleanable),
         KeyCode::Char('c') => app.sort_by(Order::Created),
         KeyCode::Char('m') => app.sort_by(Order::Modified),
 
@@ -516,7 +519,7 @@ fn keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("↵", "enter"),
             ("←", "up"),
             ("/", "filter"),
-            ("n/s/c/m", "sort"),
+            ("n/s/f/c/m", "sort"),
             ("r", "sizes"),
             ("R", "config"),
             ("D", "remove"),
