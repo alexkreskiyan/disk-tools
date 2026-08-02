@@ -514,7 +514,8 @@ impl Rules {
     /// Which rule a compiled part belongs to, by position.
     ///
     /// For callers keeping something of their own beside each rule — a duplicate
-    /// rule's keeper policy, so far.
+    /// rule's keeper policy, so far, which is why this is behind that feature.
+    #[cfg(feature = "duplicates")]
     pub(crate) fn rule_index_at(&self, part: usize) -> usize {
         self.owner[part].0
     }
@@ -524,6 +525,9 @@ impl Rules {
     /// The same three tests in the same order as [`crate::detect`] and
     /// [`Self::state`] — matched, not excluded, predicates hold — so nothing
     /// built on this can reach a different conclusion about one path.
+    ///
+    /// Only pooling asks it, so it is behind that feature.
+    #[cfg(feature = "duplicates")]
     pub(crate) fn claiming(&self, path: &Path, facts: &Facts<'_>) -> Option<usize> {
         let candidate = Candidate::new(path);
         self.matching(&candidate, facts.is_dir)
@@ -563,6 +567,9 @@ impl Rules {
     /// excludes it, and no part is rooted below it — so nothing under it can be
     /// claimed by anyone. One comparison at the top of a `.git` saves walking
     /// the hundreds of thousands of nodes inside it.
+    ///
+    /// Only the duplicate walk prunes on it, so it is behind that feature.
+    #[cfg(feature = "duplicates")]
     pub(crate) fn excludes_subtree(&self, dir: &Path) -> bool {
         let candidate = Candidate::new(dir);
         let mut governed = false;
