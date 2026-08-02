@@ -233,12 +233,49 @@ impl App {
         }
         removal.carry_out();
 
-        // What was measured against the rules is no longer there, so the figure
-        // beside it would be a claim about a directory that has changed under
-        // the screen.
+        // **Only the row that changed.** A removal under `project/` cannot have
+        // altered `other/`, and forgetting the whole listing — which is what
+        // `remeasure` is for, on the `r` key — would re-walk every sibling to
+        // learn what it already knew.
+        //
+        // `request` skips what it already has, so re-requesting the listing
+        // costs one walk: the forgotten one.
         let path = removal.path().to_path_buf();
         self.sizer.forget(&path);
-        self.remeasure();
+
+        self.refresh();
+    }
+
+    /// Read this directory again without leaving it.
+    ///
+    /// Not [`Self::arrive`]: that is for a move, and it clears the filter,
+    /// because a filter is about the directory it was typed in. Here the
+    /// directory is the same one — the user is still looking at the rows they
+    /// narrowed to, and having them reappear because something was removed
+    /// would be the browser undoing their work for them.
+    ///
+    /// A removed directory is a row until something looks again, and a removed
+    /// file leaves a row carrying a size for a file that is not there.
+    fn refresh(&mut self) {
+        let Ok(listed) = self.read(&self.cwd.clone()) else {
+            // The directory itself has gone — from under us, or because it was
+            // what was removed. Leave the rows alone rather than blanking the
+            // screen; the next move settles it.
+            return;
+        };
+        self.listed = listed;
+        self.here = blank(&self.cwd);
+        self.here.state = self.state_of_cwd();
+
+        self.classify();
+        self.sizer.request(self.subdirectories());
+        apply_sizes(&self.cwd, &self.sizer, &mut self.listed);
+
+        self.applied = sort(&mut self.listed, self.order, self.reverse);
+        // Holds the cursor on whatever it was on, and drops it to the top when
+        // that row is the one that has just gone.
+        self.refilter();
+        self.total_here();
     }
 
     /// Abandon it. A plan still being walked is simply dropped: the worker
@@ -1904,6 +1941,99 @@ mod tests {
             assert!(app.removal().is_none(), "`{key}` should have cancelled");
             assert!(root.join("project/node_modules/a.bin").exists());
         }
+    }
+
+    /// A removal under one row cannot have changed another, and re-walking the
+    /// siblings to learn what was already known is the whole cost of getting
+    /// this wrong.
+    #[test]
+    fn removing_re_walks_only_what_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+        std::fs::create_dir(root.join("untouched")).expect("mkdir");
+        std::fs::write(root.join("untouched/b.bin"), vec![b'y'; 8192]).expect("write");
+
+        let mut app =
+            App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+        await_sizes(&mut app);
+        let before = app
+            .entries()
+            .iter()
+            .find(|entry| entry.name == "untouched")
+            .and_then(|entry| entry.size)
+            .expect("measured");
+
+        point_at(&mut app, "project");
+        app.begin_removal();
+        await_plan(&mut app);
+        crate::ui::press(&mut app, 'y');
+
+        // Still there, and still known — no walk was needed to say so.
+        let after = app
+            .entries()
+            .iter()
+            .find(|entry| entry.name == "untouched")
+            .expect("still listed");
+        assert_eq!(after.size, Some(before));
+        assert!(
+            !after.measuring,
+            "an untouched sibling must not be walked again"
+        );
+    }
+
+    /// The row that was removed goes; the filter that found it stays, because
+    /// the directory is the same one it was typed in.
+    #[test]
+    fn removing_re_reads_the_listing_and_keeps_the_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        // A rule that claims the row itself, so the row goes with it.
+        let rules = Rules::new(
+            vec![Rule {
+                name: "junk".into(),
+                tier: Tier::Trash,
+                parts: vec![Part {
+                    root: Some(root.to_string_lossy().into_owned()),
+                    includes: vec!["**/project/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
+            }],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+
+        let mut app = App::open(root, rules, now(), UserDirs::default()).expect("open");
+        app.start_filtering();
+        for ch in "pro".chars() {
+            app.filter_push(ch);
+        }
+        app.filter_accept();
+        point_at(&mut app, "project");
+
+        app.begin_removal();
+        await_plan(&mut app);
+        crate::ui::press(&mut app, 'y');
+
+        assert!(
+            !root.join("project").exists(),
+            "the fixture must actually have gone"
+        );
+        assert!(
+            !app.entries().iter().any(|entry| entry.name == "project"),
+            "and the row with it: {:?}",
+            app.entries().iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.filter(),
+            "pro",
+            "the filter is about this directory, and this is still it"
+        );
     }
 
     /// Abandoning leaves the disk and the screen exactly as they were.

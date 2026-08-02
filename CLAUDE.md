@@ -216,6 +216,12 @@ Invariants worth keeping in mind:
 - **`..` is refused in every pattern field.** It is the only way a pattern can
   leave its root, and every way it could is a mistake that would otherwise be
   silent — the glob never matches and the part stops claiming anything.
+- **A removal re-walks only what changed.** `Sizer::forget` is called on the one
+  path that was removed from and the listing is re-requested — `request` skips
+  what it already holds, so exactly one walk runs. `remeasure`, which forgets the
+  whole listing, stays what the `r` key does. And the re-read goes through
+  `refresh`, not `arrive`: the latter clears the filter, which is right for a
+  move and wrong for standing still.
 - **Sorting by what would be freed degrades like sorting by creation time.**
   Both read a figure that may not be there — one because the platform never
   recorded it, one because the walk has not finished — so both fall back to name
