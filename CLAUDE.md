@@ -219,8 +219,9 @@ Invariants worth keeping in mind:
 - **The browser removes only what a rule claims, and always asks.** `D` plans
   the subtree under the cursor exactly as `clean <path>` would, on a **worker**
   so the screen keeps drawing. The **strictest tier in the plan** decides how it
-  is agreed to: anything destroying takes the word `purge` typed out, everything
-  else takes a `y`. On the command line the verb is the moment of intent; a
+  is agreed to: anything destroying takes the word `purge` typed out and then
+  `↵`, everything else takes `Y`/`N`. While the word is being typed every letter
+  belongs to it, so only the **capital** `N` can also mean no. On the command line the verb is the moment of intent; a
   keypress has none, so the modal supplies one. `Backspace` is not the key — it
   navigates, and a destructive action must not share a finger with a habit.
 - **`--explain` exits without walking, reading or removing.** Explaining and then

@@ -303,13 +303,15 @@ This destroys files. There is no way back.
 
   Frees 2.4G
 
-  type `purge` to confirm: pu         esc cancel
+  type purge then ↵ to confirm: pu      N / Esc cancel
 ```
 
-A plan that only trashes takes a `y`. A plan with **anything** destroying in it
-takes the word — the strictest tier in the plan decides, because a subtree
-usually holds both and asking by the gentlest would let a purge-tier candidate
-through on one letter.
+A plan that only trashes is a yes-or-no question: `Y` confirms, `N` or `Esc`
+cancels. A plan with **anything** destroying in it
+takes the word typed out and then `↵` — the strictest tier in the plan decides,
+because a subtree usually holds both and asking by the gentlest would let a
+purge-tier candidate through on one letter. While the word is being typed every
+letter belongs to it, so only the **capital** `N` can also mean no.
 
 **It plans on a worker.** Walking a tree and asking git about every repository
 in it takes seconds; doing that on the UI thread would freeze the one screen

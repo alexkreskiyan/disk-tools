@@ -1886,6 +1886,86 @@ mod tests {
         );
     }
 
+    /// The gentle case is a yes-or-no question, and both answers are a letter.
+    #[test]
+    fn a_trashing_plan_takes_a_letter_either_way() {
+        for (key, gone) in [('y', true), ('Y', true)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+            std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096])
+                .expect("write");
+
+            let mut app =
+                App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+            point_at(&mut app, "project");
+            app.begin_removal();
+            await_plan(&mut app);
+            crate::ui::press(&mut app, key);
+
+            assert_eq!(
+                !root.join("project/node_modules/a.bin").exists(),
+                gone,
+                "`{key}` should have removed it"
+            );
+        }
+    }
+
+    #[test]
+    fn n_cancels_without_removing_anything() {
+        for key in ['n', 'N'] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+            std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096])
+                .expect("write");
+
+            let mut app =
+                App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+            point_at(&mut app, "project");
+            app.begin_removal();
+            await_plan(&mut app);
+            crate::ui::press(&mut app, key);
+
+            assert!(app.removal().is_none(), "`{key}` should have cancelled");
+            assert!(root.join("project/node_modules/a.bin").exists());
+        }
+    }
+
+    /// While the word is being typed every letter is a letter of it — so only
+    /// the capital can also mean no, and the lower-case one stays a keystroke
+    /// someone may be part-way through.
+    #[test]
+    fn only_the_capital_n_cancels_a_destroying_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        let mut rules = claiming_here(root).to_vec();
+        rules[0].tier = Tier::Purge;
+        let mut app = App::open(
+            root,
+            Rules::new(rules, &UserDirs::default()).expect("compiles"),
+            now(),
+            UserDirs::default(),
+        )
+        .expect("open");
+        point_at(&mut app, "project");
+        app.begin_removal();
+        await_plan(&mut app);
+
+        crate::ui::press(&mut app, 'n');
+        assert!(
+            app.removal().is_some(),
+            "a lower-case letter is a letter, not an answer"
+        );
+
+        crate::ui::press(&mut app, 'N');
+        assert!(app.removal().is_none());
+        assert!(root.join("project/node_modules/a.bin").exists());
+    }
+
     /// Abandoning leaves the disk and the screen exactly as they were.
     #[test]
     fn dismissing_changes_nothing() {

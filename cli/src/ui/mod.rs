@@ -148,6 +148,13 @@ fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
     true
 }
 
+/// One character key, for the tests that are about a binding rather than a
+/// state — the bindings live here, so pressing one has to happen here too.
+#[cfg(test)]
+pub(crate) fn press(app: &mut App, ch: char) {
+    removing(app, KeyCode::Char(ch));
+}
+
 /// Keys while a removal is on screen.
 ///
 /// `Esc` always abandons it, at every stage — including while the plan is still
@@ -161,9 +168,13 @@ fn removing(app: &mut App, code: KeyCode) {
             match code {
                 KeyCode::Esc => app.dismiss_removal(),
                 KeyCode::Enter => app.confirm_removal(),
-                // The gentle case takes the letter as agreement. The destroying
-                // one takes only the word, so `y` there is just a letter of it.
-                KeyCode::Char('y') if !destroys => app.confirm_removal(),
+                // The gentle case is a yes-or-no question, and both answers are
+                // a letter. The destroying one is not: every letter there is a
+                // letter of the word, so only the **capital** N can also mean
+                // no — a lower-case one might be something someone is typing.
+                KeyCode::Char('y' | 'Y') if !destroys => app.confirm_removal(),
+                KeyCode::Char('n') if !destroys => app.dismiss_removal(),
+                KeyCode::Char('N') => app.dismiss_removal(),
                 KeyCode::Backspace => app.removal_pop(),
                 KeyCode::Char(ch) => app.removal_push(ch),
                 _ => {}
@@ -291,10 +302,7 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
     let mut state = ListState::default().with_selected(Some(app.cursor()));
     frame.render_stateful_widget(list, bands[3], &mut state);
 
-    frame.render_widget(
-        Paragraph::new(keys(app)).style(Style::default().add_modifier(Modifier::DIM)),
-        bands[5],
-    );
+    frame.render_widget(Paragraph::new(hints(&keys(app))), bands[5]);
 }
 
 /// A removal, at whatever stage it has reached.
@@ -403,23 +411,36 @@ fn draw_removal(frame: &mut Frame<'_>, pending: &removal::Removal) {
     };
     frame.render_widget(Paragraph::new(body), bands[1]);
 
-    let keys = match pending {
+    let keys: Line<'static> = match pending {
         Removal::Asking {
             destroys: true,
             typed,
             ..
-        } => format!(
-            "  type `{}` to confirm: {typed:<8}   esc cancel",
-            removal::Removal::WORD
-        ),
-        Removal::Asking { .. } => "  y confirm    esc cancel".to_owned(),
-        Removal::Planning { .. } => "  esc cancel".to_owned(),
-        _ => "  esc close".to_owned(),
+        } => Line::from(vec![
+            Span::raw("  type "),
+            Span::styled(
+                removal::Removal::WORD,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" then "),
+            Span::styled(
+                "↵",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" to confirm: {typed:<8}")),
+            Span::styled(
+                "N / Esc",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" cancel"),
+        ]),
+        Removal::Asking { .. } => hints(&[("Y", "confirm"), ("N / Esc", "cancel")]),
+        Removal::Planning { .. } => hints(&[("Esc", "cancel")]),
+        _ => hints(&[("Esc", "close")]),
     };
-    frame.render_widget(
-        Paragraph::new(keys).style(Style::default().add_modifier(Modifier::DIM)),
-        bands[2],
-    );
+    frame.render_widget(Paragraph::new(keys), bands[2]);
 }
 
 /// The whole screen, given over to a config that cannot be read.
@@ -511,15 +532,48 @@ fn legend() -> Vec<Span<'static>> {
 
 /// What the keys do — different while a filter is being typed, because most of
 /// them are then just letters.
-fn keys(app: &App) -> &'static str {
+///
+/// Pairs rather than one string so the **key** can be drawn apart from what it
+/// does. A hint line dim all the way through is a line the eye skips, and this
+/// is the only place the bindings are ever written down.
+fn keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if app.blocked().is_some() {
-        return "R re-read the config  q quit";
+        return vec![("R", "re-read the config"), ("q", "quit")];
     }
     if app.is_filtering() {
-        "esc cancel  ↵ keep  ↑↓ move"
+        vec![("esc", "cancel"), ("↵", "keep"), ("↑↓", "move")]
     } else {
-        "q quit  ↵ enter  ← up  / filter  n/s/c/m sort  r sizes  R config  D remove"
+        vec![
+            ("q", "quit"),
+            ("↵", "enter"),
+            ("←", "up"),
+            ("/", "filter"),
+            ("n/s/c/m", "sort"),
+            ("r", "sizes"),
+            ("R", "config"),
+            ("D", "remove"),
+        ]
     }
+}
+
+/// The hint line: keys lit, labels quiet.
+fn hints(pairs: &[(&'static str, &'static str)]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(pairs.len() * 3);
+    for (key, what) in pairs {
+        if !spans.is_empty() {
+            // Two, not three: the bindings are the widest line on the screen,
+            // and a 78-column terminal clipped `D remove` off the end of it.
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(format!(" {what}")));
+    }
+    Line::from(spans)
 }
 
 /// The path, and anything that went wrong.
