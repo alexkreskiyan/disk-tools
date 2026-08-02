@@ -223,32 +223,12 @@ impl App {
         }
     }
 
-    /// A character typed towards the word that agrees to a destroying plan.
-    pub fn removal_push(&mut self, ch: char) {
-        if let Some(Removal::Asking { typed, .. }) = &mut self.removal {
-            typed.push(ch);
-        }
-    }
-
-    pub fn removal_pop(&mut self) {
-        if let Some(Removal::Asking { typed, .. }) = &mut self.removal {
-            typed.pop();
-        }
-    }
-
-    /// Agree, and carry it out — if enough has been said to agree.
-    ///
-    /// The gentle case is settled here: a plan that only trashes takes the key
-    /// itself as agreement, and a plan that destroys takes only the word.
+    /// Agree, and carry it out.
     pub fn confirm_removal(&mut self) {
         let Some(removal) = &mut self.removal else {
             return;
         };
-        let ready = match removal {
-            Removal::Asking { destroys, .. } => !*destroys || removal.agreed(),
-            _ => false,
-        };
-        if !ready {
+        if !matches!(removal, Removal::Asking { .. }) {
             return;
         }
         removal.carry_out();
@@ -1843,10 +1823,10 @@ mod tests {
         assert!(root.join("ordinary/a.bin").exists());
     }
 
-    /// The word is the whole guard on a destroying plan: agreeing without it
-    /// must do nothing at all.
+    /// A destroying plan is still one question with two answers — the tier
+    /// changes what the modal *says*, in red, not what it takes to agree.
     #[test]
-    fn a_destroying_plan_is_not_agreed_to_by_pressing_return() {
+    fn a_destroying_plan_is_announced_and_still_cancellable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
@@ -1870,19 +1850,11 @@ mod tests {
             Some(Removal::Asking { destroys: true, .. })
         ));
 
-        app.confirm_removal();
+        crate::ui::press(&mut app, 'n');
+        assert!(app.removal().is_none(), "no is no, whatever the tier");
         assert!(
             root.join("project/node_modules/a.bin").exists(),
-            "return alone must not destroy anything"
-        );
-
-        for ch in "purg".chars() {
-            app.removal_push(ch);
-        }
-        app.confirm_removal();
-        assert!(
-            root.join("project/node_modules/a.bin").exists(),
-            "and neither must most of the word"
+            "and nothing was destroyed on the way to saying it"
         );
     }
 
@@ -1930,40 +1902,6 @@ mod tests {
             assert!(app.removal().is_none(), "`{key}` should have cancelled");
             assert!(root.join("project/node_modules/a.bin").exists());
         }
-    }
-
-    /// While the word is being typed every letter is a letter of it — so only
-    /// the capital can also mean no, and the lower-case one stays a keystroke
-    /// someone may be part-way through.
-    #[test]
-    fn only_the_capital_n_cancels_a_destroying_plan() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
-        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
-
-        let mut rules = claiming_here(root).to_vec();
-        rules[0].tier = Tier::Purge;
-        let mut app = App::open(
-            root,
-            Rules::new(rules, &UserDirs::default()).expect("compiles"),
-            now(),
-            UserDirs::default(),
-        )
-        .expect("open");
-        point_at(&mut app, "project");
-        app.begin_removal();
-        await_plan(&mut app);
-
-        crate::ui::press(&mut app, 'n');
-        assert!(
-            app.removal().is_some(),
-            "a lower-case letter is a letter, not an answer"
-        );
-
-        crate::ui::press(&mut app, 'N');
-        assert!(app.removal().is_none());
-        assert!(root.join("project/node_modules/a.bin").exists());
     }
 
     /// Abandoning leaves the disk and the screen exactly as they were.

@@ -163,23 +163,13 @@ fn removing(app: &mut App, code: KeyCode) {
     use removal::Removal;
 
     match app.removal() {
-        Some(Removal::Asking { destroys, .. }) => {
-            let destroys = *destroys;
-            match code {
-                KeyCode::Esc => app.dismiss_removal(),
-                KeyCode::Enter => app.confirm_removal(),
-                // The gentle case is a yes-or-no question, and both answers are
-                // a letter. The destroying one is not: every letter there is a
-                // letter of the word, so only the **capital** N can also mean
-                // no — a lower-case one might be something someone is typing.
-                KeyCode::Char('y' | 'Y') if !destroys => app.confirm_removal(),
-                KeyCode::Char('n') if !destroys => app.dismiss_removal(),
-                KeyCode::Char('N') => app.dismiss_removal(),
-                KeyCode::Backspace => app.removal_pop(),
-                KeyCode::Char(ch) => app.removal_push(ch),
-                _ => {}
-            }
-        }
+        // One question, one answer, whichever tier the plan holds. What the
+        // tier changes is what the modal says above this line.
+        Some(Removal::Asking { .. }) => match code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => app.confirm_removal(),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => app.dismiss_removal(),
+            _ => {}
+        },
         // Planning, done, or nothing to do: one key out, and no key in.
         Some(_) => {
             if matches!(code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
@@ -412,30 +402,8 @@ fn draw_removal(frame: &mut Frame<'_>, pending: &removal::Removal) {
     frame.render_widget(Paragraph::new(body), bands[1]);
 
     let keys: Line<'static> = match pending {
-        Removal::Asking {
-            destroys: true,
-            typed,
-            ..
-        } => Line::from(vec![
-            Span::raw("  type "),
-            Span::styled(
-                removal::Removal::WORD,
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" then "),
-            Span::styled(
-                "↵",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" to confirm: {typed:<8}")),
-            Span::styled(
-                "N / Esc",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" cancel"),
-        ]),
+        // The same two keys either way. A plan that destroys says so in red at
+        // the top of the modal, which is where the difference belongs.
         Removal::Asking { .. } => hints(&[("Y", "confirm"), ("N / Esc", "cancel")]),
         Removal::Planning { .. } => hints(&[("Esc", "cancel")]),
         _ => hints(&[("Esc", "close")]),
@@ -835,9 +803,6 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        app.removal_push('p');
-        app.removal_push('u');
-
         for line in paint(app, 78, 12) {
             println!("|{line}");
         }

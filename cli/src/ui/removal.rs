@@ -13,9 +13,10 @@
 //!
 //! **It always asks.** On the command line the confirmation is the verb: you
 //! type `clean` yourself, and that is the moment of intent. A keypress has no
-//! such moment, so the modal supplies one. What differs between them is the
-//! price of a mistake, not whether you are asked: the trash takes a `y`, and
-//! destroying takes the word `purge` typed out.
+//! such moment, so the modal supplies one — `Y` or `N`, whichever tier the plan
+//! holds. What the tier changes is what the modal *says*: a plan that destroys
+//! announces itself in red and names every share as destroyed, because the
+//! information is the part that matters and the ceremony was not.
 //!
 //! **It plans on a worker.** Planning walks a tree and runs a `git status` per
 //! repository; doing that on the UI thread would freeze the browser for as long
@@ -38,11 +39,9 @@ pub enum Removal {
     Asking {
         path: PathBuf,
         plan: Box<CleanPlan>,
-        /// Anything here is destroyed rather than trashed, so agreement is the
-        /// word rather than a letter.
+        /// Anything here is destroyed rather than trashed. It changes what the
+        /// modal says, not what it takes to agree.
         destroys: bool,
-        /// What has been typed towards that word so far.
-        typed: String,
     },
     /// What it did, until dismissed.
     Done {
@@ -96,7 +95,6 @@ impl Removal {
                     path: path.clone(),
                     plan: Box::new(plan),
                     destroys,
-                    typed: String::new(),
                 };
                 true
             }
@@ -107,20 +105,6 @@ impl Removal {
                 *self = Removal::Nothing { path: path.clone() };
                 true
             }
-        }
-    }
-
-    /// The word that agrees to this, when a letter will not do.
-    pub const WORD: &'static str = "purge";
-
-    /// Has enough been typed to agree?
-    pub fn agreed(&self) -> bool {
-        match self {
-            Removal::Asking {
-                destroys: false, ..
-            } => false,
-            Removal::Asking { typed, .. } => typed == Removal::WORD,
-            _ => false,
         }
     }
 
@@ -209,7 +193,6 @@ mod tests {
                 ..CleanPlan::default()
             }),
             destroys,
-            typed: String::new(),
         }
     }
 
@@ -235,28 +218,6 @@ mod tests {
                 ..
             }
         ));
-        assert!(
-            !gentle.agreed(),
-            "a letter is not typed into the word; the caller settles that key"
-        );
-    }
-
-    /// Typed short, typed wrong, typed right.
-    #[test]
-    fn the_word_has_to_be_the_word() {
-        let mut asking = asking(vec![candidate("destroyed", true, 8192)]);
-
-        for attempt in ["", "pur", "purgeee", "PURGE"] {
-            if let Removal::Asking { typed, .. } = &mut asking {
-                *typed = attempt.to_owned();
-            }
-            assert!(!asking.agreed(), "`{attempt}` must not agree");
-        }
-
-        if let Removal::Asking { typed, .. } = &mut asking {
-            *typed = Removal::WORD.to_owned();
-        }
-        assert!(asking.agreed());
     }
 
     /// The modal shows what `preview -d 0` would print about the same paths, so
