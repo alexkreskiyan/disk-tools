@@ -8,10 +8,19 @@
 use crate::config::Config;
 use clap::{Parser, Subcommand};
 use disk_tools_core::{
-    CleanOptions, DetectOptions, RuleError, Rules, ScanOptions, UserDirs, age_rule,
+    CleanOptions, DetectOptions, DuplicateRules, Keep, RuleError, Rules, ScanOptions, UserDirs,
+    age_rule, user_path,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+/// The floor `--dup` applies when nothing else says otherwise.
+///
+/// A default rather than 0 because this flag decides how much is *read*: below
+/// it a file is never opened. Small files are also where duplicates are least
+/// worth acting on — a thousand identical 4 KiB icons are 4 MiB and a very long
+/// report.
+const MIN_DUPLICATE_SIZE: u64 = 1 << 20;
 
 /// disk-tools — find what's eating your disk.
 #[derive(Parser, Debug)]
@@ -36,6 +45,15 @@ pub struct Args {
     /// verb unable to say where.
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// Say what this command would do, and do nothing else.
+    ///
+    /// Names the config file actually read, which rules are in force and which
+    /// were dropped and why, where it would look, and — for `clean` — where
+    /// things would go and whether it would stop. Exits without walking,
+    /// reading or removing anything.
+    #[arg(long, global = true)]
+    pub explain: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -88,7 +106,11 @@ pub enum ConfigAction {
     /// Write the default configuration, comments and all, so it can be edited.
     Init {
         /// Overwrite an existing file.
-        #[arg(long)]
+        ///
+        /// Without it an existing config stops the command: this reads as "show
+        /// me the defaults", and a command that reads that way must not be able
+        /// to throw away a file the user has edited.
+        #[arg(short = 'f', long)]
         force: bool,
     },
 }
@@ -152,6 +174,34 @@ pub struct CleanArgs {
     #[arg(value_name = "PATH")]
     pub path: Option<PathBuf>,
 
+    /// Look for duplicate files instead of what the rules claim.
+    ///
+    /// The rules still prune: nothing inside something they claim is offered as
+    /// a duplicate, because such a directory goes wholesale and removing one
+    /// file out of it breaks the rest. Every duplicate needs confirming, so
+    /// `clean --dup` refuses without --yes.
+    ///
+    /// There is no config key for this: a file that switched what `clean`
+    /// removes would do it invisibly, the same reason --yes and --purge are
+    /// absent from it.
+    #[arg(long)]
+    pub dup: bool,
+
+    /// Which copy of a duplicate group to keep. Default: oldest-created.
+    ///
+    /// A date the platform did not record never wins; where no copy in a group
+    /// has it, the other date decides and the report says so.
+    #[arg(long, value_enum, value_name = "RULE", requires = "dup")]
+    pub keep: Option<KeepArg>,
+
+    /// Prefer to keep copies under this path. Repeatable; earlier wins.
+    ///
+    /// Beats --keep outright, which then only chooses among the copies inside.
+    /// Given on the command line it replaces the configured list rather than
+    /// adding to it.
+    #[arg(long = "keep-in", value_name = "PATH", requires = "dup")]
+    pub keep_in: Vec<PathBuf>,
+
     /// Drop everything that needs per-item confirmation.
     ///
     /// Keeps both of the other tiers: purge is a stronger claim that something
@@ -189,7 +239,16 @@ pub struct CleanArgs {
     pub min_size: Option<u64>,
 
     /// Also offer anything untouched for this long: 90d, 6m, 1y.
-    #[arg(long = "older-than", value_parser = parse_duration, value_name = "DURATION")]
+    ///
+    /// Refused with --dup, where it would mean the opposite. It works by adding
+    /// a rule, and under --dup the rules only prune — so it would *exclude*
+    /// everything older than the threshold from the search rather than offer it.
+    #[arg(
+        long = "older-than",
+        value_parser = parse_duration,
+        value_name = "DURATION",
+        conflicts_with = "dup"
+    )]
     pub older_than: Option<Duration>,
 
     // Neither carries a clap `default_value`, for the reason the whole file
@@ -213,6 +272,128 @@ pub struct CleanArgs {
     /// The whole plan, or the whole outcome — `-d` and `--sort` do not reach it.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `--keep`, as clap spells it.
+///
+/// A mirror of the core's [`Keep`] rather than the type itself: the core takes
+/// no dependency on clap, and a `ValueEnum` derive there would be one. The two
+/// are kept in step by `every_keep_rule_maps_to_the_core`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum KeepArg {
+    /// The byte-lexicographically first path — the only rule that reads no
+    /// metadata and so can never degrade.
+    First,
+    /// The earliest creation time: the copy that existed first.
+    OldestCreated,
+    /// The latest creation time.
+    NewestCreated,
+    /// The earliest modification time.
+    OldestModified,
+    /// The latest modification time.
+    NewestModified,
+}
+
+impl From<KeepArg> for Keep {
+    fn from(arg: KeepArg) -> Keep {
+        match arg {
+            KeepArg::First => Keep::First,
+            KeepArg::OldestCreated => Keep::OldestCreated,
+            KeepArg::NewestCreated => Keep::NewestCreated,
+            KeepArg::OldestModified => Keep::OldestModified,
+            KeepArg::NewestModified => Keep::NewestModified,
+        }
+    }
+}
+
+/// What a `--dup` run searches for, once the flags and the file are merged.
+///
+/// Its presence **is** the switch: `Some` means the candidates come from file
+/// contents and not from the rules. A boolean beside the settings could be true
+/// with nothing to search by, and would have to be checked everywhere the
+/// settings are read.
+// No `PartialEq`: the compiled rules hold glob automata, which have no useful
+// equality. The tests below compare the fields they are about.
+#[derive(Debug, Clone)]
+pub struct Duplicating {
+    /// Where duplicates may be looked for, and what to do with the copies.
+    pub rules: DuplicateRules,
+
+    /// Below this, a file is not even hashed. Defaults to 1 MiB — reading
+    /// megabytes of dotfiles to reclaim kilobytes is the wrong trade for a disk
+    /// tool, and this is the one flag that decides how much is read at all.
+    /// Applied beside each part's own floor, the larger of the two deciding.
+    pub min_size: u64,
+
+    /// `--keep`, when it was passed. `None` leaves every rule its own.
+    pub keep: Option<Keep>,
+
+    /// `--keep-in`, when it was passed: it replaces a rule's list rather than
+    /// extending it. Absolute, like every path this tool acts on.
+    pub keep_in: Option<Vec<PathBuf>>,
+}
+
+/// Where a resolved value came from.
+///
+/// Kept only so `--explain` can name the line to change. A report saying
+/// `floor 5.0M` sends a user to the wrong place half the time: the flag and the
+/// file arrive here as the same value, and only the resolution knew which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A flag on this command line.
+    Flag(&'static str),
+    /// A key in the configuration file.
+    File(&'static str),
+    /// Nothing said anything; this is the built-in.
+    Default,
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::Flag(name) => write!(f, "{name}"),
+            Source::File(key) => write!(f, "{key}, from the file"),
+            Source::Default => write!(f, "the built-in default"),
+        }
+    }
+}
+
+/// A value that has no file key: the flag, or the built-in.
+fn source_of<T>(flag: Option<T>, name: &'static str) -> Source {
+    match flag {
+        Some(_) => Source::Flag(name),
+        None => Source::Default,
+    }
+}
+
+/// Take the first of flag, file, default — and remember which it was.
+///
+/// The one place the precedence order is written for a value that `--explain`
+/// shows, so the answer and the explanation cannot disagree about it.
+fn from<T>(
+    flag: Option<T>,
+    file: Option<T>,
+    fallback: T,
+    flag_name: &'static str,
+    file_key: &'static str,
+) -> (T, Source) {
+    match (flag, file) {
+        (Some(value), _) => (value, Source::Flag(flag_name)),
+        (None, Some(value)) => (value, Source::File(file_key)),
+        (None, None) => (fallback, Source::Default),
+    }
+}
+
+/// Where each shown value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sources {
+    pub min_size: Source,
+    pub keep: Source,
+    pub keep_in: Source,
+    pub safe: Source,
+    pub confirm: Source,
+    pub depth: Source,
+    pub sort: Source,
 }
 
 /// What the report is ordered by.
@@ -288,6 +469,13 @@ pub struct Cleanup {
     /// narrow it.
     pub options: CleanOptions,
 
+    /// `Some` when `--dup` was passed: what to search for, instead of the rules.
+    ///
+    /// The two sources are never mixed. Rules yield tiered directories and
+    /// duplicates yield groups of files with a keeper, and a report holding both
+    /// would have no common unit to be about.
+    pub duplicates: Option<Duplicating>,
+
     /// Which verb this was. The only thing that differs between them.
     pub intent: Intent,
 
@@ -301,6 +489,9 @@ pub struct Cleanup {
     /// How the plan is **shown**. Never how it is chosen: nothing in here can
     /// keep a candidate out of the removal, only out of the printout.
     pub report: Report,
+
+    /// Where each of the above came from, for `--explain`.
+    pub sources: Sources,
 }
 
 /// What the parsed arguments actually asked for.
@@ -461,11 +652,90 @@ impl Args {
         // and one rooted elsewhere simply matches nothing — `Rules::prunes` sees
         // to that. With no path, the rules say where to look, which is what
         // `root` is required for.
+        let duplicate_rules =
+            DuplicateRules::new(config.duplicate_rules, &user_dirs).map_err(ResolveError::Rule)?;
+
+        // A path narrows the walk to itself. Without one, **the rules of the
+        // mode being run** say where to look: the clean rules for an ordinary
+        // run, the duplicate rules for `--dup`. v0.6 made `--dup` demand a path
+        // because there was no such list to ask; there is now, and the special
+        // case goes with it.
         let roots_from_rules = clean.path.is_none();
         let roots = match clean.path {
             Some(path) => vec![absolute(path)],
+            None if clean.dup => duplicate_rules.scan_roots(),
             None => rules.scan_roots(),
         };
+
+        // Flag, then file, then a default that depends on the mode: hashing has
+        // a floor worth having and rule-claimed directories do not.
+        let (min_size, min_size_source) = from(
+            clean.min_size,
+            clean.dup.then_some(config.duplicates.min_size).flatten(),
+            if clean.dup { MIN_DUPLICATE_SIZE } else { 0 },
+            "--min-size",
+            "[duplicates] min-size",
+        );
+        let (safe_only, safe_source) = from(
+            clean.safe.then_some(true),
+            clean_settings.safe,
+            false,
+            "--safe",
+            "[clean] safe",
+        );
+        let (require_confirmation, confirm_source) = from(
+            clean.yes.then_some(false),
+            clean_settings.require_confirmation,
+            true,
+            "--yes",
+            "[clean] require-confirmation",
+        );
+        let (keep, keep_source) = from(
+            clean.keep.map(Keep::from),
+            config.duplicates.keep,
+            Keep::default(),
+            "--keep",
+            "[duplicates] keep",
+        );
+
+        let keep_in_source = if !clean.keep_in.is_empty() {
+            Source::Flag("--keep-in")
+        } else if !config.duplicates.keep_in.is_empty() {
+            Source::File("[duplicates] keep-in")
+        } else {
+            Source::Default
+        };
+
+        let duplicates = clean.dup.then_some(()).map(|()| Duplicating {
+            rules: duplicate_rules,
+            min_size,
+            // `None` means no one overrode the rules, which is a different
+            // statement from "the default was used".
+            keep: (keep_source != Source::Default).then_some(keep),
+            // The flag **replaces** the file's list rather than extending it:
+            // these are ordered preferences, and a command line that could only
+            // ever add to them could not say "not the usual place, this one".
+            //
+            // A root the file writes with a token this build cannot resolve
+            // drops out, exactly as an unresolvable rule root does: unknown
+            // reads as nowhere, never as anywhere.
+            keep_in: match (
+                clean.keep_in.is_empty(),
+                config.duplicates.keep_in.is_empty(),
+            ) {
+                (true, true) => None,
+                (true, false) => Some(
+                    config
+                        .duplicates
+                        .keep_in
+                        .iter()
+                        .filter_map(|text| user_path(text, &user_dirs))
+                        .map(absolute)
+                        .collect(),
+                ),
+                _ => Some(clean.keep_in.into_iter().map(absolute).collect()),
+            },
+        });
 
         Ok(Mode::Clean(Box::new(Cleanup {
             roots,
@@ -473,23 +743,40 @@ impl Args {
             options: CleanOptions {
                 detect: DetectOptions { rules, now },
                 user_dirs,
-                safe_only: clean.safe || clean_settings.safe.unwrap_or(false),
+                safe_only,
                 purge_all: clean.purge,
-                min_size: clean.min_size.unwrap_or(0),
+                min_size,
             },
+            duplicates,
             intent,
             // **True** when nothing says otherwise. The concept asks for
             // confirmation on this tier, and the asymmetry the denylist already
             // states applies: refusing too readily costs a user one extra flag,
             // refusing too rarely costs them data.
-            confirm_tier_allowed: clean.yes || !clean_settings.require_confirmation.unwrap_or(true),
+            confirm_tier_allowed: !require_confirmation,
             report: Report {
                 // Grouped by rule unless asked for more. The overview is what
                 // the question "what would this take" wants first; the list is
                 // one keystroke away.
                 depth: clean.depth.unwrap_or(0),
-                sort: clean.sort.unwrap_or(Sort::Name),
+                // The one place a default depends on the mode, and it earns it.
+                // A rule plan is a few dozen directories and alphabetical order
+                // is what makes it reviewable; a duplicate search returns
+                // hundreds of groups, and the only question asked of that list
+                // is which of them are worth acting on.
+                sort: clean
+                    .sort
+                    .unwrap_or(if clean.dup { Sort::Size } else { Sort::Name }),
                 json: clean.json,
+            },
+            sources: Sources {
+                min_size: min_size_source,
+                keep: keep_source,
+                keep_in: keep_in_source,
+                safe: safe_source,
+                confirm: confirm_source,
+                depth: source_of(clean.depth, "--depth"),
+                sort: source_of(clean.sort, "--sort"),
             },
         })))
     }
@@ -504,6 +791,20 @@ pub enum ResolveError {
     /// `%APPDATA%`, no `XDG_CONFIG_HOME`. Guessing would put a file somewhere
     /// the user would never look for it.
     NoConfigPath,
+}
+
+impl ResolveError {
+    /// What the message is *about*, for the caller's prefix.
+    ///
+    /// Two of these are complaints about the configuration file and one is
+    /// about the command line. `disk-tools: config: --dup needs a PATH` sends a
+    /// user to edit a file that has nothing to do with it — v0.5 shipped exactly
+    /// that mistake for `--apply`, and it is worth one method not to repeat it.
+    pub fn about(&self) -> Option<&'static str> {
+        match self {
+            ResolveError::Rule(_) | ResolveError::NoConfigPath => Some("config"),
+        }
+    }
 }
 
 impl std::fmt::Display for ResolveError {
@@ -703,6 +1004,316 @@ mod tests {
             .expect("the built-in rules compile"))
     }
 
+    // ---- duplicates ------------------------------------------------------
+
+    /// The `Duplicating` a `--dup` run resolved to, or `None` without the flag.
+    fn duplicating(toml: &str, args: &[&str]) -> Option<Duplicating> {
+        match against(toml, args) {
+            Mode::Clean(cleanup) => cleanup.duplicates,
+            other => panic!("expected a cleanup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dup_switches_the_source_and_nothing_else_does() {
+        let path = rooted("x");
+        assert!(duplicating("", &["preview", &path]).is_none());
+        assert!(duplicating("", &["preview", &path, "--dup"]).is_some());
+        assert!(
+            duplicating("", &["clean", &path, "--dup"]).is_some(),
+            "both verbs, or the preview could not be acted on by retyping it"
+        );
+    }
+
+    /// The special case v0.6 needed is gone: with rules that have roots, this is
+    /// the sentence `preview` with no path already speaks — of the other list.
+    #[test]
+    fn dup_without_a_path_walks_the_duplicate_rule_roots() {
+        let config = crate::config::parse_for_test(
+            "duplicate-rules:\n  - name: photos\n    parts:\n      - root: \"/tmp/photos\"\n        includes: [\"**\"]\n      - root: \"/tmp/scans\"\n        includes: [\"**\"]\n",
+        );
+        let mode = parse(&["preview", "--dup"])
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve");
+
+        let Mode::Clean(cleanup) = mode else {
+            panic!("expected a cleanup")
+        };
+        assert_eq!(
+            cleanup.roots,
+            vec![PathBuf::from("/tmp/photos"), PathBuf::from("/tmp/scans")],
+            "every part of every rule, not just the first"
+        );
+        assert!(cleanup.roots_from_rules);
+    }
+
+    /// And it is the *duplicate* rules it asks, not the clean ones — sending a
+    /// user to edit the wrong half of their file is the mistake this prevents.
+    #[test]
+    fn dup_without_a_path_ignores_the_clean_rule_roots() {
+        let config = crate::config::parse_for_test(
+            "clean-rules:\n  - name: junk\n    parts:\n      - root: \"/tmp/junk\"\n        includes: [\"**/target/\"]\nduplicate-rules: []\n",
+        );
+        let mode = parse(&["preview", "--dup"])
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve");
+
+        let Mode::Clean(cleanup) = mode else {
+            panic!("expected a cleanup")
+        };
+        assert!(
+            cleanup.roots.is_empty(),
+            "no duplicate rule names a directory: {:?}",
+            cleanup.roots
+        );
+    }
+
+    /// Without `--dup` the clean rules are still the ones asked.
+    #[test]
+    fn an_ordinary_run_still_walks_the_clean_rule_roots() {
+        let config = crate::config::parse_for_test(
+            "clean-rules:\n  - name: junk\n    parts:\n      - root: \"/tmp/junk\"\n        includes: [\"**/target/\"]\n",
+        );
+        let mode = parse(&["preview"])
+            .expect("parse")
+            .resolve(env(config))
+            .expect("resolve");
+
+        let Mode::Clean(cleanup) = mode else {
+            panic!("expected a cleanup")
+        };
+        assert_eq!(cleanup.roots, vec![PathBuf::from("/tmp/junk")]);
+        assert!(
+            cleanup.duplicates.is_none(),
+            "and nothing consults the pools"
+        );
+    }
+
+    /// Silently ignoring a flag that cannot apply is how a user comes to believe
+    /// a keeper rule is in force when nothing read it.
+    #[test]
+    fn the_keeper_flags_need_the_mode_they_belong_to() {
+        let path = rooted("x");
+        for args in [
+            vec!["preview", &path, "--keep", "first"],
+            vec!["preview", &path, "--keep-in", &path],
+        ] {
+            let err = parse(&args).expect_err("--dup is required");
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn min_size_takes_the_flag_then_the_file_then_a_default_that_knows_the_mode() {
+        let path = rooted("x");
+        let file = "duplicates:\n  min-size: \"4M\"\n";
+
+        assert_eq!(
+            duplicating("", &["preview", &path, "--dup"])
+                .expect("dup")
+                .min_size,
+            1 << 20,
+            "the floor exists because this flag decides how much is read"
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup"])
+                .expect("dup")
+                .min_size,
+            4 << 20
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup", "--min-size", "2M"])
+                .expect("dup")
+                .min_size,
+            2 << 20
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup", "--min-size", "0"])
+                .expect("dup")
+                .min_size,
+            0,
+            "an explicit zero beats the file, which is why no flag here has a clap default"
+        );
+    }
+
+    /// The rule-claimed source keeps its own default of 0: a directory is
+    /// claimed whole, and nothing is read to decide it.
+    #[test]
+    fn the_duplicate_floor_does_not_leak_into_an_ordinary_run() {
+        let path = rooted("x");
+        assert_eq!(clean_options(&["preview", &path]).min_size, 0);
+        assert_eq!(
+            clean_options(&["preview", &path, "--dup"]).min_size,
+            1 << 20,
+            "and the plan is narrowed by the same number the search was"
+        );
+    }
+
+    #[test]
+    fn keep_takes_the_flag_then_the_file_then_the_original() {
+        let path = rooted("x");
+        let file = "duplicates:\n  keep: \"newest-modified\"\n";
+
+        assert_eq!(
+            duplicating("", &["preview", &path, "--dup"])
+                .expect("dup")
+                .keep,
+            None,
+            "unstated leaves every rule its own"
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup"])
+                .expect("dup")
+                .keep,
+            Some(Keep::NewestModified)
+        );
+        assert_eq!(
+            duplicating(file, &["preview", &path, "--dup", "--keep", "first"])
+                .expect("dup")
+                .keep,
+            Some(Keep::First)
+        );
+    }
+
+    /// Every value clap offers has to reach the core, or a flag parses and then
+    /// means something else.
+    #[test]
+    fn every_keep_rule_maps_to_the_core() {
+        let path = rooted("x");
+        for (word, expected) in [
+            ("first", Keep::First),
+            ("oldest-created", Keep::OldestCreated),
+            ("newest-created", Keep::NewestCreated),
+            ("oldest-modified", Keep::OldestModified),
+            ("newest-modified", Keep::NewestModified),
+        ] {
+            assert_eq!(
+                duplicating("", &["preview", &path, "--dup", "--keep", word])
+                    .expect("dup")
+                    .keep,
+                Some(expected),
+                "--keep {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_in_is_made_absolute_and_the_flag_replaces_the_file() {
+        let path = rooted("x");
+        // Built rather than written, and in a TOML *literal* string: a
+        // hard-coded "/from/file" is drive-relative on Windows, so `absolute`
+        // prepends whichever drive the runner has and the assertion below stops
+        // matching. CI caught exactly this, on a runner whose drive was `D:`.
+        // Single quotes because a basic TOML string would read `\f` as an escape.
+        let configured = rooted("from");
+        let file = format!("duplicates:\n  keep-in: ['{configured}']\n");
+
+        let from_file = duplicating(&file, &["preview", &path, "--dup"]).expect("dup");
+        assert_eq!(from_file.keep_in, Some(vec![PathBuf::from(&configured)]));
+
+        let flagged = duplicating(
+            &file,
+            &["preview", &path, "--dup", "--keep-in", &rooted("named")],
+        )
+        .expect("dup");
+        assert_eq!(
+            flagged.keep_in,
+            Some(vec![PathBuf::from(rooted("named"))]),
+            "ordered preferences: the command line replaces them, it does not append"
+        );
+
+        let relative =
+            duplicating("", &["preview", &path, "--dup", "--keep-in", "here"]).expect("dup");
+        assert!(
+            relative.keep_in.as_ref().expect("a list")[0].is_absolute(),
+            "every path this tool acts on is absolute: {:?}",
+            relative.keep_in
+        );
+    }
+
+    /// `~` means the same thing wherever a user may write a path, because one
+    /// function in the core decides what it means.
+    #[test]
+    fn a_configured_keep_in_expands_the_same_tokens_a_rule_root_does() {
+        let path = rooted("x");
+        let config = crate::config::parse_for_test("duplicates:\n  keep-in: [\"~/Photos\"]\n");
+        let home = PathBuf::from(rooted("home/me"));
+        let mode = parse(&["preview", &path, "--dup"])
+            .expect("parse")
+            .resolve(Environment {
+                user_dirs: UserDirs {
+                    home: Some(home.clone()),
+                    ..UserDirs::default()
+                },
+                ..env(config)
+            })
+            .expect("resolve");
+
+        let Mode::Clean(cleanup) = mode else {
+            panic!("expected a cleanup")
+        };
+        assert_eq!(
+            cleanup.duplicates.expect("dup").keep_in,
+            Some(vec![home.join("Photos")])
+        );
+    }
+
+    /// An unresolvable token claims nothing rather than everything — the rule
+    /// the whole project follows for a path it cannot work out.
+    #[test]
+    fn a_keep_in_root_with_no_home_drops_out() {
+        let path = rooted("x");
+        let found = duplicating(
+            "duplicates:\n  keep-in: [\"~/Photos\"]\n",
+            &["preview", &path, "--dup"],
+        )
+        .expect("dup");
+        assert_eq!(
+            found.keep_in,
+            Some(Vec::new()),
+            "the file named one and it did not resolve, which is not the same as naming none"
+        );
+    }
+
+    /// The only default in this file that depends on another flag, and it is
+    /// stated in `--help` for exactly that reason.
+    #[test]
+    fn the_report_order_defaults_to_size_only_under_dup() {
+        let path = rooted("x");
+        let sort_of = |args: &[&str]| match resolved(args).expect("resolve") {
+            Mode::Clean(cleanup) => cleanup.report.sort,
+            other => panic!("expected a cleanup, got {other:?}"),
+        };
+
+        assert_eq!(sort_of(&["preview", &path]), Sort::Name);
+        assert_eq!(sort_of(&["preview", &path, "--dup"]), Sort::Size);
+        assert_eq!(
+            sort_of(&["preview", &path, "--dup", "--sort", "name"]),
+            Sort::Name,
+            "the flag still wins, as everywhere"
+        );
+    }
+
+    /// The flag adds a rule, and under `--dup` the rules only prune — so it
+    /// would have quietly meant the opposite of what it says: not "also offer
+    /// what is old" but "exclude everything older than this from the search".
+    /// A flag whose sense inverts with another flag is refused rather than
+    /// documented.
+    #[test]
+    fn older_than_is_refused_with_dup() {
+        let path = rooted("x");
+        let err = parse(&["preview", &path, "--dup", "--older-than", "90d"])
+            .expect_err("the two cannot both apply");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // And each of them alone still parses.
+        assert!(parse(&["preview", &path, "--dup"]).is_ok());
+        assert!(parse(&["preview", &path, "--older-than", "90d"]).is_ok());
+    }
+
     // ---- precedence: flag > file > default -------------------------------
 
     /// Resolve `args` against a config file built from `toml`.
@@ -727,7 +1338,7 @@ mod tests {
     #[test]
     fn every_setting_takes_the_flag_then_the_file_then_the_default() {
         // (setting, config, flag, expected)
-        let file = "[report]\nmin-size = \"1M\"\nn = 5\ndepth = 3\n";
+        let file = "report:\n  min-size: \"1M\"\n  n: 5\n  depth: 3\n";
 
         assert_eq!(
             scan_with("", &["scan", "/x"]).min_size,
@@ -769,7 +1380,7 @@ mod tests {
     /// short of dropping the clap default can tell them apart.
     #[test]
     fn an_explicit_zero_beats_the_file() {
-        let file = "[report]\nmin-size = \"1M\"\n";
+        let file = "report:\n  min-size: \"1M\"\n";
 
         assert_eq!(
             scan_with(file, &["scan", "/x", "--min-size", "0"]).min_size,
@@ -789,7 +1400,7 @@ mod tests {
     #[test]
     fn zero_depth_means_the_root_alone_in_both_places() {
         assert_eq!(
-            scan_with("[report]\ndepth = 0\n", &["scan", "/x"]).depth,
+            scan_with("report:\n  depth: 0\n", &["scan", "/x"]).depth,
             Some(0)
         );
         assert_eq!(
@@ -803,7 +1414,7 @@ mod tests {
     /// rather than left to be discovered.
     #[test]
     fn a_boolean_set_in_the_file_cannot_be_unset_by_a_flag() {
-        let file = "[scan]\none-file-system = true\n\n[report]\napparent = true\n";
+        let file = "scan:\n  one-file-system: true\n\nreport:\n  apparent: true\n";
 
         let from_file = scan_with(file, &["scan", "/x"]);
         assert!(from_file.apparent);
@@ -823,7 +1434,7 @@ mod tests {
         };
 
         assert!(!clean("", &["clean", "/x"]).safe_only);
-        assert!(clean("[clean]\nsafe = true\n", &["clean", "/x"]).safe_only);
+        assert!(clean("clean:\n  safe: true\n", &["clean", "/x"]).safe_only);
         assert!(clean("", &["clean", "/x", "--safe"]).safe_only);
     }
 
@@ -833,7 +1444,7 @@ mod tests {
     #[test]
     fn the_dangerous_flags_have_no_file_counterpart() {
         let warnings =
-            crate::config::parse_for_test("[clean]\nallow-dirty = true\npurge = true\n").warnings;
+            crate::config::parse_for_test("clean:\n  allow-dirty: true\n  purge: true\n").warnings;
 
         assert_eq!(warnings, vec!["clean.allow-dirty", "clean.purge"]);
     }
@@ -1115,7 +1726,7 @@ mod tests {
 
     /// The age rule's threshold, if `--older-than` put one in the list.
     fn older_than_of(options: &CleanOptions) -> Option<Duration> {
-        options.detect.rules.get("old")?.older_than
+        options.detect.rules.get("old")?.parts.first()?.older_than
     }
 
     fn clean_options(args: &[&str]) -> CleanOptions {
@@ -1199,6 +1810,7 @@ mod tests {
             Rules::builtin(&UserDirs::default())
                 .get("rust-target")
                 .expect("a built-in")
+                .parts[0]
                 .requires_clean_repo,
             "the git guard survives as the per-rule setting that replaced the flag"
         );
@@ -1368,8 +1980,7 @@ mod tests {
     #[test]
     fn without_a_path_the_rule_roots_are_walked() {
         let config = crate::config::parse_for_test(
-            "[[rules]]\nname = \"a\"\nroot = \"/tmp/a\"\nincludes = [\"**/x/\"]\n\n\
-             [[rules]]\nname = \"b\"\nroot = \"/tmp/b\"\nincludes = [\"**/y/\"]\n",
+            "clean-rules:\n  - name: \"a\"\n    parts:\n      - root: \"/tmp/a\"\n        includes: [\"**/x/\"]\n  - name: \"b\"\n    parts:\n      - root: \"/tmp/b\"\n        includes: [\"**/y/\"]\n",
         );
         let mode = parse(&["clean"])
             .expect("parse")
@@ -1391,7 +2002,7 @@ mod tests {
     #[test]
     fn a_path_is_the_only_thing_walked() {
         let config = crate::config::parse_for_test(
-            "[[rules]]\nname = \"a\"\nroot = \"/tmp/a\"\nincludes = [\"**/x/\"]\n",
+            "clean-rules:\n  - name: \"a\"\n    parts:\n      - root: \"/tmp/a\"\n        includes: [\"**/x/\"]\n",
         );
         let path = rooted("elsewhere");
         let mode = parse(&["clean", &path])

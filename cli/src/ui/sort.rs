@@ -19,6 +19,8 @@ use std::cmp::Ordering;
 pub enum Order {
     Name,
     Size,
+    /// What the rules would free here — the `clean` column.
+    Cleanable,
     Created,
     Modified,
 }
@@ -29,6 +31,7 @@ impl Order {
         match self {
             Order::Name => "name",
             Order::Size => "size",
+            Order::Cleanable => "clean",
             Order::Created => "created",
             Order::Modified => "modified",
         }
@@ -49,9 +52,16 @@ pub struct Applied {
 /// a platform every comparison would be between two absences, so the result
 /// would be arbitrary rather than sorted. One entry having it is enough to
 /// proceed — the rest sort to the end, which is where "unknown" belongs.
+///
+/// `Cleanable` falls back the same way, for a different reason: the figures
+/// arrive from a background walk, so a directory just opened has none of them
+/// yet. Reporting the fallback is what stops "by clean" from silently showing
+/// name order — and the browser re-sorts when the walk finishes, so the answer
+/// corrects itself rather than staying wrong.
 pub fn sort(entries: &mut [Entry], wanted: Order, reverse: bool) -> Applied {
     let possible = match wanted {
         Order::Created if entries.iter().all(|entry| entry.created.is_none()) => Order::Name,
+        Order::Cleanable if entries.iter().all(|entry| entry.reclaimable.is_none()) => Order::Name,
         other => other,
     };
 
@@ -88,6 +98,7 @@ fn key(a: &Entry, b: &Entry, order: Order, reverse: bool) -> Option<Ordering> {
     match order {
         Order::Name => None,
         Order::Size => option_cmp(a.size, b.size, reverse),
+        Order::Cleanable => option_cmp(a.reclaimable, b.reclaimable, reverse),
         Order::Created => option_cmp(a.created, b.created, reverse),
         Order::Modified => option_cmp(a.modified, b.modified, reverse),
     }
@@ -144,6 +155,14 @@ mod tests {
             state: disk_tools_core::State::Untracked,
             reclaimable: None,
             measuring: false,
+        }
+    }
+
+    /// A directory with a figure in the `clean` column, or without one.
+    fn reclaiming(name: &str, reclaimable: Option<u64>) -> Entry {
+        Entry {
+            reclaimable,
+            ..dir(name)
         }
     }
 
@@ -313,5 +332,65 @@ mod tests {
             Order::Name,
             "an empty listing has no birth times, so the rule applies unchanged"
         );
+    }
+
+    /// The order for clearing space by hand: biggest win first.
+    #[test]
+    fn cleanable_orders_by_what_the_rules_would_free() {
+        let mut entries = vec![
+            reclaiming("a", Some(1024)),
+            reclaiming("b", Some(8192)),
+            reclaiming("c", Some(4096)),
+        ];
+
+        let applied = sort(&mut entries, Order::Cleanable, true);
+
+        assert_eq!(applied.order, Order::Cleanable);
+        assert!(!applied.fell_back);
+        assert_eq!(names(&entries), ["b", "c", "a"]);
+    }
+
+    /// A directory whose walk has not finished has no figure yet, and an
+    /// unknown is not a zero: it sorts last in **both** directions, so the rows
+    /// that can answer the question stay where the eye goes first.
+    #[test]
+    fn a_row_not_yet_measured_sorts_last_either_way() {
+        let mut entries = vec![
+            reclaiming("unknown", None),
+            reclaiming("small", Some(1024)),
+            reclaiming("big", Some(8192)),
+        ];
+
+        sort(&mut entries, Order::Cleanable, true);
+        assert_eq!(names(&entries), ["big", "small", "unknown"]);
+
+        sort(&mut entries, Order::Cleanable, false);
+        assert_eq!(names(&entries), ["small", "big", "unknown"]);
+    }
+
+    /// Nothing measured at all is the state a directory is in the moment it
+    /// opens. Falling back silently would leave "by clean" showing name order
+    /// with no way to tell.
+    #[test]
+    fn nothing_measured_falls_back_and_says_so() {
+        let mut entries = vec![reclaiming("b", None), reclaiming("a", None)];
+
+        let applied = sort(&mut entries, Order::Cleanable, false);
+
+        assert_eq!(applied.order, Order::Name);
+        assert!(applied.fell_back);
+        assert_eq!(names(&entries), ["a", "b"]);
+    }
+
+    /// One figure is enough to sort by: the rest go to the end, which is where
+    /// unknown belongs.
+    #[test]
+    fn one_measured_row_is_enough() {
+        let mut entries = vec![reclaiming("a", None), reclaiming("b", Some(4096))];
+
+        let applied = sort(&mut entries, Order::Cleanable, true);
+
+        assert!(!applied.fell_back);
+        assert_eq!(names(&entries), ["b", "a"]);
     }
 }

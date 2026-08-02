@@ -10,20 +10,20 @@
 //! key dispatch.
 
 mod app;
-mod edit;
 mod layout;
 mod listing;
 mod measure;
+mod removal;
 mod sort;
 mod term;
 
 use crate::args::Reload;
+use crate::render::tree::format_size;
 use app::App;
 use disk_tools_core::{Rules, State};
-use edit::{Dialog, Field, Guide};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use sort::Order;
 use std::io::{self, IsTerminal};
 use std::path::Path;
@@ -52,6 +52,7 @@ pub fn run(root: &Path, rules: Rules, reload: Reload, now: SystemTime) -> io::Re
         // directory and the key line.
         app.set_page((terminal.size()?.height as usize).saturating_sub(4));
         app.absorb_sizes();
+        app.settle_removal();
         terminal.draw(|frame| draw(frame, &app, now))?;
 
         // A timeout rather than a blocking read: without one, a resize or a
@@ -82,10 +83,22 @@ pub fn run(root: &Path, rules: Rules, reload: Reload, now: SystemTime) -> io::Re
 /// Separated from the loop so the bindings are one readable table rather than
 /// something to reconstruct from a match buried in I/O.
 fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
-    // A dialog takes every key. Leaving the browser's bindings live underneath
-    // would make `q` quit from inside a half-typed rule.
-    if app.dialog().is_some() {
-        dialog(app, code, reload.path.as_deref());
+    // A removal takes every key while it is on screen. Leaving the browser's
+    // bindings live underneath would let `q` quit out of a half-typed
+    // confirmation, and `j` move the cursor off the row being asked about.
+    if app.removal().is_some() {
+        removing(app, code);
+        return true;
+    }
+
+    // Blocked: two keys, and both of them are ways out. Everything else would
+    // act on rules the tool no longer has.
+    if app.blocked().is_some() {
+        match code {
+            KeyCode::Char('q') => return false,
+            KeyCode::Char('R') => reread(app, reload),
+            _ => {}
+        }
         return true;
     }
 
@@ -110,9 +123,11 @@ fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.leave(),
 
         KeyCode::Char('/') => app.start_filtering(),
-        // The rule dialog: what does this program think of this path, and what
-        // would make it think otherwise.
-        KeyCode::Char('a') => app.open_rules(),
+        // Remove what the rules claim under this row. Capital, like `R`: the
+        // keys that do something out of the ordinary are the shifted ones, and
+        // `Backspace` — the obvious guess — already means "up one level", which
+        // is the last thing a destructive key should share a finger with.
+        KeyCode::Char('D') => app.begin_removal(),
         // The same key whether the filter is being typed or merely in force.
         KeyCode::Esc => app.filter_clear(),
 
@@ -125,6 +140,9 @@ fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
 
         KeyCode::Char('n') => app.sort_by(Order::Name),
         KeyCode::Char('s') => app.sort_by(Order::Size),
+        // `f` for what it frees: `c` is already creation time, and this is the
+        // order that matters while clearing space by hand — biggest win first.
+        KeyCode::Char('f') => app.sort_by(Order::Cleanable),
         KeyCode::Char('c') => app.sort_by(Order::Created),
         KeyCode::Char('m') => app.sort_by(Order::Modified),
 
@@ -133,31 +151,37 @@ fn handle(app: &mut App, code: KeyCode, reload: &Reload) -> bool {
     true
 }
 
-/// Keys while the rule dialog is open.
+/// One character key, for the tests that are about a binding rather than a
+/// state — the bindings live here, so pressing one has to happen here too.
+#[cfg(test)]
+pub(crate) fn press(app: &mut App, ch: char) {
+    removing(app, KeyCode::Char(ch));
+}
+
+/// Keys while a removal is on screen.
 ///
-/// `Esc` always closes without writing anything, at either step — a dialog you
-/// cannot leave by the obvious key is a dialog people learn to fear.
-fn dialog(app: &mut App, code: KeyCode, config: Option<&Path>) {
-    match app.dialog() {
-        Some(Dialog::Choosing(_)) => match code {
-            KeyCode::Esc => app.close_dialog(),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.open_form(),
-            KeyCode::Down | KeyCode::Char('j') => app.choose_down(),
-            KeyCode::Up | KeyCode::Char('k') => app.choose_up(),
+/// `Esc` always abandons it, at every stage — including while the plan is still
+/// being walked, where it costs nothing because nothing has happened yet.
+fn removing(app: &mut App, code: KeyCode) {
+    use removal::Removal;
+
+    match app.removal() {
+        // One question, one answer, whichever tier the plan holds. What the
+        // tier changes is what the modal says above this line.
+        Some(Removal::Asking { .. }) => match code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => app.confirm_removal(),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => app.dismiss_removal(),
             _ => {}
         },
-        Some(Dialog::Editing(_)) => match code {
-            KeyCode::Esc => app.close_dialog(),
-            KeyCode::Enter => app.confirm_form(config),
-            KeyCode::Tab | KeyCode::Down => app.form_next(),
-            KeyCode::BackTab | KeyCode::Up => app.form_previous(),
-            // The one key both choice fields answer to. Left and right because
-            // a two-valued field is not a list to scroll.
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => app.form_toggle(),
-            KeyCode::Backspace => app.form_pop(),
-            KeyCode::Char(ch) => app.form_push(ch),
-            _ => {}
-        },
+        // Under way: no key at all. Offering one would promise a stop that
+        // cannot be delivered once the batch is with the OS.
+        Some(Removal::Removing { .. }) => {}
+        // Planning, done, or nothing to do: one key out, and no key in.
+        Some(_) => {
+            if matches!(code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                app.dismiss_removal();
+            }
+        }
         None => {}
     }
 }
@@ -194,6 +218,21 @@ fn filtering(app: &mut App, code: KeyCode) {
 /// everything on this screen was about its contents and nothing was about it.
 /// `..` is the way out of here, not a description of here.
 fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
+    // A removal is drawn over everything, because everything under it is frozen
+    // and a screen that looked live would invite keys that go nowhere.
+    if let Some(pending) = app.blocked().is_none().then(|| app.removal()).flatten() {
+        draw_removal(frame, pending);
+        return;
+    }
+
+    // Blocked: the listing is not drawn at all. Leaving it under the message
+    // would leave a screenful of colours standing as an answer, and they are
+    // answers from rules the tool no longer has.
+    if let Some(why) = app.blocked() {
+        draw_blocked(frame, why);
+        return;
+    }
+
     // The legend costs a row, so it is only there when the colours it explains
     // are. A directory no rule reaches has nothing to explain.
     let legend_rows = u16::from(app.any_rule_applies());
@@ -259,125 +298,199 @@ fn draw(frame: &mut Frame<'_>, app: &App, now: SystemTime) {
     let mut state = ListState::default().with_selected(Some(app.cursor()));
     frame.render_stateful_widget(list, bands[3], &mut state);
 
-    frame.render_widget(
-        Paragraph::new(keys(app)).style(Style::default().add_modifier(Modifier::DIM)),
-        bands[5],
-    );
-
-    // Last, and over everything: a dialog that shared the screen with the
-    // listing would leave the user reading two things at once, one of which is
-    // no longer taking keys.
-    if let Some(dialog) = app.dialog() {
-        draw_dialog(frame, dialog);
-    }
+    frame.render_widget(Paragraph::new(hints(&keys(app))), bands[5]);
 }
 
-/// The rule dialog, centred over the listing.
-fn draw_dialog(frame: &mut Frame<'_>, dialog: &Dialog) {
-    let (title, lines) = match dialog {
-        Dialog::Choosing(chooser) => (
-            format!("rules for {}", chooser.name),
-            chooser
-                .rows()
-                .into_iter()
-                .enumerate()
-                .map(|(at, row)| marked(at == chooser.cursor(), row))
-                .collect::<Vec<Line<'static>>>(),
+/// A removal, at whatever stage it has reached.
+///
+/// The plan is shown **grouped by rule**, which is what `preview -d 0` prints
+/// about the same paths: the modal and the report must not be able to describe
+/// one plan differently.
+fn draw_removal(frame: &mut Frame<'_>, pending: &removal::Removal) {
+    use removal::Removal;
+
+    let bands = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(frame.area());
+
+    let (title, style) = match pending {
+        Removal::Asking { destroys: true, .. } => (
+            "This destroys files. There is no way back.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        Dialog::Editing(form) => {
-            let mut lines: Vec<Line<'static>> = Field::ALL
-                .iter()
-                .map(|field| {
-                    let mut line = marked(
-                        *field == form.focus(),
-                        format!("{:>19}  {}", field.label(), form.value(*field)),
-                    );
-                    if form.is_wrong(*field) {
-                        // Flagged in its own right, not only by the line below:
-                        // on a form this long, a sentence at the bottom is a
-                        // long way from the field it is about.
-                        line = line.patch_style(Style::default().fg(Color::Red));
-                    }
-                    line
+        Removal::Asking { .. } => (
+            "Remove what the rules claim here?",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Removal::Planning { .. } => ("Working out what would go…", Style::default()),
+        Removal::Removing { .. } => ("Removing…", Style::default().add_modifier(Modifier::BOLD)),
+        Removal::Done { .. } => ("Done.", Style::default().add_modifier(Modifier::BOLD)),
+        Removal::Nothing { .. } => ("Nothing here is claimed by any rule.", Style::default()),
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{title}\n{}", pending.path().display()))
+            .style(style)
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        bands[0],
+    );
+
+    let body: Vec<Line<'static>> = match pending {
+        Removal::Asking { plan, .. } => {
+            let mut lines: Vec<Line<'static>> = removal::shares(plan)
+                .into_iter()
+                .map(|share| {
+                    Line::from(format!(
+                        "  {:>8}  {:<16} {:>4} {}  {}",
+                        format_size(share.allocated),
+                        share.rule,
+                        share.count,
+                        if share.count == 1 { "item " } else { "items" },
+                        if share.purge {
+                            "destroyed"
+                        } else {
+                            "to the Trash"
+                        },
+                    ))
                 })
                 .collect();
-
-            lines.push(Line::from(""));
-            lines.push(match form.guide() {
-                Guide::Wrong(why) => {
-                    Line::styled(format!("  {why}"), Style::default().fg(Color::Red))
-                }
-                // What the value comes to, so `10M` can be seen to mean what was
-                // meant before Enter is pressed.
-                Guide::Reading(reading) => {
-                    Line::styled(format!("  = {reading}"), Style::default().fg(Color::Green))
-                }
-                // A field whose syntax is only in the README is a field that
-                // gets typed wrong.
-                Guide::Hint(hint) => Line::styled(
-                    format!("  {hint}"),
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-            });
-            lines.push(Line::styled(
-                if form.focus().is_choice() {
-                    "  space change  ↵ confirm  esc cancel"
-                } else {
-                    "  tab next  ↵ confirm  esc cancel"
-                },
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-
-            (
-                if form.is_edit() {
-                    format!("edit rule `{}`", form.value(Field::Name))
-                } else {
-                    "new rule".to_owned()
-                },
-                lines,
-            )
+            lines.push(Line::from(String::new()));
+            lines.push(Line::from(format!(
+                "  Frees {}",
+                format_size(plan.reclaimable)
+            )));
+            if !plan.excluded.is_empty() {
+                lines.push(Line::from(format!(
+                    "  {} refused and left alone",
+                    plan.excluded.len()
+                )));
+            }
+            lines
         }
+        Removal::Done { outcome, .. } => {
+            let mut lines = vec![Line::from(format!(
+                "  Removed {} of them, freeing {}.",
+                outcome.count(),
+                format_size(outcome.reclaimed())
+            ))];
+            if !outcome.trashed.paths.is_empty() {
+                lines.push(Line::from(format!(
+                    "  {} in the Trash, and can be put back.",
+                    outcome.trashed.paths.len()
+                )));
+            }
+            if !outcome.purged.paths.is_empty() {
+                lines.push(Line::from(format!(
+                    "  {} destroyed.",
+                    outcome.purged.paths.len()
+                )));
+            }
+            for failure in &outcome.failed {
+                lines.push(Line::from(format!(
+                    "  not removed: {} — {}",
+                    failure.path.display(),
+                    failure.reason
+                )));
+            }
+            lines
+        }
+        Removal::Planning { .. } => vec![Line::from(
+            "  Walking the tree and asking git about any repository in it.",
+        )],
+        // What each half can honestly report differs, and this says the true
+        // thing rather than the tidy one: `apply` names a trashed candidate
+        // **before** submitting the batch, so that count is what has been listed
+        // for the Trash, not what has left. Purging is per item, so there the
+        // figure is the real one.
+        Removal::Removing {
+            trashing,
+            purging,
+            listed,
+            destroyed,
+            latest,
+            ..
+        } => {
+            let mut lines = Vec::new();
+            if *trashing > 0 {
+                lines.push(Line::from(if listed < trashing {
+                    format!("  Listing for the Trash: {listed} of {trashing}")
+                } else {
+                    format!(
+                        "  Handing {trashing} to the Trash — one call, and it takes as long as it takes"
+                    )
+                }));
+            }
+            if *purging > 0 {
+                lines.push(Line::from(format!(
+                    "  Destroying: {destroyed} of {purging}"
+                )));
+            }
+            if let Some(path) = latest {
+                lines.push(Line::from(String::new()));
+                lines.push(Line::from(format!("  {}", path.display())));
+            }
+            lines
+        }
+        Removal::Nothing { .. } => vec![
+            Line::from(
+                "  Only what a rule claims can be removed from here — which is what keeps the",
+            ),
+            Line::from("  tiers and the denylist from being decoration on a file deleter."),
+        ],
     };
+    frame.render_widget(Paragraph::new(body), bands[1]);
 
-    let area = centred(frame.area(), 70, lines.len() as u16 + 2);
-    frame.render_widget(Clear, area);
+    let keys: Line<'static> = match pending {
+        // The same two keys either way. A plan that destroys says so in red at
+        // the top of the modal, which is where the difference belongs.
+        Removal::Asking { .. } => hints(&[("Y", "confirm"), ("N / Esc", "cancel")]),
+        Removal::Planning { .. } => hints(&[("Esc", "cancel")]),
+        // Nothing to offer: it is happening, and stopping half way through a
+        // batch the OS is already carrying out is not a thing this can promise.
+        Removal::Removing { .. } => Line::from(String::new()),
+        _ => hints(&[("Esc", "close")]),
+    };
+    frame.render_widget(Paragraph::new(keys), bands[2]);
+}
+
+/// The whole screen, given over to a config that cannot be read.
+///
+/// The error goes out **in full** — a parse error names a line and a column, and
+/// truncating it to fit a notice line would remove the only part worth having.
+fn draw_blocked(frame: &mut Frame<'_>, why: &str) {
+    let bands = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(frame.area());
+
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title)),
-        area,
+        Paragraph::new(
+            "The configuration could not be read, so nothing on screen would mean anything.",
+        )
+        .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .wrap(ratatui::widgets::Wrap { trim: false }),
+        bands[0],
     );
-}
-
-/// A row with a cursor marker, so the selection survives a terminal with no
-/// colour and a reader who is not looking for one.
-fn marked(focused: bool, text: String) -> Line<'static> {
-    let line = Line::from(format!("{} {text}", if focused { ">" } else { " " }));
-    if focused {
-        line.patch_style(Style::default().add_modifier(Modifier::BOLD))
-    } else {
-        line
-    }
-}
-
-/// A box of at most `width` x `height`, centred — and never larger than what it
-/// is centred in, since a dialog wider than the terminal shows its left edge and
-/// nothing else.
-fn centred(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
-        width,
-        height,
-    }
+    frame.render_widget(
+        Paragraph::new(why.to_owned()).wrap(ratatui::widgets::Wrap { trim: false }),
+        bands[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Fix the file, then press R. q leaves.")
+            .style(Style::default().add_modifier(Modifier::DIM)),
+        bands[2],
+    );
 }
 
 /// Read the config again and repaint against it.
 ///
-/// A bad file leaves the rules that were working in place and says why. Dropping
-/// them would mean a typo silently turns every colour off, which looks exactly
-/// like "my rules stopped matching" — the one thing the user is here to
-/// diagnose.
+/// A file that no longer parses **blocks** the browser rather than leaving a
+/// note under a screen still painted in the previous rules' colours. See
+/// [`App::block`] for why that reversed a v0.4 decision.
 fn reread(app: &mut App, reload: &Reload) {
     match crate::config::load(reload.path.as_deref(), &reload.user_dirs, None)
         .map_err(|err| err.to_string())
@@ -391,7 +504,7 @@ fn reread(app: &mut App, reload: &Reload) {
                 None => "reloaded the built-in rules".to_owned(),
             });
         }
-        Err(problem) => app.say(format!("config unchanged — {problem}")),
+        Err(problem) => app.block(problem),
     }
 }
 
@@ -431,12 +544,48 @@ fn legend() -> Vec<Span<'static>> {
 
 /// What the keys do — different while a filter is being typed, because most of
 /// them are then just letters.
-fn keys(app: &App) -> &'static str {
-    if app.is_filtering() {
-        "esc cancel  ↵ keep  ↑↓ move"
-    } else {
-        "q quit  ↵ enter  ← up  / filter  a rules  n/s/c/m sort  r sizes  R config"
+///
+/// Pairs rather than one string so the **key** can be drawn apart from what it
+/// does. A hint line dim all the way through is a line the eye skips, and this
+/// is the only place the bindings are ever written down.
+fn keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    if app.blocked().is_some() {
+        return vec![("R", "re-read the config"), ("q", "quit")];
     }
+    if app.is_filtering() {
+        vec![("esc", "cancel"), ("↵", "keep"), ("↑↓", "move")]
+    } else {
+        vec![
+            ("q", "quit"),
+            ("↵", "enter"),
+            ("←", "up"),
+            ("/", "filter"),
+            ("n/s/f/c/m", "sort"),
+            ("r", "sizes"),
+            ("R", "config"),
+            ("D", "remove"),
+        ]
+    }
+}
+
+/// The hint line: keys lit, labels quiet.
+fn hints(pairs: &[(&'static str, &'static str)]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(pairs.len() * 3);
+    for (key, what) in pairs {
+        if !spans.is_empty() {
+            // Two, not three: the bindings are the widest line on the screen,
+            // and a 78-column terminal clipped `D remove` off the end of it.
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(format!(" {what}")));
+    }
+    Line::from(spans)
 }
 
 /// The path, and anything that went wrong.
@@ -516,8 +665,9 @@ pub fn stdout_is_terminal() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disk_tools_core::UserDirs;
+    use disk_tools_core::{Part, Rule, UserDirs};
     use ratatui::backend::TestBackend;
+    use std::path::PathBuf;
 
     /// Draw into a fake terminal of a known size and read the text back.
     ///
@@ -540,11 +690,165 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             app.absorb_sizes();
+            app.settle_removal();
             if app.entries().iter().all(|entry| !entry.measuring) {
                 return paint(app, width, height);
             }
             assert!(std::time::Instant::now() < deadline, "sizes never settled");
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    // ---- a config that cannot be read ------------------------------------
+
+    /// A file with a genuine mistake in it, for the two tests below.
+    fn broken_config(home: &Path) -> PathBuf {
+        let path = home.join("config.yml");
+        std::fs::write(&path, "clean-rules:\n  - name: mine\n    tier: trash\n").expect("write");
+        path
+    }
+
+    fn reload_from(path: Option<PathBuf>) -> Reload {
+        Reload {
+            path,
+            user_dirs: UserDirs::default(),
+        }
+    }
+
+    /// The blocked screen, printed. Ignored for the same reason as `show`.
+    #[test]
+    #[ignore = "diagnostic: prints the screen, asserts nothing"]
+    fn show_blocked() {
+        let dir = fixture();
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let reload = reload_from(Some(broken_config(dir.path())));
+        reread(&mut app, &reload);
+        for line in paint(app, 78, 12) {
+            println!("|{line}");
+        }
+    }
+
+    /// The whole screen, because every colour on the previous one was a claim
+    /// about rules the tool no longer has.
+    #[test]
+    fn a_config_that_stops_parsing_blocks_the_browser() {
+        let dir = fixture();
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let reload = reload_from(Some(broken_config(dir.path())));
+
+        reread(&mut app, &reload);
+
+        assert!(app.blocked().is_some());
+        let lines = paint(app, 78, 12);
+        assert!(
+            lines.iter().any(|line| line.contains("could not be read")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("`parts` is required")),
+            "the error goes out in full, not summarised: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("press R")),
+            "and the way out is on screen: {lines:?}"
+        );
+    }
+
+    /// Two keys, and both of them are ways out.
+    #[test]
+    fn a_blocked_browser_takes_only_reload_and_quit() {
+        let dir = fixture();
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let reload = reload_from(Some(broken_config(dir.path())));
+        reread(&mut app, &reload);
+        let before = app.cursor();
+
+        for code in [
+            KeyCode::Down,
+            KeyCode::Char('j'),
+            KeyCode::Enter,
+            KeyCode::Char('/'),
+            KeyCode::Char('s'),
+            KeyCode::Char('r'),
+        ] {
+            assert!(handle(&mut app, code, &reload), "{code:?} must not quit");
+            assert_eq!(app.cursor(), before, "{code:?} moved something");
+            assert!(app.blocked().is_some(), "{code:?} left the blocked state");
+        }
+
+        assert!(
+            !handle(&mut app, KeyCode::Char('q'), &reload),
+            "q still leaves"
+        );
+    }
+
+    /// The only way out that is not the door: a file that parses.
+    #[test]
+    fn a_config_that_parses_again_unblocks_it() {
+        let dir = fixture();
+        let mut app =
+            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
+        let path = broken_config(dir.path());
+        let reload = reload_from(Some(path.clone()));
+        reread(&mut app, &reload);
+        assert!(app.blocked().is_some());
+
+        std::fs::write(
+            &path,
+            "clean-rules:\n  - name: mine\n    tier: trash\n    parts:\n      - root: \"*\"\n        includes: [\"**/node_modules/\"]\n",
+        )
+        .expect("write");
+        handle(&mut app, KeyCode::Char('R'), &reload);
+
+        assert!(app.blocked().is_none(), "the rules are readable again");
+        assert!(
+            app.any_rule_applies(),
+            "and in force: the listing is painted by them"
+        );
+    }
+
+    /// The destroying modal, printed. Ignored for the same reason as `show`.
+    #[test]
+    #[ignore = "diagnostic: prints the screen, asserts nothing"]
+    fn show_removal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 400_000])
+            .expect("write");
+
+        let rules = Rules::new(
+            vec![Rule {
+                name: "node-modules".into(),
+                tier: disk_tools_core::Tier::Purge,
+                parts: vec![Part {
+                    root: Some(root.to_string_lossy().into_owned()),
+                    includes: vec!["**/node_modules/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
+            }],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+
+        let mut app = App::open(root, rules, now(), UserDirs::default()).expect("open");
+        app.move_down();
+        app.begin_removal();
+        for _ in 0..200 {
+            app.settle_removal();
+            if !matches!(app.removal(), Some(removal::Removal::Planning { .. })) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for line in paint(app, 78, 12) {
+            println!("|{line}");
         }
     }
 
@@ -591,28 +895,6 @@ mod tests {
     #[ignore = "diagnostic: prints the screen, asserts nothing"]
     fn show() {
         for line in painted(Path::new("."), 76, 14) {
-            println!("|{line}");
-        }
-    }
-
-    /// The rule form, printed. Ignored for the same reason as `show`.
-    #[test]
-    #[ignore = "diagnostic: prints the screen, asserts nothing"]
-    fn show_form() {
-        let mut app =
-            App::open(Path::new("."), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at_first_directory(&mut app);
-        app.open_rules();
-        app.open_form();
-        // Something in a measured field, so the reading line has work to do.
-        for _ in 0..6 {
-            app.form_next();
-        }
-        for ch in "10M".chars() {
-            app.form_push(ch);
-        }
-
-        for line in paint(app, 76, 22) {
             println!("|{line}");
         }
     }
@@ -822,9 +1104,12 @@ mod tests {
         let rules = Rules::new(
             vec![disk_tools_core::Rule {
                 name: "junk".into(),
-                root: Some(dir.path().to_string_lossy().into_owned()),
-                includes: vec!["**/sub/".into()],
-                ..disk_tools_core::Rule::default()
+                parts: vec![Part {
+                    root: Some(dir.path().to_string_lossy().into_owned()),
+                    includes: vec!["**/sub/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
             }],
             &disk_tools_core::UserDirs::default(),
         )
@@ -856,88 +1141,6 @@ mod tests {
             !lines.iter().any(|line| line.contains("rules:")),
             "{lines:?}"
         );
-    }
-
-    /// The dialog is over the listing, not beside it: two things to read, one
-    /// of which is no longer taking keys, is worse than one.
-    #[test]
-    fn the_form_is_drawn_over_the_listing() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        // Opening lands on `..`, which is not a thing in this listing and so has
-        // no rule to write about it.
-        point_at_first_directory(&mut app);
-        app.open_rules();
-        app.open_form();
-
-        let lines = paint(app, 78, 20);
-
-        assert!(
-            lines.iter().any(|line| line.contains("new rule")),
-            "{lines:?}"
-        );
-        for label in ["name", "root", "includes", "tier", "enabled"] {
-            assert!(
-                lines.iter().any(|line| line.contains(label)),
-                "{label} missing from {lines:?}"
-            );
-        }
-        assert!(
-            lines.iter().any(|line| line.contains("esc cancel")),
-            "and the way out is on screen: {lines:?}"
-        );
-    }
-
-    /// A flagged field says so where the field is. On a nine-field form a
-    /// sentence at the bottom is a long way from what it is about.
-    #[test]
-    fn a_rejected_field_is_marked_and_explained() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at_first_directory(&mut app);
-        app.open_rules();
-        app.open_form();
-        for _ in 0..20 {
-            app.form_pop();
-        }
-        app.confirm_form(None);
-
-        let lines = paint(app, 78, 20);
-
-        assert!(
-            lines.iter().any(|line| line.contains("needs a name")),
-            "{lines:?}"
-        );
-    }
-
-    /// A terminal smaller than the dialog shows its left edge and nothing else,
-    /// unless the dialog is clamped.
-    #[test]
-    fn a_dialog_larger_than_the_terminal_does_not_overflow_it() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        // Opening lands on `..`, which is not a thing in this listing and so has
-        // no rule to write about it.
-        point_at_first_directory(&mut app);
-        app.open_rules();
-        app.open_form();
-
-        let lines = paint(app, 20, 6);
-
-        assert_eq!(lines.len(), 6);
-        assert!(lines.iter().all(|line| line.chars().count() <= 20));
-    }
-
-    fn point_at_first_directory(app: &mut App) {
-        while app
-            .selected()
-            .is_some_and(|entry| !entry.is_dir || entry.name == "..")
-        {
-            app.move_down();
-        }
     }
 
     #[test]

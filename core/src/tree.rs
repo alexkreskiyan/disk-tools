@@ -51,7 +51,7 @@ pub struct ScanNode {
 /// The cost is sub-second precision, which nothing here wants: the age rule this
 /// field exists for works in days.
 #[cfg(feature = "serde")]
-mod unix_seconds {
+pub(crate) mod unix_seconds {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

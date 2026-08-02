@@ -349,7 +349,7 @@ struct Row {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::{Rule, UserDirs};
+    use crate::rules::{Part, Rule, UserDirs};
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
@@ -723,7 +723,10 @@ mod tests {
         let rules = Rules::new(
             vec![Rule {
                 name: "node-modules".into(),
-                includes: vec!["**/node_modules/".into()],
+                parts: vec![Part {
+                    includes: vec!["**/node_modules/".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             }],
             &UserDirs::default(),
@@ -823,7 +826,10 @@ mod tests {
         let rules = Rules::new(
             vec![Rule {
                 name: "pycache".into(),
-                includes: vec!["**/*.pyc".into()],
+                parts: vec![Part {
+                    includes: vec!["**/*.pyc".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             }],
             &UserDirs::default(),

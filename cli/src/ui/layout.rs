@@ -16,6 +16,7 @@
 
 use super::listing::Entry;
 use super::sort::Order;
+use crate::render::age;
 use crate::render::tree::{fit, format_size};
 use std::time::SystemTime;
 use unicode_width::UnicodeWidthStr;
@@ -130,16 +131,12 @@ pub fn header(cols: &Columns, order: Order, reverse: bool) -> String {
             if order == column { arrow } else { ' ' }
         )
     };
-    // A column with no key that sorts it reserves the slot too, so its label
-    // ends where the others do rather than one place to the right.
-    let unsorted = |label: &str| format!("{label} ");
-
     let mut parts = Vec::new();
     if cols.size {
         parts.push(format!("{:>SIZE$}", mark(Order::Size)));
     }
     if cols.clean {
-        parts.push(format!("{:>CLEAN$}", unsorted("clean")));
+        parts.push(format!("{:>CLEAN$}", mark(Order::Cleanable)));
     }
     parts.push(fit(&mark(Order::Name), cols.name));
     if cols.created {
@@ -245,33 +242,6 @@ fn spinner(now: SystemTime) -> char {
         .map(|since| since.as_millis())
         .unwrap_or(0);
     FRAMES[(millis / 100) as usize % FRAMES.len()]
-}
-
-/// How long ago, in one unit and at most four columns.
-///
-/// A timestamp in the future is a clock that disagrees with the filesystem's,
-/// not a fact about the file — "now" is the honest reading of it, and a negative
-/// age would be worse.
-fn age(now: SystemTime, then: Option<SystemTime>) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
-
-    let Some(then) = then else {
-        return String::new();
-    };
-    let Ok(elapsed) = now.duration_since(then) else {
-        return "now".to_owned();
-    };
-
-    match elapsed.as_secs() {
-        secs if secs < MINUTE => "now".to_owned(),
-        secs if secs < HOUR => format!("{}m", secs / MINUTE),
-        secs if secs < DAY => format!("{}h", secs / HOUR),
-        secs if secs < 30 * DAY => format!("{}d", secs / DAY),
-        secs if secs < 365 * DAY => format!("{}mo", secs / (30 * DAY)),
-        secs => format!("{}y", secs / (365 * DAY)),
-    }
 }
 
 #[cfg(test)]
@@ -648,6 +618,21 @@ mod tests {
             spinner(now()),
             spinner(now() + Duration::from_secs(1)),
             "and it comes round"
+        );
+    }
+
+    /// The `clean` column sorts now, so it takes the arrow like the others —
+    /// and the width was already reserved for it, which is why nothing shifts.
+    #[test]
+    fn the_clean_column_can_carry_the_arrow() {
+        let cols = columns(120);
+        let line = header(&cols, Order::Cleanable, true);
+
+        assert!(line.contains("clean↓"), "{line}");
+        assert_eq!(
+            line.len(),
+            header(&cols, Order::Name, false).len(),
+            "and every separator stays where it was"
         );
     }
 }

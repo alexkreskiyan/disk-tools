@@ -4,7 +4,7 @@ Find what's eating your disk. `disk-tools` walks a directory tree in parallel,
 measures **real on-disk (allocated) size**, and prints a size-sorted tree of the
 biggest consumers — or JSON.
 
-**v0.5 — scan, preview, clean, a config file, and a browser.**
+**v0.7 — scan, preview, clean, duplicates, rules made of parts, and a browser.**
 Two verbs, not one flag: **`disk-tools preview` shows what would go and changes
 nothing; `disk-tools clean` removes it**, to the OS trash, immediately. They take
 an identical flag set, because the way a preview is acted on is to retype the
@@ -12,6 +12,19 @@ same line with the other verb.
 
 `clean` still refuses while anything in the plan is not regenerable — that is the
 guard that mattered, and it stayed when `--apply` went.
+
+**`--dup` searches by content instead of by rule.** Same two verbs, same
+removal, same refusal: `preview --dup <PATH>` finds files whose bytes are
+identical, groups them, and says which copy stays.
+
+**A rule is a name, a consequence and a list of parts** — satisfying any part
+satisfies the rule. That is what lets one rule say "a `bin/` beside a `*.csproj`
+**or** beside a `*.fsproj`", which three independent lists could not. Duplicates
+have their own rules on the same shape, where the parts pool instead of matching.
+
+**`--explain` says what a command would do and does nothing else** — the file it
+read, the rules in force, the ones dropped and why, where each value came from,
+and whether the run would stop.
 
 What counts as junk is not fixed. Detection is a list of rules you can read and
 edit — `disk-tools config init` writes the defaults out with their comments —
@@ -25,7 +38,9 @@ full vision and the specs for the
 the [cleanup engine](kb/specs/2026.07/2026.07.25-disk-tools-v0.2-detectors-cleanup.md),
 [configuration](kb/specs/2026.07/2026.07.26-disk-tools-v0.3-config-rules.md),
 the [browser](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
-and [preview + clean](kb/specs/2026.07/2026.07.29-disk-tools-v0.5-preview-clean.md).
+[preview + clean](kb/specs/2026.07/2026.07.29-disk-tools-v0.5-preview-clean.md)
+[duplicates](kb/specs/2026.07/2026.07.30-disk-tools-v0.6-duplicates.md)
+and [rules made of parts](kb/specs/2026.07/2026.07.30-disk-tools-v0.7-duplicate-rules.md).
 
 Cross-platform: macOS, Linux, Windows.
 
@@ -149,7 +164,7 @@ directory you are in.
        ⠹ │          │ current/     │      30d │        2h │
     4.0K │          │ README.md    │      30d │        2h │
 rules: included  excluded  in scope  untracked
-q quit  ↵ enter  ← up  / filter  a rules  n/s/c/m sort  r sizes  R config
+q quit  ↵ enter  ← up  / filter  n/s/f/c/m sort  r sizes  R config  D remove
 ```
 
 The row under the labels is **the directory you are in**, in the same columns as
@@ -190,11 +205,11 @@ meant to stop.
 | `PgUp` `PgDn`, `Home` `End` | A screenful, or the whole way |
 | `↵`, `l`, `→` | Enter the directory. On a file, nothing |
 | `←`, `h`, `Backspace` | Up one level, landing on the directory you left |
-| `n` `s` `c` `m` | Sort by name, size, created, modified — one press from anywhere. The same key again reverses |
+| `n` `s` `f` `c` `m` | Sort by name, size, **what would be freed**, created, modified — one press from anywhere. The same key again reverses |
 | `/` | Filter this listing. Letters narrow it as you type, `↵` keeps it, `Esc` drops it |
-| `a` | The rules for the row under the cursor: add one, or edit one that exists |
 | `r` | Measure this directory's subdirectories again |
-| `R` | Read `config.toml` again |
+| `R` | Read `config.yml` again |
+| `D` | Remove what the rules claim under this row — see below |
 | `q` | Leave |
 
 The parent row (`..`) is an ordinary entry, so `↵` on it goes up. It is never
@@ -256,53 +271,80 @@ deliberately not consulted: `requires-clean-repo` costs a `git status` per
 repository, and it is a question about whether `clean` will *act*, not about
 whether a rule claims the path.
 
-### Editing rules
-
-`a` on a row lists the rules with *new* at the top, and opens a form on whichever
-you pick. A new rule arrives rooted where you are and matching what you marked,
-with `~` used where it applies — a rule rooted at `/Users/you/Projects` stops
-working the moment the config is used anywhere else.
-
-Every field of a rule is editable. `min-size` and `older-than` are read back as
-you type (`10M` → `= 10485760 bytes`); the rest is checked on `↵`, because a
-name is only a duplicate against the rules around it. A rejected form **stays
-open with the field marked and everything you typed intact**.
-
-`Esc` closes without writing. `↵` writes.
-
-### The browser writes your config file
-
-This is the part to know before you hand-edit `config.toml`.
-
-- **Comments survive.** The file is edited in place with `toml_edit`, not
-  regenerated: comments, spacing and key order are kept, including the trailing
-  comment on the line being changed. Editing one rule does not touch its
-  neighbours.
-- **Keys that fall back to a default are removed.** A rule that no longer needs
-  `requires-sibling` loses the key rather than keeping a stale one. `tier` is
-  the exception and is always written out — it decides whether `clean` takes
-  something without asking, and whether it can be brought back afterwards. A
-  setting that consequential should not be invisible.
-- **Adding the first rule to a file with no `[[rules]]` writes the built-ins out
-  too.** An absent `[[rules]]` means "leave the built-ins alone", so appending
-  one table would silently turn five rules into one. The browser says when it
-  has done this. (`rules = []` is the opposite statement and is left alone.)
-- **The write is atomic** — a neighbouring file and a rename — so an interrupted
-  save cannot leave a truncated config that the next run refuses to start on.
-- **The file is written before the screen recolours.** A save that fails leaves
-  the form open with the reason in it, rather than showing you a rule that is
-  not on disk.
-
-`R` re-reads the file, so an edit made in `$EDITOR` shows up without restarting.
-A file that has become invalid leaves the rules already in force alone and says
-why — dropping them would make a typo look exactly like "my rules stopped
-matching", which is the thing you would be there to diagnose.
-
 ### What it will not do
 
 `ui` needs a terminal and refuses a pipe with a sentence rather than escape
 sequences; use `scan` or `preview` for something you can redirect. It never
-deletes: removal is `clean`'s, with its tiers, its refusal and its denylist.
+deletes on its own account: `D` runs `clean`'s plan, with its tiers, its
+refusals and its denylist, and asks before any of it happens.
+
+### Removing from the browser
+
+`D` cleans what the rules claim under the row the cursor is on — the same plan
+`clean <that path>` would make, from the screen that already shows you which
+rows are junk and how much of each is reclaimable.
+
+Three things keep it a keystroke rather than a hazard.
+
+**It only removes what a rule already claims.** On a row nothing claims it says
+so and stops. Anything else would make the browser a general file deleter and
+the tiers and the denylist decoration on it.
+
+**It always asks**, and what changes with the tier is the price of a mistake,
+not whether you are asked. On the command line the confirmation is the verb —
+you type `clean` yourself, and that is the moment of intent. A keypress has no
+such moment, so the modal supplies one:
+
+```console
+This destroys files. There is no way back.
+/Users/you/Projects/thing
+    2.4G  rust-target     3 items  destroyed
+  392.0K  node-modules    1 item   to the Trash
+
+  Frees 2.4G
+
+  Y confirm  N / Esc cancel
+```
+
+One question, two answers, whichever tier the plan holds: `Y` confirms, `N` or
+`Esc` cancels. A plan with **anything** destroying in it
+What the tier changes is what the modal **says**: a plan holding anything
+destroying announces itself in red and names every share as destroyed, because a
+subtree usually holds both and the heading is the only place that difference can
+be seen before it happens.
+
+**It plans and removes on a worker.** Walking a tree and asking git about every
+repository in it takes seconds, and handing a batch to the OS trash is a
+round-trip to Finder on macOS; doing either on the UI thread would freeze the one
+screen whose point is that it does not. `Esc` abandons a plan still being walked,
+and costs nothing, because nothing has happened.
+
+While it runs, the modal says what is honestly known — which differs between the
+two halves. Destroying is per item, so the count is real. Trashing is **one call
+at the end**, so what is counted before it is what has been *listed*:
+
+```console
+Removing…
+/Users/you/Projects/thing
+  Handing 4 to the Trash — one call, and it takes as long as it takes
+  Destroying: 2 of 3
+
+  /Users/you/Projects/thing/target
+```
+
+There is no key offered while it runs: stopping half way through a batch the OS
+is already carrying out is not something this could promise.
+
+`Backspace` is deliberately *not* the key: it means "up one level" today, and a
+destructive action must not share a finger with a navigation habit.
+
+**It no longer edits rules either.** The browser used to compose a rule and write
+it back into the config with every comment intact; that rested on `toml_edit`,
+and the configuration is YAML now. The one lossless YAML editor available
+produces wrong indentation on exactly the operation this needed — appending a
+mapping to a sequence — and a config editor that can corrupt a config is worse
+than no config editor. `R` still re-reads the file, so the loop is: edit in your
+editor, press `R`, see the colours change.
 
 ## Cleaning up
 
@@ -521,12 +563,13 @@ single command regenerates makes it a chore rather than a safety net.
 
 Two ways past it. **Per rule**, which is the one to reach for:
 
-```toml
-[[rules]]
-name     = "node-modules"
-root     = "~/Projects"
-includes = ["**/node_modules/"]
-tier     = "purge"          # regenerated by one command; the trash adds nothing
+```yaml
+clean-rules:
+  - name: node-modules
+    tier: purge            # regenerated by one command; the trash adds nothing
+    parts:
+      - root: "~/Projects"
+        includes: ["**/node_modules/"]
 ```
 
 **Or for one run**, over everything in the plan:
@@ -572,20 +615,147 @@ with anything outside the scanned tree is invisible. Sharing *within* the scan i
 detected on both platforms. Do not compare a Windows figure with a Unix one and
 conclude anything.
 
+## Duplicates
+
+`--dup` changes what a candidate **is**: not what a rule claims, but a file whose
+contents are byte-for-byte identical to another's. Everything else is the same —
+the same two verbs, the same denylist, the same refusal.
+
+```console
+$ disk-tools preview --dup ~/Downloads
+Each group keeps one copy. The size is what removing the others frees.
+
+   60.8M  ×3  keeps /Users/me/Downloads/IMG_1826.MOV
+   57.5M  ×3  keeps /Users/me/Downloads/IMG_1829.MOV
+   23.9M  ×4  keeps /Users/me/Downloads/IMG20250831181435.jpg
+
+Reclaimable: 1.6G — 288 copies in 247 groups.
+
+Preview — nothing was removed. The same line with `clean` removes it.
+```
+
+`-d 1` names every path and why the keeper is the keeper:
+
+```console
+$ disk-tools preview --dup -d 1 ~/Downloads
+   60.8M  ×3  30.4M each
+  keep    /Users/me/Downloads/IMG_1826.MOV   (created 4mo)
+  remove  /Users/me/Downloads/ChatExport_2026-04-05/files/IMG_1826.MOV
+  remove  /Users/me/Downloads/ChatExport_2026-06-03/files/IMG_1826.MOV
+```
+
+**With no path, your `duplicate-rules:` say where to look** — exactly as the
+clean rules do for an ordinary run. The shipped rule is unrooted, so a bare
+`preview --dup` has nowhere to go and says which list to edit.
+
+### Which copy stays
+
+One per group, chosen by `--keep`:
+
+| Value | Keeps |
+|---|---|
+| `oldest-created` | the copy that existed first. **Default** |
+| `newest-created` | the most recently made copy |
+| `oldest-modified` | the earliest modification time |
+| `newest-modified` | the latest |
+| `first` | the first path in byte order. Reads no metadata, so it can never degrade |
+
+Creation time is the default because it is the one that survives copying: a copy
+is a new inode with a new creation time, while `cp -p`, `rsync` and unpacking an
+archive all carry the *modification* time of the original onto the copy. Sorting
+by path was tried and rejected on live data — it keeps `IMG (1).jpg` over
+`IMG.jpg`.
+
+`--keep-in <PATH>` beats `--keep` outright, and can be repeated:
+
+```console
+$ disk-tools preview --dup --keep-in ~/Photos ~/Downloads
+```
+
+The first of those roots that any copy in a group lies under wins, and `--keep`
+then chooses among the copies inside it. **It is not a promise that nothing under
+that root is removed**: a group keeps exactly one copy, so three copies inside
+`~/Photos` still lose two.
+
+### Where a date is missing
+
+`created()` is not recorded by every filesystem — Linux without `statx` birth
+times has none at all. The rules **degrade rather than mislead**:
+
+- a copy whose date the platform did not record never wins;
+- a group where *no* copy has the date asked for falls back to the other date,
+  and then to the path;
+- every such group is marked `(*)`, and the report says how many there were.
+
+So a run under `--keep oldest-created` on a filesystem without creation times
+still produces a plan, and still says that it is not the plan you asked for.
+
+### What is not searched
+
+- **Files below `--min-size`, which defaults to 1 MiB here** (it is 0 for a
+  rule-based run). This is the flag that decides how much is *read*: below it a
+  file is never opened. Dropping it to `0` on one real `~/Downloads` cost 5.6×
+  the hashing to find 5% more space — see the
+  [measurements](kb/benchmarks/2026.07/2026.07.30-duplicate-cost.md).
+- **Anything inside a directory your clean rules claim.** A `node_modules` is a
+  duplicate farm, and removing one file out of one breaks a tree that should have
+  gone wholesale. There is no flag to turn this off.
+- **Anything no duplicate rule matches**, and anything a matching rule excludes —
+  `.git` by default. See [Where duplicates are looked for](#where-duplicates-are-looked-for).
+- **Hardlinks to each other.** Two names for one inode free nothing when one goes,
+  so they are not duplicates. A separate file with the same contents still is.
+- **Symlinks, empty files**, and anything that changed size between the scan and
+  the hash.
+
+`--older-than` is refused here rather than accepted. It works by adding a rule,
+and rules only prune under `--dup` — so it would have meant *exclude everything
+older than this from the search*, which is the opposite of what it says
+everywhere else.
+
+### How it decides two files are identical
+
+Files are bucketed by size — a unique size is proof of unique content, and it
+costs nothing, since the scan already measured it. Buckets with more than one
+member get an xxh3-128 of their first 16 KiB, and whatever still collides gets a
+**blake3 hash of the whole file**. There is no byte-for-byte pass after that: a
+collision in a 256-bit cryptographic digest is not a thing that happens, and
+doubling every read to defend against it would be a real cost against an
+unreachable one.
+
+A file that cannot be read drops out of its group **and is reported**. If that
+leaves fewer than two members, the group disappears: a copy is never offered for
+removal against content the tool could not read.
+
+### Removing them
+
+Every duplicate is `confirm`-tier, always — the copy that stays is a judgement
+call, and no rule can make it for you. So:
+
+```console
+$ disk-tools clean --dup ~/Downloads
+…
+288 candidates are not regenerable, and nothing was removed.
+Add --safe to take only the regenerable ones, or --yes to take all of them.
+```
+
+`--yes` is what takes them, and `--safe --dup` plans nothing at all, which is
+correct: `--safe` means *only what needs no confirmation*, and a duplicate never
+qualifies.
+
 ## Configuration
 
 `disk-tools` reads one file. Write the defaults out and edit them:
 
 ```console
 $ disk-tools config init
-/Users/you/.config/disk-tools/config.toml
+/Users/you/.config/disk-tools/config.yml
 ```
 
-It refuses to overwrite an existing file without `--force`, and the path it
-prints is the one it read: `$XDG_CONFIG_HOME/disk-tools/config.toml` when that is
+It refuses to overwrite an existing file without `-f` / `--force`, and the path it
+prints is the one it read: `$XDG_CONFIG_HOME/disk-tools/config.yml` when that is
 set — on **every** platform, since exporting it is you saying where your
-configuration lives — otherwise `%APPDATA%\disk-tools\config.toml` on Windows and
-`~/.config/disk-tools/config.toml` elsewhere. `--config <PATH>` overrides all of
+configuration lives — otherwise `%APPDATA%\disk-tools\config.yml` on Windows and
+`~/.config/disk-tools/config.yml` elsewhere. `--config <PATH>` overrides all of
 it.
 
 **No config file is an ordinary state**: the built-in rules apply and nothing is
@@ -593,52 +763,117 @@ reported. A `--config` path that is *not there* is an error, because that is a
 typo and defaults quietly substituted for it would leave you cleaning under rules
 you never wrote.
 
-### A rule
+> **Two spellings changed in v0.7, and both are refused by name rather than
+> ignored.** `rules:` is now `clean-rules:`, and a rule is a list of `parts:`;
+> `requires-sibling` is now `requires`. An unfamiliar key here is a *warning*, so
+> a stale file would otherwise stop applying without a word while `clean` ran on
+> the built-in rules — which is the one outcome worth stopping for.
+>
+> **The file was TOML until v0.6.** A `config.toml` sitting where `config.yml`
+> should be is refused the same way.
 
-```toml
-[[rules]]
-name                = "github-node-modules"
-root                = "~/Projects/github"   # "*" means wherever the scan goes
-includes            = ["**/node_modules/"]  # trailing / is directory-only
-excludes            = ["**/vendor/**"]
-requires-sibling    = "*.csproj"            # a glob that must match a file beside it
-requires-clean-repo = true                  # skip if the repo has uncommitted work
-older-than          = "90d"
-min-size            = "10M"
-tier                = "confirm"             # unstated means confirm
-enabled             = true
+The examples below are lifted from what `config init` writes; the comments in
+that file are the documentation, and this section is the short version.
+
+### A rule is a list of parts
+
+```yaml
+clean-rules:
+  - name: dotnet-output          # what the report calls it
+    tier: purge                  # what happens to what it claims
+    parts:
+      - root: "~/Projects"       # "*" means wherever the scan goes
+        includes: ["**/bin/", "**/obj/"]
+        requires: ["*.csproj"]
+      - root: "~/work"
+        includes: ["**/bin/"]
+        requires: ["*.fsproj"]
+        older-than: 90d
 ```
 
-`root` is required, and answers "what do I clean when no path is named". Use
-`"*"` for a rule that applies wherever the scan goes — which is what three of the
-five built-ins say.
+**A node is claimed when it satisfies any one part.** The rule carries its
+identity and its consequence; a part carries everything that decides whether an
+object qualifies — `root`, `includes`, `excludes`, `requires`,
+`requires-clean-repo`, `older-than`, `min-size`.
 
-A trailing `/` in `includes` means **directory only**, as in gitignore. That is
-why `**/*.pyc` matches files and `**/node_modules/` does not match a file of that
-name.
+That split is what the shape is for. `requires` is matched **all**, so one part
+listing both `*.csproj` and `*.fsproj` demands *both* beside the node. Two parts
+ask two questions, and either answer claims it — under one name, one tier and one
+row in the report.
 
-`requires-sibling` is matched against the **file names beside** a match, and is
-a **glob** rather than a name: outside Cargo, build systems name their marker
-after the project, so the file that proves a `bin/` is .NET output is
-`Whatever.csproj`. Give a list and each pattern has to find something of its own
-— `["*.csproj", "*.sln"]` wants both. A pattern with no metacharacters matches
-itself, so `Cargo.toml` still means exactly that, and `NotCargo.toml` is not it.
+There is no shorter spelling. Two ways to write one thing would have to be
+answered for in every example, every error message and every field added later;
+two lines per rule is the cheaper side of that.
 
-```toml
-[[rules]]
-name             = "csharp-bin"
-root             = "~/Projects"
-includes         = ["**/bin/", "**/obj/"]
-requires-sibling = "*.csproj"
-tier             = "trash"
-```
+| In a part | |
+|---|---|
+| `root` | required. `"*"` means wherever the scan goes. `~`, `%LOCALAPPDATA%` and `%APPDATA%` expand from your environment — and **a token that cannot be resolved drops that part**, never widens it |
+| `includes` | globs relative to `root`. A trailing `/` means **directory only**, as in gitignore: `**/*.pyc` matches files, `**/node_modules/` does not match a file of that name. **`*` stops at a separator, `**` crosses one** — `*/` is the direct children of `root`, `**/` is everything under it |
+| `excludes` | matched by `includes`, but left alone |
+| `requires` | paths relative to the directory holding the match, each of which must find something. `Cargo.toml` is the file beside it; `src/main.rs` descends from there. Globs, because build systems name their marker after the project. Matched **all** |
+| `requires-clean-repo` | skip a match whose repository has uncommitted work |
+| `older-than`, `min-size` | this part only, so "old `bin/`, any `obj/`" is sayable |
 
-`~`, `%LOCALAPPDATA%` and `%APPDATA%` are expanded from your environment. **A
-token that cannot be resolved disables its rule** rather than widening it — an
-unknown home is never treated as "any home".
+**No pattern may leave its root.** `..` is refused wherever it appears — it is
+the only way a pattern could escape, and every way it could is a mistake that
+would otherwise be silent: the glob simply never matches and the part stops
+claiming anything.
 
-`min-size` on a rule narrows the plan just as `--min-size` does, and the report
+`min-size` on a part narrows the plan just as `--min-size` does, and the report
 says which of the two applied. They are different things to go and change.
+
+### Where duplicates are looked for
+
+`duplicate-rules:` has the same parts, and they mean something else:
+
+```yaml
+duplicate-rules:
+  - name: photos-and-their-copies
+    keep-in: ["~/Photos"]
+    parts:
+      - root: "~/Photos"
+        includes: ["**"]
+      - root: "~/Downloads"
+        includes: ["**"]
+```
+
+| | a part contributes |
+|---|---|
+| a **clean** rule | matchers. Anything satisfying any part is claimed, independently |
+| a **duplicate** rule | a population. Everything satisfying any part is **pooled**, and copies are compared *within that pool* |
+
+So adding a part to a clean rule adds candidates; adding one here can **create
+groups that did not exist**, because two populations can now pair. The example
+above is exactly that: a photo in the library and its copy in the downloads are
+comparable only because one rule covers both.
+
+**A file belongs to one pool: the first rule, in list order, whose parts match
+it.** Overlapping pools are not an ambiguity but a corrupt plan — one would name
+a file its keeper while another listed it for removal. The cost is that two
+*separate* rules never compare their files with each other, so the report always
+says what it searched:
+
+```console
+Searched 2 pools of 4120 files, and copies are only ever compared within one:
+  photos  4000 files
+  scans    120 files
+```
+
+A duplicate rule also carries `keep` and `keep-in` — per area, which is what
+made the flags worth having — and a `tier` that may be `trash` or `confirm`.
+**`purge` is refused here**: for a clean rule it means "one command regenerates
+this", and nothing regenerates a copy. The other copy is the only thing that
+makes removal safe, and the trash is the only way back from a keeper chosen
+wrongly. The `--purge` flag still applies — typed by hand, like `--yes`.
+
+The shipped rule searches everywhere except `.git`. Git LFS stores its objects
+**verbatim**, so every tracked file pairs with its own object; neither side may
+go, and the exclusion is data rather than a hardcoded skip so you can see and
+edit it.
+
+> **A rooted pool is worth more than any tuning.** Narrowing a search of
+> `~/Projects` to one subdirectory took it from 49.8 GiB read in 13.6 s to
+> 125 MiB in 0.38 s. [Measured.](kb/benchmarks/2026.08/2026.08.01-duplicate-rules-cost.md)
 
 ### Running with no path
 
@@ -676,7 +911,7 @@ Pass a path, or give a rule a `root` other than "*".
 
 One limitation worth knowing: a true/false setting turned **on** in the file
 cannot be turned back off from the command line, because a flag can only be
-passed or not passed. For `[clean] safe` that direction is the right one — the
+passed or not passed. For `clean.safe` that direction is the right one — the
 file may only make a cleanup more cautious.
 
 ## Flags
@@ -694,6 +929,7 @@ file may only make a cleanup more cautious.
 | `--json` | Emit JSON instead of the tree report | display |
 | `-v`, `--verbose` | List every skipped entry instead of just the first ten. **Global** — works with any verb | display |
 | `--config <PATH>` | Read this file instead of the one in your config directory. **Global** | — |
+| `--explain` | Say what this command would do — the file it read, the rules in force and the ones dropped and why, where it would look, where things would go, and whether it would stop — then exit **without walking, reading or removing anything**. **Global** | — |
 | `-h`, `--help` / `-V`, `--version` | Print help / version | — |
 
 `disk-tools preview [PATH]` and `disk-tools clean [PATH]` take **the same set** —
@@ -703,13 +939,16 @@ optional**; without it the roots of your configured rules are walked, see
 
 | Flag | Effect | Changes |
 |------|--------|---------|
+| `--dup` | Look for **duplicate files** instead of what the clean rules claim. Without a PATH it walks the roots of your `duplicate-rules:`. No config key — a file that switched what `clean` removes would do it invisibly | the plan |
+| `--keep <RULE>` | Which copy of a group stays: `first`, `oldest-created`, `newest-created`, `oldest-modified`, `newest-modified`. **Overrides every rule's own.** Requires `--dup` | the plan |
+| `--keep-in <PATH>` | Prefer to keep copies under this path; repeatable, earlier wins, beats `--keep`. Replaces a rule's own list rather than extending it. Requires `--dup` | the plan |
 | `--safe` | Drop everything that needs confirming. Keeps `purge` and `trash` — it is about confirmation, not about destinations | the plan |
-| `--min-size <SIZE>` | Ignore anything smaller. **Narrows the plan, not just the printout** — unlike `scan`'s flag of the same name, what is shown is what `clean` removes | the plan |
-| `--older-than <DURATION>` | Also offer anything untouched for this long: `90d`, `2w`, `6m`, `1y`. A bare number is rejected — `90` could mean seconds as easily as days. `m` is 30 days, `y` is 365 | the plan |
+| `--min-size <SIZE>` | Ignore anything smaller. **Narrows the plan, not just the printout** — unlike `scan`'s flag of the same name, what is shown is what `clean` removes. Defaults to 0, or to **1 MiB under `--dup`**, where it decides how much is read | the plan |
+| `--older-than <DURATION>` | Also offer anything untouched for this long: `90d`, `2w`, `6m`, `1y`. A bare number is rejected — `90` could mean seconds as easily as days. `m` is 30 days, `y` is 365. **Refused with `--dup`**, where it would mean the opposite: it works by adding a rule, and under `--dup` the rules only prune | the plan |
 | `--purge` | Send the **whole plan** past the trash. Nothing can be put back. Per rule this is `tier = "purge"`; neither cancels the confirmation | the plan |
 | `--yes` | Also remove what needs confirming. Without it `clean` refuses while any `confirm`-tier candidate remains, and exits 2 | the plan |
-| `-d`, `--depth <N>` | `0` groups by rule (default), `1` lists candidates, `2`+ unfolds inside them | the display |
-| `--sort <KEY>` | `name` (default) or `size`. Largest first, ties broken by path | the display |
+| `-d`, `--depth <N>` | `0` groups by rule (default), `1` lists candidates, `2`+ unfolds inside them. Under `--dup`: `0` is one line per group, `1`+ names every path, and there is nothing to unfold past that | the display |
+| `--sort <KEY>` | `name` or `size`. Largest first, ties broken by path. Defaults to `name`, and to **`size` under `--dup`**, where the list is hundreds of groups and only the top of it is a decision | the display |
 | `--json` | The whole plan (`preview`) or the whole outcome (`clean`). Ignores `-d` and `--sort` | the display |
 
 `preview` accepts every one of them and still changes nothing — including
@@ -777,6 +1016,14 @@ independent reruns have put it anywhere from 1.7× ahead to slightly behind. It
 accumulates one total and keeps nothing, where `disk-tools` builds the tree that the
 report, and the planned TUI, both need.
 
+**The duplicate search reads real bytes**, which nothing else here does. Bucketing
+by size keeps that off most of a tree — on one real `~/Downloads`, 61% of eligible
+files have a unique size and are never opened, and 9% of the eligible bytes are
+read. A cold run is bound by the disk at ~850 MiB/s rather than by blake3, which
+moves 3–4 GiB/s warm. A project tree is the adversarial case: 89% of files there
+share a size with something, and the funnel narrows almost nothing.
+[Measured.](kb/benchmarks/2026.07/2026.07.30-duplicate-cost.md)
+
 Cleanup adds one cost worth knowing: the git guard spawns `git status` once per
 repository, measured at **~23 ms each**, which dominates a `preview` over a tree of
 many projects — see [the note](kb/benchmarks/2026.07/2026.07.25-clean-latency.md).
@@ -809,8 +1056,11 @@ Cleanup, first — these are the ones worth reading before your first `clean`:
 | **Planning costs ~23 ms per repository** | The git guard spawns `git status --porcelain` once per repository. Over 50 dirty Rust projects a `preview` is 1.2 s against 15 ms for a plain scan — 80×. It runs only for rules that set `requires-clean-repo`. [Measured.](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) |
 | **`clean` refuses rather than prompting** | For the `confirm` tier it stops and asks you to add `--safe` or `--yes`, rather than asking about each path. A real prompt needs stdin, TTY detection and a story for piped input, which belongs with the interactive browser. See [The refusal](#the-refusal). |
 | **A bare `clean` removes** | It walks your rules' roots and takes what they claim. That is what the verb says, and it goes to the trash, but the shipped config roots `user-caches` at your home directory — so `preview` is the one to explore with. See [Running with no path](#running-with-no-path). |
-| **The browser writes your config file** | `a` then `↵` edits `config.toml` in place. Comments survive and neighbouring rules are untouched, but it is a program editing a file you may also be editing — `R` re-reads, and there is no merge. See [The browser writes your config file](#the-browser-writes-your-config-file). |
+| **The browser writes your config file** | `a` then `↵` edits `config.yml` in place. Comments survive and neighbouring rules are untouched, but it is a program editing a file you may also be editing — `R` re-reads, and there is no merge. See [The browser writes your config file](#the-browser-writes-your-config-file). |
 | **Row colours do not consult `requires-clean-repo`** | `included` means the rule's patterns and its cheap predicates match. Whether `clean` will actually act also depends on the git guard, which costs a `git status` per repository and is not run per row. A yellow row inside a dirty repository is still refused by `clean`, with a reason. |
+| **`--dup` does not compare bytes, it compares blake3 hashes** | Two files are called identical when a 256-bit cryptographic digest of each agrees. There is no final `memcmp`, which would double every read to defend against something that does not happen. |
+| **`--keep-in` does not protect a directory** | It decides which copy a group *keeps*, not which copies are safe. Three copies inside `~/Photos` still lose two. See [Which copy stays](#which-copy-stays). |
+| **A duplicate search can be slow and reads your files** | It is the only thing here bounded by disk throughput. `--min-size` is the control, and it defaults to 1 MiB for that reason. |
 | **A tier you wrote is unverified** | `trash` and `purge` both say "this regenerates", and the tool takes your word for it: it removes without asking, and `purge` without a way back. For the built-in rules that word is this project's; for yours it is yours. An unstated tier is `confirm`. See [Three tiers](#three-things-stand-between-a-match-and-a-deletion). |
 
 And the scanner's, unchanged from v0.1:

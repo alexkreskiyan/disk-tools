@@ -317,6 +317,7 @@ mod tests {
             rule: "node-modules".into(),
             tier: crate::Tier::Trash,
             purge: false,
+            duplicate_of: None,
             allocated,
             shared: false,
         }

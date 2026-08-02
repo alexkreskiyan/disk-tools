@@ -273,7 +273,7 @@ fn entry_for(
     })
 }
 
-fn skip_reason(err: &io::Error) -> SkipReason {
+pub(crate) fn skip_reason(err: &io::Error) -> SkipReason {
     match err.kind() {
         io::ErrorKind::PermissionDenied => SkipReason::PermissionDenied,
         io::ErrorKind::NotFound => SkipReason::NotFound,

@@ -193,6 +193,16 @@ smoke-trash:
     # which is the one outcome a smoke test must not be able to produce.
     cargo test -p disk-tools --test cli -- --ignored --nocapture
 
+# Read-only: the pipeline cannot remove anything and this prints what it found.
+# Until `--dup` lands on preview/clean, this is the only way to point the
+# duplicate pass at a real tree. `DT_DUP_MIN` sets the minimum size in bytes
+# (default 1 MiB).
+
+# Search DIR for duplicate files and print the biggest groups.
+bench-dup DIR:
+    DT_PHASE_PATH="{{DIR}}" cargo test --release -p disk-tools-core --lib \
+        -- --ignored --nocapture duplicates::diagnostics
+
 # Answers whether parallelising the per-directory loop is worth doing, or whether
 # the kernel serialises the metadata path anyway.
 

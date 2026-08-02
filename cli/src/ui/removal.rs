@@ -1,0 +1,450 @@
+//! Cleaning the row under the cursor, without leaving the browser.
+//!
+//! The browser is where you *see* what is disposable — it colours every row by
+//! what the rules say and shows how much of each is reclaimable. Leaving it to
+//! retype the same path into `clean` was the friction this removes.
+//!
+//! Three things make it safe enough to be a keystroke.
+//!
+//! **It only ever removes what the rules already claim.** The key acts on the
+//! plan for the subtree under the cursor, exactly as `clean <that path>` would.
+//! On a row no rule claims it does nothing and says so — otherwise the tiers and
+//! the denylist would be decoration on a general-purpose file deleter.
+//!
+//! **It always asks.** On the command line the confirmation is the verb: you
+//! type `clean` yourself, and that is the moment of intent. A keypress has no
+//! such moment, so the modal supplies one — `Y` or `N`, whichever tier the plan
+//! holds. What the tier changes is what the modal *says*: a plan that destroys
+//! announces itself in red and names every share as destroyed, because the
+//! information is the part that matters and the ceremony was not.
+//!
+//! **It plans and removes on a worker.** Planning walks a tree and runs a
+//! `git status` per repository; removing hands a batch to the OS trash, which on
+//! macOS is a round-trip to Finder. Doing either on the UI thread would freeze
+//! the browser for as long as it took, on the one screen whose whole point is
+//! that it stays responsive.
+//!
+//! What the progress can honestly say differs between the two halves, and the
+//! modal says the true thing rather than the tidy one. `apply` reports each
+//! trashed candidate **before** submitting the batch, so those callbacks mean
+//! *listed*, not *gone*; the removal itself is one call at the end that takes as
+//! long as it takes. Purging is per item, so there the count is the real one.
+
+use disk_tools_core::{CleanOptions, CleanOutcome, CleanPlan, ScanOptions, apply, plan, scan};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::thread;
+
+/// What the worker has to say while it works.
+#[derive(Debug)]
+pub enum Step {
+    /// One candidate reached — *listed* for the trash, or *destroyed*.
+    Reached { path: PathBuf, purge: bool },
+    /// All of it, and what became of it.
+    Finished(Box<CleanOutcome>),
+}
+
+/// Where a removal has got to.
+#[derive(Debug)]
+pub enum Removal {
+    /// Walking and planning, on a worker. `Esc` abandons it.
+    Planning {
+        path: PathBuf,
+        answer: Receiver<CleanPlan>,
+    },
+    /// The plan, waiting to be agreed to.
+    Asking {
+        path: PathBuf,
+        plan: Box<CleanPlan>,
+        /// Anything here is destroyed rather than trashed. It changes what the
+        /// modal says, not what it takes to agree.
+        destroys: bool,
+    },
+    /// Carrying it out, on a worker.
+    Removing {
+        path: PathBuf,
+        /// How many the plan holds of each kind — the denominators.
+        trashing: usize,
+        purging: usize,
+        /// How many of each the worker has reported.
+        listed: usize,
+        destroyed: usize,
+        /// The last path it named, so the modal shows something moving.
+        latest: Option<PathBuf>,
+        answer: Receiver<Step>,
+    },
+    /// What it did, until dismissed.
+    Done {
+        path: PathBuf,
+        outcome: Box<CleanOutcome>,
+    },
+    /// The rules claim nothing here — said out loud rather than ignored, so a
+    /// key that did nothing cannot be mistaken for a key that did not register.
+    Nothing { path: PathBuf },
+}
+
+impl Removal {
+    /// Start planning the subtree under `path`.
+    ///
+    /// The walk happens on a worker and the browser keeps drawing; the answer is
+    /// collected by [`Self::settle`] on the next frame that has one.
+    pub fn begin(path: &Path, options: CleanOptions) -> Removal {
+        let (send, answer) = channel();
+        let root = path.to_path_buf();
+        let walking = root.clone();
+        thread::spawn(move || {
+            let tree = scan(&ScanOptions {
+                root: walking,
+                ..ScanOptions::default()
+            });
+            // A closed channel means the browser moved on; nothing to report to.
+            let _ = send.send(plan(&tree, &options));
+        });
+        Removal::Planning { path: root, answer }
+    }
+
+    /// Take the worker's answer if it has one.
+    ///
+    /// Returns `true` when the state changed, so the caller knows a redraw is
+    /// worth the frame.
+    pub fn settle(&mut self) -> bool {
+        match self {
+            Removal::Planning { .. } => self.settle_plan(),
+            Removal::Removing { .. } => self.settle_removal(),
+            _ => false,
+        }
+    }
+
+    /// Take everything the removing worker has said since the last frame.
+    ///
+    /// Returns whether the state changed — including a counter moving, since
+    /// that is the whole point of showing it.
+    fn settle_removal(&mut self) -> bool {
+        let Removal::Removing {
+            path,
+            listed,
+            destroyed,
+            latest,
+            answer,
+            ..
+        } = self
+        else {
+            return false;
+        };
+
+        let mut moved = false;
+        let mut finished = None;
+        loop {
+            match answer.try_recv() {
+                Ok(Step::Reached { path, purge }) => {
+                    if purge {
+                        *destroyed += 1;
+                    } else {
+                        *listed += 1;
+                    }
+                    *latest = Some(path);
+                    moved = true;
+                }
+                Ok(Step::Finished(outcome)) => {
+                    finished = Some(outcome);
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                // The worker died mid-removal. Say what is true: it is over, and
+                // nothing here knows what it managed.
+                Err(TryRecvError::Disconnected) => {
+                    finished = Some(Box::new(CleanOutcome::default()));
+                    break;
+                }
+            }
+        }
+
+        if let Some(outcome) = finished {
+            *self = Removal::Done {
+                path: path.clone(),
+                outcome,
+            };
+            return true;
+        }
+        moved
+    }
+
+    fn settle_plan(&mut self) -> bool {
+        let Removal::Planning { path, answer } = self else {
+            return false;
+        };
+        match answer.try_recv() {
+            Ok(plan) if plan.candidates.is_empty() => {
+                *self = Removal::Nothing { path: path.clone() };
+                true
+            }
+            Ok(plan) => {
+                // The **strictest** tier in the plan decides how it is agreed
+                // to. A subtree usually holds both, and asking by the gentlest
+                // would let one purge-tier candidate through on a `y`.
+                let destroys = plan.candidates.iter().any(|candidate| candidate.purge);
+                *self = Removal::Asking {
+                    path: path.clone(),
+                    plan: Box::new(plan),
+                    destroys,
+                };
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            // The worker died — a panic in the walk. Say nothing was done,
+            // because nothing was.
+            Err(TryRecvError::Disconnected) => {
+                *self = Removal::Nothing { path: path.clone() };
+                true
+            }
+        }
+    }
+
+    /// Carry it out, on a worker. Only ever reached through the modal.
+    pub fn carry_out(&mut self) {
+        let Removal::Asking { path, plan, .. } = self else {
+            return;
+        };
+        let (send, answer) = channel();
+        let path = path.clone();
+        let plan = std::mem::take(plan);
+        let (purging, trashing) =
+            plan.candidates
+                .iter()
+                .fold((0, 0), |(purging, trashing), candidate| {
+                    if candidate.purge {
+                        (purging + 1, trashing)
+                    } else {
+                        (purging, trashing + 1)
+                    }
+                });
+
+        thread::spawn(move || {
+            let reporting = send.clone();
+            let outcome = apply(&plan, |candidate| {
+                let _ = reporting.send(Step::Reached {
+                    path: candidate.path.clone(),
+                    purge: candidate.purge,
+                });
+            });
+            let _ = send.send(Step::Finished(Box::new(outcome)));
+        });
+
+        *self = Removal::Removing {
+            path,
+            trashing,
+            purging,
+            listed: 0,
+            destroyed: 0,
+            latest: None,
+            answer,
+        };
+    }
+
+    /// The path this is about, whatever state it is in.
+    pub fn path(&self) -> &Path {
+        match self {
+            Removal::Planning { path, .. }
+            | Removal::Asking { path, .. }
+            | Removal::Removing { path, .. }
+            | Removal::Done { path, .. }
+            | Removal::Nothing { path } => path,
+        }
+    }
+}
+
+/// One rule's share of a plan, for the modal.
+pub struct Share {
+    pub rule: String,
+    pub count: usize,
+    pub allocated: u64,
+    /// Where they go. The **rule's** tier is not here: what a reader of the
+    /// modal needs is the destination, and `--purge` can make a trash-tier
+    /// candidate destroyed without changing its tier.
+    pub purge: bool,
+}
+
+/// The plan, grouped the way the `-d 0` report groups it.
+///
+/// The same shape deliberately: what the modal shows and what `preview` prints
+/// have to be the same claim about the same paths.
+pub fn shares(plan: &CleanPlan) -> Vec<Share> {
+    let mut shares: Vec<Share> = Vec::new();
+    for candidate in &plan.candidates {
+        match shares.iter_mut().find(|share| share.rule == candidate.rule) {
+            Some(share) => {
+                share.count += 1;
+                share.allocated += candidate.allocated;
+            }
+            None => shares.push(Share {
+                rule: candidate.rule.clone(),
+                count: 1,
+                allocated: candidate.allocated,
+                purge: candidate.purge,
+            }),
+        }
+    }
+    shares.sort_by(|a, b| b.allocated.cmp(&a.allocated).then(a.rule.cmp(&b.rule)));
+    shares
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use disk_tools_core::{Candidate, Kept, Tier};
+
+    fn candidate(rule: &str, purge: bool, allocated: u64) -> Candidate {
+        Candidate {
+            path: PathBuf::from(format!("/p/{rule}")),
+            rule: rule.into(),
+            tier: if purge { Tier::Purge } else { Tier::Confirm },
+            purge,
+            duplicate_of: None::<Kept>,
+            allocated,
+            shared: false,
+        }
+    }
+
+    fn asking(candidates: Vec<Candidate>) -> Removal {
+        let destroys = candidates.iter().any(|c| c.purge);
+        Removal::Asking {
+            path: PathBuf::from("/p"),
+            plan: Box::new(CleanPlan {
+                reclaimable: candidates.iter().map(|c| c.allocated).sum(),
+                candidates,
+                ..CleanPlan::default()
+            }),
+            destroys,
+        }
+    }
+
+    /// A subtree usually holds both tiers, and asking by the gentlest would let
+    /// a purge-tier candidate through on one letter.
+    #[test]
+    fn one_destroying_candidate_makes_the_whole_thing_ask_for_the_word() {
+        let mixed = asking(vec![
+            candidate("trashed", false, 4096),
+            candidate("destroyed", true, 8192),
+        ]);
+
+        assert!(matches!(mixed, Removal::Asking { destroys: true, .. }));
+    }
+
+    #[test]
+    fn nothing_destroying_asks_for_a_letter() {
+        let gentle = asking(vec![candidate("trashed", false, 4096)]);
+        assert!(matches!(
+            gentle,
+            Removal::Asking {
+                destroys: false,
+                ..
+            }
+        ));
+    }
+
+    /// The modal shows what `preview -d 0` would print about the same paths, so
+    /// the two cannot describe one plan differently.
+    #[test]
+    fn the_shares_are_grouped_by_rule_largest_first() {
+        let plan = CleanPlan {
+            candidates: vec![
+                candidate("small", false, 1024),
+                candidate("big", true, 8192),
+                candidate("big", true, 4096),
+            ],
+            ..CleanPlan::default()
+        };
+
+        let shares = shares(&plan);
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].rule, "big");
+        assert_eq!(shares[0].count, 2);
+        assert_eq!(shares[0].allocated, 12_288);
+        assert!(shares[0].purge);
+        assert_eq!(shares[1].rule, "small");
+    }
+
+    /// The one thing the progress must not overstate. `apply` names a trashed
+    /// candidate **before** submitting the batch, so those callbacks mean
+    /// *listed*, and the removal itself is one call afterwards — a bar driven by
+    /// them would reach the end and then sit there while the work happened.
+    #[test]
+    fn trashing_and_destroying_are_counted_apart() {
+        let (send, answer) = channel();
+        let mut removal = Removal::Removing {
+            path: PathBuf::from("/p"),
+            trashing: 2,
+            purging: 1,
+            listed: 0,
+            destroyed: 0,
+            latest: None,
+            answer,
+        };
+
+        send.send(Step::Reached {
+            path: PathBuf::from("/p/a"),
+            purge: false,
+        })
+        .expect("send");
+        send.send(Step::Reached {
+            path: PathBuf::from("/p/b"),
+            purge: true,
+        })
+        .expect("send");
+
+        assert!(removal.settle(), "a counter moving is worth a frame");
+        let Removal::Removing {
+            listed,
+            destroyed,
+            latest,
+            ..
+        } = &removal
+        else {
+            panic!("still removing");
+        };
+        assert_eq!(*listed, 1);
+        assert_eq!(*destroyed, 1);
+        assert_eq!(latest.as_deref(), Some(Path::new("/p/b")));
+    }
+
+    /// Nothing new to say is not a redraw.
+    #[test]
+    fn nothing_arriving_is_not_a_change() {
+        let (send, answer) = channel();
+        let mut removal = Removal::Removing {
+            path: PathBuf::from("/p"),
+            trashing: 1,
+            purging: 0,
+            listed: 0,
+            destroyed: 0,
+            latest: None,
+            answer,
+        };
+
+        assert!(!removal.settle());
+        drop(send);
+    }
+
+    /// A worker that dies mid-removal ends it, and claims nothing about what it
+    /// managed — which is the safe direction for a figure nobody can check.
+    #[test]
+    fn a_worker_that_dies_ends_it_claiming_nothing() {
+        let (send, answer) = channel::<Step>();
+        let mut removal = Removal::Removing {
+            path: PathBuf::from("/p"),
+            trashing: 1,
+            purging: 0,
+            listed: 0,
+            destroyed: 0,
+            latest: None,
+            answer,
+        };
+        drop(send);
+
+        assert!(removal.settle());
+        let Removal::Done { outcome, .. } = &removal else {
+            panic!("over, one way or another");
+        };
+        assert_eq!(outcome.count(), 0);
+    }
+}

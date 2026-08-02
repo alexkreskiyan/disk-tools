@@ -19,12 +19,11 @@
 //! would mean re-reading the directory to widen the filter again, and a size
 //! arriving for a hidden row would have nowhere to land.
 
-use super::edit::{Chooser, Dialog, Form};
 use super::listing::{self, Entry};
 use super::measure::Sizer;
+use super::removal::Removal;
 use super::sort::{Applied, Order, sort};
-use crate::config::write;
-use disk_tools_core::{Facts, Rule, Rules, State, UserDirs};
+use disk_tools_core::{CleanOptions, DetectOptions, Facts, Rules, State, UserDirs};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -79,13 +78,21 @@ pub struct App {
     /// stays open.
     now: SystemTime,
 
-    /// For resolving `~` in a rule the user writes. The core reads no
-    /// environment either.
-    user_dirs: UserDirs,
+    /// Everything a removal needs that the browser does not otherwise have: the
+    /// rules to plan by, and the user's directories the denylist is built from.
+    ///
+    /// Held rather than passed at the keystroke because a plan must be made
+    /// against the rules **on screen** — the colours the user is looking at.
+    options: CleanOptions,
 
-    /// The rule dialog, when one is open. Everything else on screen is frozen
-    /// behind it — a keypress means something different while a form has focus.
-    dialog: Option<Dialog>,
+    /// A removal, from the moment `D` is pressed until it is dismissed.
+    removal: Option<Removal>,
+
+    /// Why the browser has stopped taking keys, when it has.
+    ///
+    /// `Some` only after a reload that failed: the rules on screen are then the
+    /// previous ones, and nothing here may pretend otherwise.
+    blocked: Option<String>,
 
     /// How many rows the list band has. Set by the drawing code, which is the
     /// only place that knows — a page is a screenful, so it cannot be a
@@ -120,11 +127,19 @@ impl App {
                 fell_back: false,
             },
             notice: None,
+            options: CleanOptions {
+                detect: DetectOptions {
+                    rules: (*rules).clone(),
+                    now,
+                },
+                user_dirs,
+                ..CleanOptions::default()
+            },
+            removal: None,
+            blocked: None,
             sizer: Sizer::new(Arc::clone(&rules), now),
             rules,
             now,
-            user_dirs,
-            dialog: None,
             page: 1,
         };
         let listed = app.read(root)?;
@@ -177,6 +192,124 @@ impl App {
     /// Put something in the header until the next thing that succeeds.
     pub fn say(&mut self, what: String) {
         self.notice = Some(what);
+    }
+
+    // ---- removing what the rules claim, from here ------------------------
+
+    pub fn removal(&self) -> Option<&Removal> {
+        self.removal.as_ref()
+    }
+
+    /// Start a removal of whatever the rules claim under the cursor.
+    ///
+    /// The **parent row is not a place**: `..` is the way out of here, not a
+    /// description of anywhere, and a key that removed through it would act on a
+    /// directory the screen is not about.
+    pub fn begin_removal(&mut self) {
+        let Some(entry) = self.selected() else {
+            return;
+        };
+        if entry.name == PARENT {
+            return;
+        }
+        let path = self.cwd.join(&entry.name);
+        self.removal = Some(Removal::begin(&path, self.options.clone()));
+    }
+
+    /// Collect whatever the worker has said — a plan, progress, or the outcome.
+    ///
+    /// The tidying belongs **here** rather than beside the keypress that started
+    /// it: removing happens on a worker now, so the moment the disk changed is
+    /// the moment its answer arrives, not the moment it was agreed to.
+    pub fn settle_removal(&mut self) {
+        let Some(removal) = &mut self.removal else {
+            return;
+        };
+        if !removal.settle() || !matches!(removal, Removal::Done { .. }) {
+            return;
+        }
+
+        // Only the row that changed. A removal under `project/` cannot have
+        // altered `other/`, and forgetting the whole listing — which is what
+        // `remeasure` is for, on the `r` key — would re-walk every sibling to
+        // learn what it already knew. `request` skips what it already holds, so
+        // the re-read below costs one walk: the forgotten one.
+        let path = removal.path().to_path_buf();
+        self.sizer.forget(&path);
+        self.refresh();
+    }
+
+    /// Agree, and carry it out.
+    pub fn confirm_removal(&mut self) {
+        let Some(removal) = &mut self.removal else {
+            return;
+        };
+        if !matches!(removal, Removal::Asking { .. }) {
+            return;
+        }
+        // Hands it to a worker and returns: the OS trash is a round-trip to
+        // Finder on macOS, and a browser that stopped drawing for it would be
+        // indistinguishable from one that had hung.
+        removal.carry_out();
+    }
+
+    /// Read this directory again without leaving it.
+    ///
+    /// Not [`Self::arrive`]: that is for a move, and it clears the filter,
+    /// because a filter is about the directory it was typed in. Here the
+    /// directory is the same one — the user is still looking at the rows they
+    /// narrowed to, and having them reappear because something was removed
+    /// would be the browser undoing their work for them.
+    ///
+    /// A removed directory is a row until something looks again, and a removed
+    /// file leaves a row carrying a size for a file that is not there.
+    fn refresh(&mut self) {
+        let Ok(listed) = self.read(&self.cwd.clone()) else {
+            // The directory itself has gone — from under us, or because it was
+            // what was removed. Leave the rows alone rather than blanking the
+            // screen; the next move settles it.
+            return;
+        };
+        self.listed = listed;
+        self.here = blank(&self.cwd);
+        self.here.state = self.state_of_cwd();
+
+        self.classify();
+        self.sizer.request(self.subdirectories());
+        apply_sizes(&self.cwd, &self.sizer, &mut self.listed);
+
+        self.applied = sort(&mut self.listed, self.order, self.reverse);
+        // Holds the cursor on whatever it was on, and drops it to the top when
+        // that row is the one that has just gone.
+        self.refilter();
+        self.total_here();
+    }
+
+    /// Abandon it. A plan still being walked is simply dropped: the worker
+    /// finds a closed channel and goes away.
+    pub fn dismiss_removal(&mut self) {
+        self.removal = None;
+    }
+
+    /// Stop taking keys, and say why.
+    ///
+    /// Reached when the config no longer parses. Every colour, every `clean`
+    /// column and every legend row on this screen is a claim about rules the
+    /// tool no longer has, and a one-line notice under a screenful of them is
+    /// not a correction — it is a caption on something that is now wrong.
+    ///
+    /// v0.4 decided the other way: a bad file left the working rules in place
+    /// with a notice, so a typo would not turn every colour off. That was right
+    /// when the alternative was an empty screen. It is wrong now that the
+    /// alternative is the CLI's own rule — rules that cannot be read stop the
+    /// work — which is what keeps the two saying the same thing about one file.
+    pub fn block(&mut self, why: String) {
+        self.blocked = Some(why);
+    }
+
+    /// Why the browser is not taking keys, if it is not.
+    pub fn blocked(&self) -> Option<&str> {
+        self.blocked.as_deref()
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -417,176 +550,6 @@ impl App {
         )
     }
 
-    pub fn dialog(&self) -> Option<&Dialog> {
-        self.dialog.as_ref()
-    }
-
-    /// Open the rule dialog on the entry under the cursor.
-    ///
-    /// The parent row is not a thing in this listing, so there is no rule to
-    /// write about it.
-    pub fn open_rules(&mut self) {
-        let Some(entry) = self.selected() else {
-            return;
-        };
-        if entry.name == PARENT {
-            return;
-        }
-
-        self.dialog = Some(Dialog::Choosing(Chooser::new(
-            &self.cwd,
-            &entry.name.to_string_lossy(),
-            entry.is_dir,
-            self.rules.names(),
-        )));
-    }
-
-    pub fn choose_down(&mut self) {
-        if let Some(Dialog::Choosing(chooser)) = &mut self.dialog {
-            chooser.down();
-        }
-    }
-
-    pub fn choose_up(&mut self) {
-        if let Some(Dialog::Choosing(chooser)) = &mut self.dialog {
-            chooser.up();
-        }
-    }
-
-    pub fn form_next(&mut self) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.next_field();
-        }
-    }
-
-    pub fn form_previous(&mut self) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.previous_field();
-        }
-    }
-
-    pub fn form_push(&mut self, ch: char) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.push(ch);
-        }
-    }
-
-    pub fn form_pop(&mut self) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.pop();
-        }
-    }
-
-    pub fn form_toggle(&mut self) {
-        if let Some(Dialog::Editing(form)) = &mut self.dialog {
-            form.toggle();
-        }
-    }
-
-    pub fn close_dialog(&mut self) {
-        // Nothing else is touched: cancelling has to leave the rules, the
-        // listing and the file exactly as they were.
-        self.dialog = None;
-    }
-
-    /// Move from the chooser to the form for whatever it is pointing at.
-    pub fn open_form(&mut self) {
-        let Some(Dialog::Choosing(chooser)) = &self.dialog else {
-            return;
-        };
-        // Taken by value before anything is written back: the chooser lives in
-        // the field about to be replaced.
-        let picked = chooser.picked().map(str::to_owned);
-        let (parent, name, is_dir) = (chooser.parent.clone(), chooser.name.clone(), chooser.is_dir);
-
-        let form = match picked {
-            Some(name) => match self.rules.get(&name) {
-                Some(rule) => Form::for_existing(rule),
-                // The list came from `Rules::names`, so this cannot happen — but
-                // a panic in a browser over a rule that moved is not a trade
-                // worth making.
-                None => return,
-            },
-            None => Form::for_new(&parent, &name, is_dir, &self.user_dirs),
-        };
-        self.dialog = Some(Dialog::Editing(Box::new(form)));
-    }
-
-    /// Try to close the form, writing the rule and putting it into effect.
-    ///
-    /// The file first, then the screen. A rule that recoloured the listing and
-    /// then failed to save would leave the user believing something that is not
-    /// on disk — and the next run would disagree with what they are looking at.
-    pub fn confirm_form(&mut self, config: Option<&Path>) {
-        let Some(Dialog::Editing(form)) = &mut self.dialog else {
-            return;
-        };
-
-        let taken = self.rules.names();
-        let Some(rule) = form.confirm(&taken, &self.user_dirs) else {
-            // The form stays open with the field flagged.
-            return;
-        };
-        let name = rule.name.clone();
-
-        let mut rules: Vec<Rule> = self.rules.to_vec();
-        match rules.iter().position(|existing| existing.name == name) {
-            // In place, because a rule's position is its precedence and an edit
-            // is not a request to change that.
-            Some(at) => rules[at] = rule.clone(),
-            None => rules.push(rule.clone()),
-        }
-
-        let compiled = match Rules::new(rules, &self.user_dirs) {
-            Ok(compiled) => compiled,
-            // `Form::confirm` already compiled this rule on its own, so the only
-            // way here is a clash with the rules around it.
-            Err(err) => {
-                if let Some(Dialog::Editing(form)) = &mut self.dialog {
-                    form.reject(err.to_string());
-                }
-                return;
-            }
-        };
-
-        let saved = match config {
-            Some(path) => match write::to_file(path, &rule) {
-                Ok(wrote) => wrote,
-                Err(problem) => {
-                    // The form stays open over a file that was not written. A
-                    // dialog that closes on a failed save is a dialog that lost
-                    // the user's work as well as their rule.
-                    if let Some(Dialog::Editing(form)) = &mut self.dialog {
-                        form.reject(problem);
-                    }
-                    return;
-                }
-            },
-            // Nothing in this environment implies a path — the same case
-            // `config init` cannot serve. The rule still works for this session.
-            None => {
-                self.dialog = None;
-                self.reload_rules(compiled);
-                self.notice = Some(format!(
-                    "rule `{name}` is in effect, but this environment names no config file to save it in"
-                ));
-                return;
-            }
-        };
-
-        self.dialog = None;
-        self.reload_rules(compiled);
-        self.notice = Some(match saved {
-            write::Wrote::Changed => format!("rule `{name}` changed"),
-            write::Wrote::Added => format!("rule `{name}` added"),
-            // Worth its own sentence: the file said nothing about rules, which
-            // left the built-ins in force, and it now lists them explicitly.
-            write::Wrote::AddedWithBuiltins => format!(
-                "rule `{name}` added, and the built-in rules written out beside it so they stay in force"
-            ),
-        });
-    }
-
     /// Swap in a freshly read rule set and repaint against it.
     ///
     /// The listing is not re-read: rules are about what the files mean, not
@@ -597,6 +560,12 @@ impl App {
     /// leave the screen answering the previous question — which is precisely the
     /// question the user changed the rule to stop asking.
     pub fn reload_rules(&mut self, rules: Rules) {
+        // Reading a usable file is the only way out of the blocked state, and
+        // this is the only place a usable file arrives.
+        self.blocked = None;
+        // A removal plans against the rules on screen, so the two are replaced
+        // together or a plan could outlive the colours that justified it.
+        self.options.detect.rules = rules.clone();
         self.rules = Arc::new(rules);
         self.sizer.retarget(Arc::clone(&self.rules));
 
@@ -663,7 +632,9 @@ impl App {
         // on every climbing figure would have rows swap places continuously;
         // never sorting would leave "by size" showing an order that is no longer
         // true. The cursor holds its entry across the move, as always.
-        if completed && self.order == Order::Size {
+        // Both orders are read off figures the walk produces, so both go stale
+        // as it runs and both correct themselves when it finishes.
+        if completed && matches!(self.order, Order::Size | Order::Cleanable) {
             self.resort();
         }
     }
@@ -851,7 +822,7 @@ fn blank(cwd: &Path) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::edit::Field;
+    use disk_tools_core::{Part, Rule, Tier, UserDirs};
 
     /// A fixed clock, so an `older_than` rule decides the same way every run.
     fn now() -> SystemTime {
@@ -1421,9 +1392,12 @@ mod tests {
         let rules = Rules::new(
             vec![disk_tools_core::Rule {
                 name: "junk".into(),
-                root: Some(dir.path().to_string_lossy().into_owned()),
-                includes: vec!["**/alpha/".into()],
-                ..disk_tools_core::Rule::default()
+                parts: vec![Part {
+                    root: Some(dir.path().to_string_lossy().into_owned()),
+                    includes: vec!["**/alpha/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
             }],
             &disk_tools_core::UserDirs::default(),
         )
@@ -1471,9 +1445,12 @@ mod tests {
         let rules = Rules::new(
             vec![disk_tools_core::Rule {
                 name: "junk".into(),
-                root: Some(dir.path().to_string_lossy().into_owned()),
-                includes: vec!["**/target/".into()],
-                ..disk_tools_core::Rule::default()
+                parts: vec![Part {
+                    root: Some(dir.path().to_string_lossy().into_owned()),
+                    includes: vec!["**/target/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
             }],
             &disk_tools_core::UserDirs::default(),
         )
@@ -1510,10 +1487,13 @@ mod tests {
             Rules::new(
                 vec![disk_tools_core::Rule {
                     name: "rust-target".into(),
-                    root: Some(root.to_string_lossy().into_owned()),
-                    includes: vec!["**/target/".into()],
-                    requires_sibling: vec!["Cargo.toml".into()],
-                    ..disk_tools_core::Rule::default()
+                    parts: vec![Part {
+                        root: Some(root.to_string_lossy().into_owned()),
+                        includes: vec!["**/target/".into()],
+                        requires: vec!["Cargo.toml".into()],
+                        ..Part::default()
+                    }],
+                    ..Rule::default()
                 }],
                 &disk_tools_core::UserDirs::default(),
             )
@@ -1569,9 +1549,12 @@ mod tests {
             Rules::new(
                 vec![disk_tools_core::Rule {
                     name: "junk".into(),
-                    root: Some(dir.path().to_string_lossy().into_owned()),
-                    includes: vec!["**/alpha/".into()],
-                    ..disk_tools_core::Rule::default()
+                    parts: vec![Part {
+                        root: Some(dir.path().to_string_lossy().into_owned()),
+                        includes: vec!["**/alpha/".into()],
+                        ..Part::default()
+                    }],
+                    ..Rule::default()
                 }],
                 &disk_tools_core::UserDirs::default(),
             )
@@ -1675,8 +1658,11 @@ mod tests {
         Rules::new(
             vec![Rule {
                 name: "junk".into(),
-                root: Some(root.to_string_lossy().into_owned()),
-                includes: vec!["**/node_modules/".into(), "**/*.pyc".into()],
+                parts: vec![Part {
+                    root: Some(root.to_string_lossy().into_owned()),
+                    includes: vec!["**/node_modules/".into(), "**/*.pyc".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             }],
             &UserDirs::default(),
@@ -1781,13 +1767,19 @@ mod tests {
         assert!(claimed(&app).is_some_and(|bytes| bytes >= 16_384));
     }
 
-    /// A rule to compile against, for the dialog tests.
-    fn one_rule(root: &Path, name: &str, includes: &str) -> Rules {
+    // ---- removing from the browser ---------------------------------------
+
+    /// A rule set that claims `node_modules` under `root`, as the built-ins do.
+    fn claiming_here(root: &Path) -> Rules {
         Rules::new(
             vec![Rule {
-                name: name.into(),
-                root: Some(root.to_string_lossy().into_owned()),
-                includes: vec![includes.into()],
+                name: "junk".into(),
+                tier: Tier::Trash,
+                parts: vec![Part {
+                    root: Some(root.to_string_lossy().into_owned()),
+                    includes: vec!["**/node_modules/".into()],
+                    ..Part::default()
+                }],
                 ..Rule::default()
             }],
             &UserDirs::default(),
@@ -1795,234 +1787,301 @@ mod tests {
         .expect("compiles")
     }
 
-    fn form(app: &App) -> &crate::ui::edit::Form {
-        match app.dialog().expect("a dialog") {
-            Dialog::Editing(form) => form,
-            Dialog::Choosing(_) => panic!("still choosing"),
+    /// Wait for the removing worker to finish and the browser to take it in.
+    fn await_removal(app: &mut App) {
+        for _ in 0..500 {
+            app.settle_removal();
+            match app.removal() {
+                Some(Removal::Removing { .. }) | None => {}
+                Some(Removal::Done { .. }) => return,
+                Some(_) => return,
+            }
+            if app.removal().is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the removal never finished");
+    }
+
+    /// Wait for the worker's plan, which is a real walk on a real directory.
+    fn await_plan(app: &mut App) {
+        for _ in 0..200 {
+            app.settle_removal();
+            if !matches!(app.removal(), Some(Removal::Planning { .. })) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the plan never arrived");
+    }
+
+    #[test]
+    fn removing_asks_before_it_does_anything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        let mut app =
+            App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+        point_at(&mut app, "project");
+        app.begin_removal();
+        await_plan(&mut app);
+
+        assert!(
+            matches!(
+                app.removal(),
+                Some(Removal::Asking {
+                    destroys: false,
+                    ..
+                })
+            ),
+            "a trash-tier plan asks, and asks gently: {:?}",
+            app.removal()
+        );
+        assert!(
+            root.join("project/node_modules/a.bin").exists(),
+            "and nothing has happened yet"
+        );
+    }
+
+    /// The parent row is the way out of here, not a description of anywhere —
+    /// removing "through" it would act on a directory the screen is not about.
+    #[test]
+    fn the_parent_row_removes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("project/node_modules")).expect("mkdir");
+
+        let mut app = App::open(
+            dir.path(),
+            claiming_here(dir.path()),
+            now(),
+            UserDirs::default(),
+        )
+        .expect("open");
+        // Opening lands on `..`.
+        app.begin_removal();
+
+        assert!(app.removal().is_none());
+    }
+
+    /// Only what a rule claims can go from here. A row nothing claims says so
+    /// rather than silently doing nothing, which would be indistinguishable
+    /// from a key that did not register.
+    #[test]
+    fn a_row_no_rule_claims_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir(root.join("ordinary")).expect("mkdir");
+        std::fs::write(root.join("ordinary/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        let mut app =
+            App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+        point_at(&mut app, "ordinary");
+        app.begin_removal();
+        await_plan(&mut app);
+
+        assert!(matches!(app.removal(), Some(Removal::Nothing { .. })));
+        assert!(root.join("ordinary/a.bin").exists());
+    }
+
+    /// A destroying plan is still one question with two answers — the tier
+    /// changes what the modal *says*, in red, not what it takes to agree.
+    #[test]
+    fn a_destroying_plan_is_announced_and_still_cancellable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        let mut rules = claiming_here(root).to_vec();
+        rules[0].tier = Tier::Purge;
+        let mut app = App::open(
+            root,
+            Rules::new(rules, &UserDirs::default()).expect("compiles"),
+            now(),
+            UserDirs::default(),
+        )
+        .expect("open");
+        point_at(&mut app, "project");
+        app.begin_removal();
+        await_plan(&mut app);
+
+        assert!(matches!(
+            app.removal(),
+            Some(Removal::Asking { destroys: true, .. })
+        ));
+
+        crate::ui::press(&mut app, 'n');
+        assert!(app.removal().is_none(), "no is no, whatever the tier");
+        assert!(
+            root.join("project/node_modules/a.bin").exists(),
+            "and nothing was destroyed on the way to saying it"
+        );
+    }
+
+    /// The gentle case is a yes-or-no question, and both answers are a letter.
+    #[test]
+    fn a_trashing_plan_takes_a_letter_either_way() {
+        for (key, gone) in [('y', true), ('Y', true)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+            std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096])
+                .expect("write");
+
+            let mut app =
+                App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+            point_at(&mut app, "project");
+            app.begin_removal();
+            await_plan(&mut app);
+            crate::ui::press(&mut app, key);
+            await_removal(&mut app);
+
+            assert_eq!(
+                !root.join("project/node_modules/a.bin").exists(),
+                gone,
+                "`{key}` should have removed it"
+            );
         }
     }
 
-    /// `a` offers both answers to "which rule": a new one, or any of the
-    /// existing ones.
     #[test]
-    fn the_dialog_offers_a_new_rule_and_the_existing_ones() {
-        let dir = fixture();
-        let rules = one_rule(dir.path(), "junk", "**/alpha/");
-        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
+    fn n_cancels_without_removing_anything() {
+        for key in ['n', 'N'] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+            std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096])
+                .expect("write");
 
-        app.open_rules();
+            let mut app =
+                App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+            point_at(&mut app, "project");
+            app.begin_removal();
+            await_plan(&mut app);
+            crate::ui::press(&mut app, key);
 
-        let Some(Dialog::Choosing(chooser)) = app.dialog() else {
-            panic!("a chooser")
-        };
-        assert_eq!(chooser.rows(), ["new rule for alpha", "junk"]);
-        assert_eq!(chooser.cursor(), 0, "a new rule is the first answer");
+            assert!(app.removal().is_none(), "`{key}` should have cancelled");
+            assert!(root.join("project/node_modules/a.bin").exists());
+        }
     }
 
-    /// There is no rule to write about a directory that is not in this listing.
+    /// A removal under one row cannot have changed another, and re-walking the
+    /// siblings to learn what was already known is the whole cost of getting
+    /// this wrong.
     #[test]
-    fn the_parent_row_opens_no_dialog() {
-        let dir = fixture();
+    fn removing_re_walks_only_what_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+        std::fs::create_dir(root.join("untouched")).expect("mkdir");
+        std::fs::write(root.join("untouched/b.bin"), vec![b'y'; 8192]).expect("write");
+
         let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, PARENT);
+            App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+        await_sizes(&mut app);
+        let before = app
+            .entries()
+            .iter()
+            .find(|entry| entry.name == "untouched")
+            .and_then(|entry| entry.size)
+            .expect("measured");
 
-        app.open_rules();
+        point_at(&mut app, "project");
+        app.begin_removal();
+        await_plan(&mut app);
+        crate::ui::press(&mut app, 'y');
+        await_removal(&mut app);
 
-        assert!(app.dialog().is_none());
-    }
-
-    #[test]
-    fn picking_new_opens_a_form_prefilled_from_the_row() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-        app.open_form();
-
-        let form = form(&app);
-        assert!(!form.is_edit());
-        assert_eq!(form.value(Field::Name), "alpha");
-        assert_eq!(form.value(Field::Includes), "**/alpha/");
-    }
-
-    #[test]
-    fn picking_an_existing_rule_opens_it_as_it_stands() {
-        let dir = fixture();
-        let rules = one_rule(dir.path(), "junk", "**/alpha/");
-        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-        app.choose_down();
-        app.open_form();
-
-        let form = form(&app);
-        assert!(form.is_edit());
-        assert_eq!(form.value(Field::Name), "junk");
-        assert_eq!(form.value(Field::Includes), "**/alpha/");
-    }
-
-    /// Cancelling has to leave the rules, the listing and the file exactly as
-    /// they were.
-    #[test]
-    fn cancelling_changes_nothing() {
-        let dir = fixture();
-        let rules = one_rule(dir.path(), "junk", "**/alpha/");
-        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-        let before = names(&app);
-
-        app.open_rules();
-        app.open_form();
-        app.form_push('x');
-        app.close_dialog();
-
-        assert!(app.dialog().is_none());
-        assert_eq!(names(&app), before);
-        assert_eq!(
-            app.entries()
-                .iter()
-                .find(|e| e.name == "alpha")
-                .expect("listed")
-                .state,
-            State::Included,
-            "the rule that was in force still is"
-        );
-    }
-
-    /// A confirmed rule takes effect immediately, which is the only way to see
-    /// whether it says what was meant.
-    #[test]
-    fn a_confirmed_rule_recolours_the_listing() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-        assert!(!app.any_rule_applies());
-
-        app.open_rules();
-        app.open_form();
-        app.confirm_form(None);
-
-        assert!(app.dialog().is_none(), "the form closed");
-        assert_eq!(
-            app.entries()
-                .iter()
-                .find(|e| e.name == "alpha")
-                .expect("listed")
-                .state,
-            State::Included
-        );
-        let notice = app.notice().expect("a word about the file");
+        // Still there, and still known — no walk was needed to say so.
+        let after = app
+            .entries()
+            .iter()
+            .find(|entry| entry.name == "untouched")
+            .expect("still listed");
+        assert_eq!(after.size, Some(before));
         assert!(
-            notice.contains("names no config file"),
-            "with nowhere to save it, the rule still works and says so: {notice}"
+            !after.measuring,
+            "an untouched sibling must not be walked again"
         );
     }
 
-    /// An edit replaces the rule where it was: a rule's position is its
-    /// precedence, and rewriting one is not a request to change that.
+    /// The row that was removed goes; the filter that found it stays, because
+    /// the directory is the same one it was typed in.
     #[test]
-    fn editing_a_rule_keeps_its_place_in_the_list() {
-        let dir = fixture();
+    fn removing_re_reads_the_listing_and_keeps_the_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        // A rule that claims the row itself, so the row goes with it.
         let rules = Rules::new(
-            vec![
-                Rule {
-                    name: "first".into(),
-                    root: Some(dir.path().to_string_lossy().into_owned()),
-                    includes: vec!["**/alpha/".into()],
-                    ..Rule::default()
-                },
-                Rule {
-                    name: "second".into(),
-                    root: Some(dir.path().to_string_lossy().into_owned()),
-                    includes: vec!["**/zulu/".into()],
-                    ..Rule::default()
-                },
-            ],
+            vec![Rule {
+                name: "junk".into(),
+                tier: Tier::Trash,
+                parts: vec![Part {
+                    root: Some(root.to_string_lossy().into_owned()),
+                    includes: vec!["**/project/".into()],
+                    ..Part::default()
+                }],
+                ..Rule::default()
+            }],
             &UserDirs::default(),
         )
         .expect("compiles");
-        let mut app = App::open(dir.path(), rules, now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
 
-        app.open_rules();
-        app.choose_down();
-        app.open_form();
-        app.confirm_form(None);
-
-        assert_eq!(app.rules.names(), ["first", "second"]);
-    }
-
-    /// A rejected form stays open with the field flagged, and nothing else
-    /// moves.
-    #[test]
-    fn a_rejected_form_stays_open_and_changes_nothing() {
-        let dir = fixture();
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-        app.open_rules();
-        app.open_form();
-
-        // Clear the name, which is required.
-        for _ in 0.."alpha".len() {
-            app.form_pop();
+        let mut app = App::open(root, rules, now(), UserDirs::default()).expect("open");
+        app.start_filtering();
+        for ch in "pro".chars() {
+            app.filter_push(ch);
         }
-        app.confirm_form(None);
+        app.filter_accept();
+        point_at(&mut app, "project");
 
-        assert!(app.dialog().is_some(), "the form is still open");
-        assert_eq!(form(&app).problem().expect("a reason").field, Field::Name);
-        assert!(app.rules.is_empty(), "and no rule was added");
-    }
+        app.begin_removal();
+        await_plan(&mut app);
+        crate::ui::press(&mut app, 'y');
+        await_removal(&mut app);
 
-    /// The file first, then the screen. A rule that recoloured the listing and
-    /// then failed to save would leave the user believing something that is not
-    /// on disk.
-    #[test]
-    fn a_confirmed_rule_reaches_the_config_file() {
-        let dir = fixture();
-        let config = dir.path().join("config.toml");
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-        app.open_form();
-        app.confirm_form(Some(&config));
-
-        let text = std::fs::read_to_string(&config).expect("written");
-        assert!(text.contains(r#"name = "alpha""#), "{text}");
-        let notice = app.notice().expect("a word about it");
-        assert!(!notice.contains("not written"), "{notice}");
-    }
-
-    /// A dialog that closes on a failed save loses the user's work as well as
-    /// their rule.
-    #[test]
-    fn a_write_that_fails_leaves_the_form_open() {
-        let dir = fixture();
-        // A directory where the file should be: the write cannot succeed, and
-        // nothing else about the situation is unusual.
-        let config = dir.path().join("alpha");
-        let mut app =
-            App::open(dir.path(), Rules::default(), now(), UserDirs::default()).expect("open");
-        point_at(&mut app, "alpha");
-
-        app.open_rules();
-        app.open_form();
-        app.confirm_form(Some(&config));
-
-        assert!(app.dialog().is_some(), "still open");
-        assert!(form(&app).problem().is_some(), "and it says why");
         assert!(
-            !app.any_rule_applies(),
-            "the rule did not take effect either"
+            !root.join("project").exists(),
+            "the fixture must actually have gone"
         );
+        assert!(
+            !app.entries().iter().any(|entry| entry.name == "project"),
+            "and the row with it: {:?}",
+            app.entries().iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.filter(),
+            "pro",
+            "the filter is about this directory, and this is still it"
+        );
+    }
+
+    /// Abandoning leaves the disk and the screen exactly as they were.
+    #[test]
+    fn dismissing_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("project/node_modules")).expect("mkdir");
+        std::fs::write(root.join("project/node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+        let mut app =
+            App::open(root, claiming_here(root), now(), UserDirs::default()).expect("open");
+        point_at(&mut app, "project");
+        let before = app.cursor();
+        app.begin_removal();
+        await_plan(&mut app);
+        app.dismiss_removal();
+
+        assert!(app.removal().is_none());
+        assert_eq!(app.cursor(), before);
+        assert!(root.join("project/node_modules/a.bin").exists());
     }
 
     /// The root of the filesystem has no parent, so there is no `..` and

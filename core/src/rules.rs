@@ -105,18 +105,20 @@ impl Default for Tier {
     }
 }
 
-/// One rule: where to look, what to claim there, and what that claim means.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rule {
-    /// Unique, and the name a [`crate::Detection`] and the report carry.
-    pub name: String,
-
-    /// Where this rule applies. `None` means **wherever the scan goes**.
+/// One self-contained statement about what qualifies.
+///
+/// A rule used to be a root plus three independent lists, and its meaning was
+/// their cross product — so the pairing between a pattern and the marker that
+/// justifies it was lost. `requires` is matched **all**, which made "a `bin/`
+/// beside a `*.csproj` **or** beside a `*.fsproj`" unsayable in one rule. A part
+/// is that pairing: everything deciding whether a node qualifies, in one place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Part {
+    /// Where this part applies. `None` means **wherever the scan goes**.
     ///
     /// The config schema requires it, so that `clean` with no path knows what to
     /// walk. The type does not, because the built-in rules genuinely have no
-    /// root: a `node_modules` is regenerable wherever it is found, which is why
-    /// v0.2 matched it by name alone.
+    /// root: a `node_modules` is regenerable wherever it is found.
     ///
     /// Written in token form — `~`, `%LOCALAPPDATA%`, `%APPDATA%` — and resolved
     /// against a supplied [`UserDirs`] in [`Rules::new`]. The core still reads no
@@ -127,12 +129,12 @@ pub struct Rule {
     /// as in gitignore.
     pub includes: Vec<String>,
 
-    /// Globs, likewise relative, that this rule declines to claim. The scan still
+    /// Globs, likewise relative, that this part declines to claim. The scan still
     /// walks and counts them — that is the difference between this and a scan
-    /// exclusion, which v0.3 deliberately does not have.
+    /// exclusion, which this project deliberately does not have.
     pub excludes: Vec<String>,
 
-    /// Globs that must **each** match something beside a match.
+    /// Globs that must **each** find something beside a match.
     ///
     /// This is the whole of `rust-target`'s safety: `target/` is an ordinary
     /// directory name, and the `Cargo.toml` next to it is the only evidence that
@@ -142,12 +144,9 @@ pub struct Rule {
     /// names because most build systems do not offer a fixed one: the file that
     /// proves a `bin/` is .NET output is `Whatever.csproj`. A pattern with no
     /// metacharacters matches itself, so `Cargo.toml` still means `Cargo.toml`.
-    pub requires_sibling: Vec<String>,
+    pub requires: Vec<String>,
 
     /// Skip a match whose enclosing repository has uncommitted work.
-    ///
-    /// v0.2 decided this from the category (`is_build_output`); with open-ended
-    /// rules there is no enum left to ask, so each rule states it.
     pub requires_clean_repo: bool,
 
     /// Claim only what has been untouched at least this long. The boundary is
@@ -161,25 +160,76 @@ pub struct Rule {
     /// threshold must stay one skipped candidate rather than becoming a hundred
     /// tiny ones once the pass descends into it.
     pub min_size: u64,
+}
+
+/// One rule: a name, what its claim means, and the parts that make it.
+///
+/// A node is claimed when it satisfies **any** part. The parts carry the
+/// matching; the rule carries identity and consequence, which is why a tier
+/// lives here and not there — a tier on a part would make the part a rule, and
+/// the rule would stop being the unit the report groups by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    /// Unique, and the name a [`crate::Detection`] and the report carry.
+    pub name: String,
 
     pub tier: Tier,
 
     pub enabled: bool,
+
+    /// Satisfying any of them is satisfying the rule.
+    pub parts: Vec<Part>,
 }
 
 impl Default for Rule {
     fn default() -> Self {
         Rule {
             name: String::new(),
-            root: None,
-            includes: Vec::new(),
-            excludes: Vec::new(),
-            requires_sibling: Vec::new(),
-            requires_clean_repo: false,
-            older_than: None,
-            min_size: 0,
             tier: Tier::default(),
             enabled: true,
+            parts: Vec::new(),
+        }
+    }
+}
+
+/// A part that could not be expressed, and why.
+///
+/// Dropping is silent by design — the alternative is refusing to run because a
+/// machine has no `%LOCALAPPDATA%` — but silence is only defensible while
+/// something can be asked. This is what `--explain` asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dropped {
+    pub rule: String,
+    /// Which part of it, counting from 1. `None` when the whole rule went.
+    pub part: Option<usize>,
+    pub why: Why,
+}
+
+/// Why a part or a rule matches nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Why {
+    /// `enabled: false`. The user's own doing, and the only one of these that
+    /// is not a limitation.
+    Disabled,
+    /// A `~` or `%APPDATA%` this frontend could not resolve. Unknown reads as
+    /// nowhere, never as anywhere.
+    UnknownRoot(String),
+    /// A resolved root that is not UTF-8, which globset cannot be given.
+    RootNotText,
+    /// Every part of it went, so there is nothing left to match with.
+    NoPartsLeft,
+}
+
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Why::Disabled => write!(f, "disabled"),
+            Why::UnknownRoot(token) => write!(
+                f,
+                "`{token}` names a directory this machine has no value for"
+            ),
+            Why::RootNotText => write!(f, "its root is not valid UTF-8"),
+            Why::NoPartsLeft => write!(f, "every one of its parts was dropped"),
         }
     }
 }
@@ -219,11 +269,16 @@ impl std::error::Error for RuleError {}
 /// the caller and passed in.
 #[derive(Clone, Default)]
 pub struct Rules {
-    /// Only the rules that survived compilation; index into this is what the
-    /// `owner` maps hold, and the lowest such index wins.
+    /// Only the rules that survived compilation.
     rules: Vec<Rule>,
 
-    /// Resolved root per rule, positionally. `None` means unrooted.
+    /// Every part of every surviving rule, flattened, in (rule, part) order —
+    /// which is precedence order, so the **lowest index wins** exactly as it did
+    /// when the index named a rule. Each entry is which rule the part belongs to
+    /// and which part of it this is.
+    owner: Vec<(usize, usize)>,
+
+    /// Resolved root per **part**, positionally. `None` means unrooted.
     roots: Vec<Option<PathBuf>>,
 
     includes: GlobSet,
@@ -236,7 +291,10 @@ pub struct Rules {
     excludes: GlobSet,
     exclude_owner: Vec<usize>,
 
-    /// Each rule's `requires_sibling`, compiled, positionally.
+    /// What was dropped at compile time, in the order it was dropped.
+    dropped: Vec<Dropped>,
+
+    /// Each part's `requires`, compiled, positionally.
     ///
     /// Separate matchers rather than one [`GlobSet`], because these are `all`
     /// and not `any`: two required siblings are two questions, and a set would
@@ -244,7 +302,7 @@ pub struct Rules {
     ///
     /// Nested and usually empty, which costs one `Vec` header per rule — the
     /// rules are compiled once and there are a handful of them.
-    siblings: Vec<Vec<globset::GlobMatcher>>,
+    requires: Vec<Vec<globset::GlobMatcher>>,
 }
 
 /// Names only — the compiled sets have no useful `Debug`, and a rule list
@@ -275,46 +333,84 @@ impl Rules {
 
         for rule in rules {
             if !rule.enabled {
+                compiled.dropped.push(Dropped {
+                    rule: rule.name,
+                    part: None,
+                    why: Why::Disabled,
+                });
                 continue;
             }
-            // Two different "cannot express this rule" cases, both answered the
-            // same way. `None` here is never "match anything".
-            let Some(root) = resolve_root(rule.root.as_deref(), dirs) else {
+            let rule_index = compiled.rules.len();
+            let before = compiled.owner.len();
+
+            for (part_index, part) in rule.parts.iter().enumerate() {
+                // Two different "cannot express this" cases, both answered the
+                // same way. `None` here is never "match anything" — and it drops
+                // **this part**, leaving the rule's others standing.
+                let Some(root) = resolve_root(part.root.as_deref(), dirs) else {
+                    compiled.dropped.push(Dropped {
+                        rule: rule.name.clone(),
+                        part: Some(part_index + 1),
+                        why: Why::UnknownRoot(part.root.clone().unwrap_or_default()),
+                    });
+                    continue;
+                };
+                let prefix = match root.as_deref().map(glob_prefix) {
+                    Some(Some(prefix)) => Some(prefix),
+                    // A root that exists but is not UTF-8: globset speaks `&str`,
+                    // so the part cannot be compiled at all.
+                    Some(None) => {
+                        compiled.dropped.push(Dropped {
+                            rule: rule.name.clone(),
+                            part: Some(part_index + 1),
+                            why: Why::RootNotText,
+                        });
+                        continue;
+                    }
+                    None => None,
+                };
+
+                let index = compiled.owner.len();
+                for pattern in &part.includes {
+                    let (bare, dir_only) = strip_dir_marker(pattern);
+                    let glob = compile(&rule.name, pattern, prefix.as_deref(), bare)?;
+                    includes.add(glob);
+                    compiled.include_owner.push(index);
+                    compiled.include_dir_only.push(dir_only);
+                }
+                for pattern in &part.excludes {
+                    let (bare, _) = strip_dir_marker(pattern);
+                    let glob = compile(&rule.name, pattern, prefix.as_deref(), bare)?;
+                    excludes.add(glob);
+                    compiled.exclude_owner.push(index);
+                }
+
+                // No root prefix: these are matched against a bare file name, not
+                // against a path. `*` therefore cannot reach past the name either,
+                // which is what makes `*.csproj` mean "beside", not "anywhere under".
+                let mut required = Vec::with_capacity(part.requires.len());
+                for pattern in &part.requires {
+                    required.push(compile(&rule.name, pattern, None, pattern)?.compile_matcher());
+                }
+
+                compiled.requires.push(required);
+                compiled.roots.push(root);
+                compiled.owner.push((rule_index, part_index));
+            }
+
+            // A rule none of whose parts survived is dropped whole. Keeping it
+            // would put a name in `names()` and `get()` that can never match
+            // anything — which is precisely the "my rule is not running" state
+            // the browser has to be able to tell from "my rule does not cover
+            // this", and it could not if the rule were still listed.
+            if compiled.owner.len() == before {
+                compiled.dropped.push(Dropped {
+                    rule: rule.name,
+                    part: None,
+                    why: Why::NoPartsLeft,
+                });
                 continue;
-            };
-            let prefix = match root.as_deref().map(glob_prefix) {
-                Some(Some(prefix)) => Some(prefix),
-                // A root that exists but is not UTF-8: globset speaks `&str`, so
-                // the rule cannot be compiled at all.
-                Some(None) => continue,
-                None => None,
-            };
-
-            let index = compiled.rules.len();
-            for pattern in &rule.includes {
-                let (bare, dir_only) = strip_dir_marker(pattern);
-                let glob = compile(&rule.name, pattern, prefix.as_deref(), bare)?;
-                includes.add(glob);
-                compiled.include_owner.push(index);
-                compiled.include_dir_only.push(dir_only);
             }
-            for pattern in &rule.excludes {
-                let (bare, _) = strip_dir_marker(pattern);
-                let glob = compile(&rule.name, pattern, prefix.as_deref(), bare)?;
-                excludes.add(glob);
-                compiled.exclude_owner.push(index);
-            }
-
-            // No root prefix: these are matched against a bare file name, not
-            // against a path. `*` therefore cannot reach past the name either,
-            // which is what makes `*.csproj` mean "beside", not "anywhere under".
-            let mut siblings = Vec::with_capacity(rule.requires_sibling.len());
-            for pattern in &rule.requires_sibling {
-                siblings.push(compile(&rule.name, pattern, None, pattern)?.compile_matcher());
-            }
-
-            compiled.siblings.push(siblings);
-            compiled.roots.push(root);
             compiled.rules.push(rule);
         }
 
@@ -361,6 +457,26 @@ impl Rules {
         self.rules.is_empty()
     }
 
+    /// What was dropped, and why — the answer to "my rule is not doing
+    /// anything" that the silence of dropping cannot give on its own.
+    pub fn dropped(&self) -> &[Dropped] {
+        &self.dropped
+    }
+
+    /// Every rule in force, with its parts.
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    /// The resolved root of a part, positionally — what a token expanded to.
+    pub fn resolved_roots(&self) -> Vec<(&str, Option<&Path>)> {
+        self.owner
+            .iter()
+            .enumerate()
+            .map(|(part, (rule, _))| (self.rules[*rule].name.as_str(), self.roots[part].as_deref()))
+            .collect()
+    }
+
     /// What `clean` with no path walks: the resolved roots of the rules that
     /// survived compilation, sorted, with any root that lies inside another
     /// dropped.
@@ -390,8 +506,40 @@ impl Rules {
         merged
     }
 
-    pub(crate) fn rule_at(&self, index: usize) -> &Rule {
-        &self.rules[index]
+    /// The rule a compiled part belongs to.
+    pub(crate) fn rule_at(&self, part: usize) -> &Rule {
+        &self.rules[self.owner[part].0]
+    }
+
+    /// Which rule a compiled part belongs to, by position.
+    ///
+    /// For callers keeping something of their own beside each rule — a duplicate
+    /// rule's keeper policy, so far, which is why this is behind that feature.
+    #[cfg(feature = "duplicates")]
+    pub(crate) fn rule_index_at(&self, part: usize) -> usize {
+        self.owner[part].0
+    }
+
+    /// The first part that claims this path, or `None`.
+    ///
+    /// The same three tests in the same order as [`crate::detect`] and
+    /// [`Self::state`] — matched, not excluded, predicates hold — so nothing
+    /// built on this can reach a different conclusion about one path.
+    ///
+    /// Only pooling asks it, so it is behind that feature.
+    #[cfg(feature = "duplicates")]
+    pub(crate) fn claiming(&self, path: &Path, facts: &Facts<'_>) -> Option<usize> {
+        let candidate = Candidate::new(path);
+        self.matching(&candidate, facts.is_dir)
+            .into_iter()
+            .find(|&part| !self.excluded(part, &candidate) && self.predicates_hold(part, facts))
+    }
+
+    /// The compiled part itself — where every predicate that decided the match
+    /// lives, including the two `plan` reads afterwards.
+    pub(crate) fn part_at(&self, part: usize) -> &Part {
+        let (rule, index) = self.owner[part];
+        &self.rules[rule].parts[index]
     }
 
     /// Can this directory's whole subtree be skipped?
@@ -410,6 +558,35 @@ impl Rules {
             // territory is somewhere below the directory and still to be reached.
             Some(root) => is_within(dir, root) || is_within(root, dir),
         })
+    }
+
+    /// Is this directory named to be left alone by everything that could reach
+    /// into it?
+    ///
+    /// True when at least one part governs it, **every** part that governs it
+    /// excludes it, and no part is rooted below it — so nothing under it can be
+    /// claimed by anyone. One comparison at the top of a `.git` saves walking
+    /// the hundreds of thousands of nodes inside it.
+    ///
+    /// Only the duplicate walk prunes on it, so it is behind that feature.
+    #[cfg(feature = "duplicates")]
+    pub(crate) fn excludes_subtree(&self, dir: &Path) -> bool {
+        let candidate = Candidate::new(dir);
+        let mut governed = false;
+
+        for (part, root) in self.roots.iter().enumerate() {
+            match root {
+                // Rooted below: its territory is still to be reached.
+                Some(root) if is_within(root, dir) && root != dir => return false,
+                Some(root) if !is_within(dir, root) => continue,
+                _ => {}
+            }
+            governed = true;
+            if !self.excluded(part, &candidate) {
+                return false;
+            }
+        }
+        governed
     }
 
     /// Indices of the rules whose includes match, lowest first, deduplicated.
@@ -455,13 +632,14 @@ impl Rules {
     pub(crate) fn predicates_hold(&self, index: usize, facts: &Facts<'_>) -> bool {
         // `all`, so two required siblings are two questions: each pattern has to
         // find something of its own.
-        if !self.siblings[index]
+        if !self.requires[index]
             .iter()
             .all(|wanted| (facts.any_sibling)(&|name| wanted.is_match(name)))
         {
             return false;
         }
-        !self.rules[index]
+        !self
+            .part_at(index)
             .older_than
             .is_some_and(|older_than| !is_older(facts.modified, older_than, facts.now))
     }
@@ -472,7 +650,7 @@ impl Rules {
     /// sets never ask, and a listing read to answer a question nobody posed is
     /// a listing read for nothing.
     pub fn wants_siblings(&self) -> bool {
-        self.siblings.iter().any(|wanted| !wanted.is_empty())
+        self.requires.iter().any(|wanted| !wanted.is_empty())
     }
 
     /// What the rules say about one path, for showing rather than for deciding.
@@ -515,7 +693,7 @@ impl Rules {
             return State::Excluded;
         }
 
-        let governing: Vec<usize> = (0..self.rules.len())
+        let governing: Vec<usize> = (0..self.owner.len())
             .filter(|index| match &self.roots[*index] {
                 // An unrooted rule applies wherever the scan goes.
                 None => true,
@@ -624,39 +802,54 @@ impl State {
 pub fn age_rule(older_than: Duration) -> Rule {
     Rule {
         name: "old".into(),
-        includes: vec!["**".into()],
-        older_than: Some(older_than),
         tier: Tier::Confirm,
+        parts: vec![Part {
+            includes: vec!["**".into()],
+            older_than: Some(older_than),
+            ..Part::default()
+        }],
         ..Rule::default()
     }
 }
 
 /// The five shipped rules, in precedence order.
 ///
-/// Public so that Task 2's `config init` renders **this** list rather than a
-/// second copy of it that could drift.
+/// Public so that `config init` renders **this** list rather than a second copy
+/// of it that could drift.
+///
+/// Each is one part, because each says one thing. `user-caches` shows what a
+/// second part would be for: two roots under one name and one tier.
 pub fn builtin_rules() -> Vec<Rule> {
     vec![
         Rule {
             name: "rust-target".into(),
-            includes: vec!["**/target/".into()],
-            // Without the manifest this is an ordinary directory that happens to
-            // share a name with a build one.
-            requires_sibling: vec!["Cargo.toml".into()],
-            requires_clean_repo: true,
             tier: Tier::Trash,
+            parts: vec![Part {
+                includes: vec!["**/target/".into()],
+                // Without the manifest this is an ordinary directory that
+                // happens to share a name with a build one.
+                requires: vec!["Cargo.toml".into()],
+                requires_clean_repo: true,
+                ..Part::default()
+            }],
             ..Rule::default()
         },
         Rule {
             name: "node-modules".into(),
-            includes: vec!["**/node_modules/".into()],
             tier: Tier::Trash,
+            parts: vec![Part {
+                includes: vec!["**/node_modules/".into()],
+                ..Part::default()
+            }],
             ..Rule::default()
         },
         Rule {
             name: "pycache".into(),
-            includes: vec!["**/__pycache__/".into(), "**/*.pyc".into()],
             tier: Tier::Trash,
+            parts: vec![Part {
+                includes: vec!["**/__pycache__/".into(), "**/*.pyc".into()],
+                ..Part::default()
+            }],
             ..Rule::default()
         },
         // The tilde is the entire safety of this one: `~/Library/Caches` is
@@ -664,25 +857,42 @@ pub fn builtin_rules() -> Vec<Rule> {
         // kept the two apart in code; here the distinction is visible as data.
         //
         // No `**`: the cache *root* is the candidate, never its contents
-        // individually — which is what `same_path` used to say.
+        // individually.
         Rule {
             name: "user-caches".into(),
-            root: Some("~".into()),
-            includes: vec![".cache/".into(), "Library/Caches/".into()],
             tier: Tier::Trash,
+            parts: vec![Part {
+                root: Some("~".into()),
+                includes: vec![".cache/".into(), "Library/Caches/".into()],
+                ..Part::default()
+            }],
             ..Rule::default()
         },
-        // Separate from `user-caches` because it has a different root, and one
-        // rule cannot have two. v0.2 folded both into a single category, which
-        // hid the fact that they are anchored differently.
+        // A separate rule rather than a second part of `user-caches`: the two
+        // are different claims about different platforms, and a report naming
+        // one of them should not be able to mean the other.
         Rule {
             name: "windows-temp".into(),
-            root: Some("%LOCALAPPDATA%".into()),
-            includes: vec!["Temp/".into()],
             tier: Tier::Trash,
+            parts: vec![Part {
+                root: Some("%LOCALAPPDATA%".into()),
+                includes: vec!["Temp/".into()],
+                ..Part::default()
+            }],
             ..Rule::default()
         },
     ]
+}
+
+/// Expand the tokens a user may write at the head of a path: `~`,
+/// `%APPDATA%`, `%LOCALAPPDATA%`.
+///
+/// The same expansion a rule's `root` gets, exported so that every other place a
+/// user writes a path — `keep-in`, so far — means the same thing by `~`. `None`
+/// when the token names a directory this frontend could not find, which is the
+/// project's usual reading of unknown: not everywhere, but nowhere.
+pub fn user_path(text: &str, dirs: &UserDirs) -> Option<PathBuf> {
+    resolve_root(Some(text), dirs).flatten()
 }
 
 /// `Some(None)` for an unrooted rule, `Some(Some(path))` for a resolved one, and
@@ -760,6 +970,12 @@ fn compile(
         // where it does not would put a directory the user never named up for
         // deletion.
         .case_insensitive(cfg!(windows))
+        // `*` stops at a separator; only `**` crosses one. Without this globset
+        // lets `*` reach to any depth, which made `**` and `*` synonyms — so the
+        // distinction every comment in this file draws, and the one gitignore
+        // draws, was fiction. It also made "only the direct children of this
+        // directory" inexpressible: `parent/*/` claimed grandchildren too.
+        .literal_separator(true)
         .build()
         .map_err(|err| RuleError {
             rule: rule.to_owned(),
@@ -779,10 +995,14 @@ mod tests {
         }
     }
 
+    /// A one-part rule, which is what most of these tests are about.
     fn rule(name: &str, includes: &[&str]) -> Rule {
         Rule {
             name: name.into(),
-            includes: includes.iter().map(|s| (*s).to_owned()).collect(),
+            parts: vec![Part {
+                includes: includes.iter().map(|s| (*s).to_owned()).collect(),
+                ..Part::default()
+            }],
             ..Rule::default()
         }
     }
@@ -825,11 +1045,11 @@ mod tests {
     }
 
     /// A rooted rule, since every state but one is about roots.
+    /// A rooted rule, since every state but one is about roots.
     fn rooted(name: &str, root: &str, includes: &[&str]) -> Rule {
-        Rule {
-            root: Some(root.to_owned()),
-            ..rule(name, includes)
-        }
+        let mut base = rule(name, includes);
+        base.parts[0].root = Some(root.to_owned());
+        base
     }
 
     /// Which rules match, by name — the shape every test below asserts on.
@@ -840,6 +1060,49 @@ mod tests {
             .into_iter()
             .map(|index| rules.rule_at(index).name.clone())
             .collect()
+    }
+
+    /// `*` stops at a separator and `**` crosses one — the distinction gitignore
+    /// draws, and the one every comment in this file assumed. Until v0.7 they
+    /// were synonyms: globset lets `*` reach to any depth unless told otherwise,
+    /// so `parent/*/` quietly claimed grandchildren, and "only the direct
+    /// children of this directory" could not be said at all.
+    #[test]
+    fn one_star_stops_at_a_separator_and_two_cross_it() {
+        let rules = Rules::new(
+            vec![rooted("shallow", "/store", &["*/"])],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+
+        assert_eq!(matches(&rules, "/store/package", true), vec!["shallow"]);
+        assert!(
+            matches(&rules, "/store/package/version", true).is_empty(),
+            "a grandchild is not a direct child"
+        );
+
+        let deep = Rules::new(
+            vec![rooted("deep", "/store", &["**/"])],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+        assert_eq!(matches(&deep, "/store/package/version", true), vec!["deep"]);
+    }
+
+    /// The same rule inside a name: `*.pyc` is a name, not a path.
+    #[test]
+    fn a_star_in_a_name_does_not_reach_into_a_directory() {
+        let rules = Rules::new(
+            vec![rooted("names", "/p", &["*.log"])],
+            &UserDirs::default(),
+        )
+        .expect("compiles");
+
+        assert_eq!(matches(&rules, "/p/app.log", false), vec!["names"]);
+        assert!(
+            matches(&rules, "/p/nested/app.log", false).is_empty(),
+            "which is why the built-ins are written `**/*.pyc` and not `*.pyc`"
+        );
     }
 
     /// The property the whole design rests on: precedence is the order the rules
@@ -884,9 +1147,10 @@ mod tests {
     fn an_unresolvable_token_drops_only_its_own_rule() {
         let rules = Rules::new(
             vec![
-                Rule {
-                    root: Some("~".into()),
-                    ..rule("needs-home", &[".cache/"])
+                {
+                    let mut base = rule("needs-home", &[".cache/"]);
+                    base.parts[0].root = Some("~".into());
+                    base
                 },
                 rule("rootless", &["**/x/"]),
             ],
@@ -905,9 +1169,10 @@ mod tests {
     #[test]
     fn a_resolved_token_anchors_the_pattern() {
         let rules = Rules::new(
-            vec![Rule {
-                root: Some("~".into()),
-                ..rule("caches", &[".cache/"])
+            vec![{
+                let mut base = rule("caches", &[".cache/"]);
+                base.parts[0].root = Some("~".into());
+                base
             }],
             &dirs("/home/me"),
         )
@@ -949,9 +1214,10 @@ mod tests {
     fn excludes_are_scoped_to_their_own_rule() {
         let rules = Rules::new(
             vec![
-                Rule {
-                    excludes: vec!["**/vendor/**".into()],
-                    ..rule("narrow", &["**/node_modules/"])
+                {
+                    let mut base = rule("narrow", &["**/node_modules/"]);
+                    base.parts[0].excludes = vec!["**/vendor/**".into()];
+                    base
                 },
                 rule("wide", &["**/node_modules/"]),
             ],
@@ -1004,9 +1270,10 @@ mod tests {
         let home = PathBuf::from(OsString::from_vec(vec![b'/', 0xff, 0xfe]));
         let rules = Rules::new(
             vec![
-                Rule {
-                    root: Some("~".into()),
-                    ..rule("caches", &[".cache/"])
+                {
+                    let mut base = rule("caches", &[".cache/"]);
+                    base.parts[0].root = Some("~".into());
+                    base
                 },
                 rule("rootless", &["**/x/"]),
             ],
@@ -1034,9 +1301,10 @@ mod tests {
     #[test]
     fn a_subtree_outside_every_root_is_pruned() {
         let rules = Rules::new(
-            vec![Rule {
-                root: Some("~/Projects".into()),
-                ..rule("scoped", &["**/target/"])
+            vec![{
+                let mut base = rule("scoped", &["**/target/"]);
+                base.parts[0].root = Some("~/Projects".into());
+                base
             }],
             &dirs("/home/me"),
         )
@@ -1051,9 +1319,10 @@ mod tests {
     #[test]
     fn the_root_and_its_ancestors_are_never_pruned() {
         let rules = Rules::new(
-            vec![Rule {
-                root: Some("~/Projects".into()),
-                ..rule("scoped", &["**/target/"])
+            vec![{
+                let mut base = rule("scoped", &["**/target/"]);
+                base.parts[0].root = Some("~/Projects".into());
+                base
             }],
             &dirs("/home/me"),
         )
@@ -1086,9 +1355,10 @@ mod tests {
             ("%APPDATA%", "/roaming"),
         ] {
             let rules = Rules::new(
-                vec![Rule {
-                    root: Some(format!("{token}/inner")),
-                    ..rule("t", &["x/"])
+                vec![{
+                    let mut base = rule("t", &["x/"]);
+                    base.parts[0].root = Some(format!("{token}/inner"));
+                    base
                 }],
                 &dirs,
             )
@@ -1108,9 +1378,10 @@ mod tests {
     fn a_token_whose_directory_is_unknown_drops_its_rule() {
         for token in ["~", "%LOCALAPPDATA%", "%APPDATA%"] {
             let rules = Rules::new(
-                vec![Rule {
-                    root: Some(token.into()),
-                    ..rule("t", &["x/"])
+                vec![{
+                    let mut base = rule("t", &["x/"]);
+                    base.parts[0].root = Some(token.into());
+                    base
                 }],
                 &UserDirs::default(),
             )
@@ -1128,9 +1399,10 @@ mod tests {
     fn an_unknown_token_is_a_literal_path() {
         for root in ["%FOO%", "%", "%%", "~sam", "Projects"] {
             let rules = Rules::new(
-                vec![Rule {
-                    root: Some(root.into()),
-                    ..rule("literal", &["x/"])
+                vec![{
+                    let mut base = rule("literal", &["x/"]);
+                    base.parts[0].root = Some(root.into());
+                    base
                 }],
                 &dirs("/home/me"),
             )
@@ -1150,9 +1422,10 @@ mod tests {
     #[test]
     fn rules_that_all_drop_leave_an_empty_set() {
         let rules = Rules::new(
-            vec![Rule {
-                root: Some("~".into()),
-                ..rule("needs-home", &[".cache/"])
+            vec![{
+                let mut base = rule("needs-home", &[".cache/"]);
+                base.parts[0].root = Some("~".into());
+                base
             }],
             &UserDirs::default(),
         )
@@ -1174,8 +1447,9 @@ mod tests {
 
         assert_eq!(rule.tier, Tier::Confirm);
         assert_eq!(rule.name, "old");
-        assert_eq!(rule.older_than, Some(Duration::from_secs(1)));
-        assert_eq!(rule.root, None, "it applies wherever the scan goes");
+        let part = &rule.parts[0];
+        assert_eq!(part.older_than, Some(Duration::from_secs(1)));
+        assert_eq!(part.root, None, "it applies wherever the scan goes");
     }
 
     #[test]
@@ -1239,17 +1513,18 @@ mod tests {
     fn only_rust_target_wants_a_clean_repository() {
         let rules = Rules::builtin(&dirs("/home/me"));
 
-        assert!(
+        let guarded = |name: &str| {
             rules
-                .get("rust-target")
+                .get(name)
                 .expect("present")
-                .requires_clean_repo
-        );
+                .parts
+                .iter()
+                .any(|part| part.requires_clean_repo)
+        };
+
+        assert!(guarded("rust-target"));
         for name in ["node-modules", "pycache", "user-caches"] {
-            assert!(
-                !rules.get(name).expect(name).requires_clean_repo,
-                "{name} is not produced from a working tree"
-            );
+            assert!(!guarded(name), "{name} is not produced from a working tree");
         }
     }
 
@@ -1285,9 +1560,10 @@ mod tests {
     #[test]
     fn a_bare_token_resolves_to_the_directory_itself() {
         let rules = Rules::new(
-            vec![Rule {
-                root: Some("~".into()),
-                ..rule("t", &["x/"])
+            vec![{
+                let mut base = rule("t", &["x/"]);
+                base.parts[0].root = Some("~".into());
+                base
             }],
             &dirs("/home/me"),
         )
@@ -1314,17 +1590,20 @@ mod tests {
     fn a_root_inside_another_is_dropped() {
         let rules = Rules::new(
             vec![
-                Rule {
-                    root: Some("~/Projects".into()),
-                    ..rule("inner", &["**/target/"])
+                {
+                    let mut base = rule("inner", &["**/target/"]);
+                    base.parts[0].root = Some("~/Projects".into());
+                    base
                 },
-                Rule {
-                    root: Some("~".into()),
-                    ..rule("outer", &["**/node_modules/"])
+                {
+                    let mut base = rule("outer", &["**/node_modules/"]);
+                    base.parts[0].root = Some("~".into());
+                    base
                 },
-                Rule {
-                    root: Some("~/Projects/github".into()),
-                    ..rule("deeper", &["**/x/"])
+                {
+                    let mut base = rule("deeper", &["**/x/"]);
+                    base.parts[0].root = Some("~/Projects/github".into());
+                    base
                 },
             ],
             &dirs("/home/me"),
@@ -1345,13 +1624,15 @@ mod tests {
     fn a_sibling_that_merely_shares_a_prefix_is_kept() {
         let rules = Rules::new(
             vec![
-                Rule {
-                    root: Some("/home/min".into()),
-                    ..rule("a", &["**/x/"])
+                {
+                    let mut base = rule("a", &["**/x/"]);
+                    base.parts[0].root = Some("/home/min".into());
+                    base
                 },
-                Rule {
-                    root: Some("/home/mine".into()),
-                    ..rule("b", &["**/y/"])
+                {
+                    let mut base = rule("b", &["**/y/"]);
+                    base.parts[0].root = Some("/home/mine".into());
+                    base
                 },
             ],
             &UserDirs::default(),
@@ -1369,13 +1650,15 @@ mod tests {
     fn duplicate_roots_collapse() {
         let rules = Rules::new(
             vec![
-                Rule {
-                    root: Some("~".into()),
-                    ..rule("a", &["**/x/"])
+                {
+                    let mut base = rule("a", &["**/x/"]);
+                    base.parts[0].root = Some("~".into());
+                    base
                 },
-                Rule {
-                    root: Some("~".into()),
-                    ..rule("b", &["**/y/"])
+                {
+                    let mut base = rule("b", &["**/y/"]);
+                    base.parts[0].root = Some("~".into());
+                    base
                 },
             ],
             &dirs("/home/me"),
@@ -1427,7 +1710,7 @@ mod tests {
     #[test]
     fn a_path_is_untracked_in_scope_included_or_excluded() {
         let mut rule = rooted("junk", "~/Projects", &["**/target/"]);
-        rule.excludes = vec!["**/keep/**".into()];
+        rule.parts[0].excludes = vec!["**/keep/**".into()];
         let rules = Rules::new(vec![rule], &dirs("/home/me")).expect("compiles");
 
         assert_eq!(
@@ -1510,7 +1793,7 @@ mod tests {
     #[test]
     fn the_first_rule_that_claims_it_without_declining_it_wins() {
         let mut first = rooted("first", "~/Projects", &["**/target/"]);
-        first.excludes = vec!["**/target/".into()];
+        first.parts[0].excludes = vec!["**/target/".into()];
         let second = rooted("second", "~/Projects", &["**/target/"]);
 
         let rules = Rules::new(vec![first, second], &dirs("/home/me")).expect("compiles");
@@ -1527,7 +1810,7 @@ mod tests {
     #[test]
     fn an_exclude_without_a_matching_include_still_reads_as_excluded() {
         let mut rule = rooted("junk", "~/Projects", &["**/target/"]);
-        rule.excludes = vec!["**/vendor/**".into()];
+        rule.parts[0].excludes = vec!["**/vendor/**".into()];
         let rules = Rules::new(vec![rule], &dirs("/home/me")).expect("compiles");
 
         assert_eq!(
@@ -1579,9 +1862,10 @@ mod tests {
     #[test]
     fn a_glob_match_whose_predicate_fails_is_in_scope_not_included() {
         let rules = Rules::new(
-            vec![Rule {
-                requires_sibling: vec!["Cargo.toml".into()],
-                ..rooted("rust-target", "~/Projects", &["**/target/"])
+            vec![{
+                let mut base = rooted("rust-target", "~/Projects", &["**/target/"]);
+                base.parts[0].requires = vec!["Cargo.toml".into()];
+                base
             }],
             &dirs("/home/me"),
         )
@@ -1603,9 +1887,10 @@ mod tests {
     #[test]
     fn a_required_sibling_is_a_glob() {
         let rules = Rules::new(
-            vec![Rule {
-                requires_sibling: vec!["*.csproj".into()],
-                ..rooted("csharp-bin", "~/Projects", &["**/bin/", "**/obj/"])
+            vec![{
+                let mut base = rooted("csharp-bin", "~/Projects", &["**/bin/", "**/obj/"]);
+                base.parts[0].requires = vec!["*.csproj".into()];
+                base
             }],
             &dirs("/home/me"),
         )
@@ -1631,9 +1916,10 @@ mod tests {
     #[test]
     fn a_plain_name_still_means_that_name() {
         let rules = Rules::new(
-            vec![Rule {
-                requires_sibling: vec!["Cargo.toml".into()],
-                ..rooted("rust-target", "~/Projects", &["**/target/"])
+            vec![{
+                let mut base = rooted("rust-target", "~/Projects", &["**/target/"]);
+                base.parts[0].requires = vec!["Cargo.toml".into()];
+                base
             }],
             &dirs("/home/me"),
         )
@@ -1655,9 +1941,10 @@ mod tests {
     #[test]
     fn every_required_sibling_needs_a_match_of_its_own() {
         let rules = Rules::new(
-            vec![Rule {
-                requires_sibling: vec!["*.csproj".into(), "*.sln".into()],
-                ..rooted("dotnet", "~/Projects", &["**/bin/"])
+            vec![{
+                let mut base = rooted("dotnet", "~/Projects", &["**/bin/"]);
+                base.parts[0].requires = vec!["*.csproj".into(), "*.sln".into()];
+                base
             }],
             &dirs("/home/me"),
         )
@@ -1678,9 +1965,10 @@ mod tests {
     #[test]
     fn a_malformed_required_sibling_names_the_rule_and_the_pattern() {
         let err = Rules::new(
-            vec![Rule {
-                requires_sibling: vec!["*.[cs".into()],
-                ..rule("broken", &["**/bin/"])
+            vec![{
+                let mut base = rule("broken", &["**/bin/"]);
+                base.parts[0].requires = vec!["*.[cs".into()];
+                base
             }],
             &UserDirs::default(),
         )
@@ -1694,9 +1982,10 @@ mod tests {
     #[test]
     fn a_rule_set_says_whether_anything_asks_about_siblings() {
         let asking = Rules::new(
-            vec![Rule {
-                requires_sibling: vec!["*.csproj".into()],
-                ..rule("dotnet", &["**/bin/"])
+            vec![{
+                let mut base = rule("dotnet", &["**/bin/"]);
+                base.parts[0].requires = vec!["*.csproj".into()];
+                base
             }],
             &UserDirs::default(),
         )
@@ -1715,9 +2004,10 @@ mod tests {
     fn an_age_threshold_decides_the_same_way_here_as_in_detect() {
         const DAY: Duration = Duration::from_secs(24 * 60 * 60);
         let rules = Rules::new(
-            vec![Rule {
-                older_than: Some(30 * DAY),
-                ..rooted("stale", "~/Downloads", &["**"])
+            vec![{
+                let mut base = rooted("stale", "~/Downloads", &["**"]);
+                base.parts[0].older_than = Some(30 * DAY);
+                base
             }],
             &dirs("/home/me"),
         )
@@ -1743,9 +2033,10 @@ mod tests {
     /// reason `detect::claim` says so.
     #[test]
     fn a_failed_predicate_lets_a_later_rule_claim_the_path() {
-        let first = Rule {
-            requires_sibling: vec!["Cargo.toml".into()],
-            ..rooted("first", "~/Projects", &["**/target/"])
+        let first = {
+            let mut base = rooted("first", "~/Projects", &["**/target/"]);
+            base.parts[0].requires = vec!["Cargo.toml".into()];
+            base
         };
         let second = rooted("second", "~/Projects", &["**/target/"]);
 

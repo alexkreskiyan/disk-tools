@@ -7,17 +7,20 @@
 mod args;
 mod config;
 mod env;
+mod explain;
 mod render;
 mod ui;
 
 use args::{Args, Cleanup, Environment, Intent, Mode, Report, validate_root};
 use clap::Parser;
 use disk_tools_core::{
-    CleanOutcome, CleanPlan, ScanOptions, ScanTree, SkippedEntry, apply, plan, scan,
+    CleanOutcome, CleanPlan, DuplicateOptions, Duplicates, ScanOptions, ScanTree, Searched,
+    SkippedEntry, apply, duplicates, plan, plan_duplicates, scan,
 };
 use indicatif::ProgressBar;
 use render::clean::{render_clean, render_outcome};
-use render::json::{render_json, render_outcome_json, render_plan};
+use render::dup::render_dup;
+use render::json::{render_dup_plan, render_json, render_outcome_json, render_plan};
 use render::skipped::render_skipped;
 use render::tree::{RenderOptions, render_tree};
 use std::io::{self, BufWriter, Write};
@@ -27,6 +30,7 @@ use std::time::{Duration, SystemTime};
 fn main() -> ExitCode {
     let args = Args::parse();
     let verbose = args.verbose;
+    let explaining = args.explain;
 
     // The core reads no clock, no environment and no config file, so all three
     // are resolved here and handed over. The clock once, at the top, so every
@@ -34,6 +38,10 @@ fn main() -> ExitCode {
     let user_dirs = env::user_dirs();
     let xdg = env::xdg_config_home();
     let config_path = config::locate(args.config.as_deref(), &user_dirs, xdg.clone());
+    // Kept for `--explain`, which names the file that was actually **read** —
+    // located and absent is an ordinary state, and saying "none found" is the
+    // answer a user chasing a rule that does nothing needs.
+    let named = config_path.clone().filter(|path| path.exists());
 
     // Before anything is scanned: a config that cannot be understood means the
     // rules are unknown, and the rules decide what may be deleted.
@@ -64,10 +72,23 @@ fn main() -> ExitCode {
     }) {
         Ok(mode) => mode,
         Err(err) => {
-            eprintln!("disk-tools: config: {err}");
+            match err.about() {
+                Some(subject) => eprintln!("disk-tools: {subject}: {err}"),
+                None => eprintln!("disk-tools: {err}"),
+            }
             return ExitCode::from(2);
         }
     };
+
+    // Before anything is walked, read or removed. Explaining and then acting
+    // would make this a log line rather than a check.
+    if explaining {
+        let said = explain::explain(&mode, named.as_deref(), verbose);
+        return match write_report(&said) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
 
     match mode {
         Mode::Scan {
@@ -169,14 +190,30 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
         ..
     } = &cleanup;
     let (roots_from_rules, intent, report) = (*roots_from_rules, *intent, *report);
+    // Which report is printed is settled by the mode, not by the plan: an empty
+    // duplicate run still has to print the duplicate report, which is the one
+    // that says why it might be empty. What it needs beyond the plan is filled
+    // in as the roots are searched.
+    let mut keeping = cleanup.duplicates.as_ref().map(|_| Keeping {
+        now: cleanup.options.detect.now,
+        pools: Vec::new(),
+    });
 
     if roots.is_empty() {
         // Not an error and not an empty plan. "Nothing to clean" would be a
         // claim about the disk; this is a statement about the configuration, and
         // the two remedies are different things to go and do.
+        //
+        // Which list is named matters: under `--dup` the clean rules' roots are
+        // not what was consulted, and sending someone to edit them would send
+        // them to the wrong half of their file.
+        let (list, verb) = match cleanup.duplicates {
+            Some(_) => ("duplicate rule", "search"),
+            None => ("rule", "clean"),
+        };
         eprintln!(
-            "disk-tools: no rule names a directory to clean.\n\
-             Pass a path, or give a rule a `root` other than \"*\"."
+            "disk-tools: no {list} names a directory to {verb}.\n\
+             Pass a path, or give one of its parts a `root` other than \"*\"."
         );
         return ExitCode::SUCCESS;
     }
@@ -227,7 +264,20 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
         // description that may have gone stale, and one missing directory is no
         // reason to leave the others uncleaned. `scan` reports it as a skip.
         let mut tree = scan_with_spinner(&walk, "Scanning…");
-        plans.push(plan(&tree, options));
+        plans.push(match &cleanup.duplicates {
+            // The two sources of a candidate, and the one place either is
+            // chosen. Both produce the same plan, so everything after this line
+            // — the refusal, the report, the removal — is unaware of which ran.
+            Some(duplicating) => {
+                let found = search_with_spinner(&tree, duplicating, options);
+                skipped.extend(found.skipped.iter().cloned());
+                if let Some(keeping) = &mut keeping {
+                    merge_pools(&mut keeping.pools, found.pools.clone());
+                }
+                plan_duplicates(&tree, &found, options)
+            }
+            None => plan(&tree, options),
+        });
         skipped.extend(std::mem::take(&mut tree.skipped));
         if unfolding {
             trees.push(tree);
@@ -237,7 +287,7 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
     let planned = CleanPlan::merge(plans);
 
     if intent == Intent::Removing {
-        return remove(&planned, &cleanup, &trees, &skipped, verbose);
+        return remove(&planned, &cleanup, &trees, &skipped, keeping, verbose);
     }
 
     // The count of what `--safe` hid comes back with the plan. It used to come
@@ -247,19 +297,81 @@ fn run_clean(cleanup: Cleanup, verbose: bool) -> ExitCode {
     // subtracting two independently-measured numbers, which could disagree.
     let hidden = options.safe_only.then_some(planned.filtered_out);
 
+    match text(&planned, hidden, Intent::Preview, report, &trees, keeping) {
+        Ok(shown) => emit(&shown, &skipped, verbose),
+        Err(err) => json_failed(err),
+    }
+}
+
+/// What a duplicate report needs beyond the plan.
+///
+/// `Some` exactly when `--dup` was passed, so **which report is printed is
+/// settled by the mode** rather than inferred from the plan's contents. An empty
+/// duplicate run has to say "no duplicates found" and name why, which a plan
+/// with no candidates in it cannot distinguish from any other empty plan.
+#[derive(Clone)]
+struct Keeping {
+    /// The clock the keeper's date is shown against, taken once at the top of
+    /// the run like every other "now" here.
+    ///
+    /// The keeper *rule* is not here: each pool has its own, so it travels on
+    /// the candidate instead.
+    now: SystemTime,
+
+    /// Every pool that was searched, and how much fell into it.
+    ///
+    /// Not in the plan, and rightly: the plan says what will happen, and this
+    /// says what was **looked at**. It is the only thing that can tell an empty
+    /// report caused by a disk with no duplicates from one caused by a
+    /// configuration that searched nowhere.
+    pools: Vec<Searched>,
+}
+
+/// The plan as text or as JSON, in whichever of the two shapes it is about.
+fn text(
+    planned: &CleanPlan,
+    hidden_by_safe: Option<usize>,
+    intent: Intent,
+    report: Report,
+    inside: &[ScanTree],
+    keeping: Option<Keeping>,
+) -> serde_json::Result<String> {
     if report.json {
-        // `hidden` is a sentence for a human about a flag they passed. A
-        // consumer knows what it passed, and can count the plan.
-        return match render_plan(&planned) {
-            Ok(payload) => emit(&(payload + "\n"), &skipped, verbose),
-            Err(err) => json_failed(err),
+        return match &keeping {
+            Some(keeping) => render_dup_plan(planned, &keeping.pools).map(|payload| payload + "\n"),
+            None => render_plan(planned).map(|payload| payload + "\n"),
         };
     }
-    emit(
-        &render_clean(&planned, hidden, Intent::Preview, report, &trees),
-        &skipped,
-        verbose,
-    )
+    Ok(human(
+        planned,
+        hidden_by_safe,
+        intent,
+        report,
+        inside,
+        keeping,
+    ))
+}
+
+/// The report as a person reads it, whatever `--json` said.
+///
+/// Split out because one caller needs exactly that: the plan printed to stderr
+/// immediately before a removal is context for the operation, not the document,
+/// and emitting JSON there would put a second value on a stream that already
+/// carries one on stdout.
+fn human(
+    planned: &CleanPlan,
+    hidden_by_safe: Option<usize>,
+    intent: Intent,
+    report: Report,
+    inside: &[ScanTree],
+    keeping: Option<Keeping>,
+) -> String {
+    match keeping {
+        Some(Keeping { now, pools }) => {
+            render_dup(planned, hidden_by_safe, intent, report, now, &pools)
+        }
+        None => render_clean(planned, hidden_by_safe, intent, report, inside),
+    }
 }
 
 /// The plan, in whichever shape was asked for.
@@ -268,11 +380,9 @@ fn render(
     report: Report,
     intent: Intent,
     inside: &[ScanTree],
+    keeping: Option<Keeping>,
 ) -> serde_json::Result<String> {
-    if report.json {
-        return render_plan(planned).map(|payload| payload + "\n");
-    }
-    Ok(render_clean(planned, None, intent, report, inside))
+    text(planned, None, intent, report, inside, keeping)
 }
 
 /// A path that is not UTF-8 cannot be a JSON string.
@@ -295,6 +405,7 @@ fn remove(
     cleanup: &Cleanup,
     inside: &[ScanTree],
     skipped: &[SkippedEntry],
+    keeping: Option<Keeping>,
     verbose: bool,
 ) -> ExitCode {
     let report = cleanup.report;
@@ -302,7 +413,7 @@ fn remove(
         // Nothing to remove, so this is the same "Nothing to clean." a preview
         // prints — and it goes through `render` so that `--json` gets a
         // document rather than a sentence.
-        return match render(planned, report, Intent::Preview, inside) {
+        return match render(planned, report, Intent::Preview, inside, keeping) {
             Ok(shown) => emit(&shown, skipped, verbose),
             Err(err) => json_failed(err),
         };
@@ -326,7 +437,7 @@ fn remove(
         // Nothing happened, so what there is to report is the plan — the same
         // document `preview` would have produced. A consumer tells the two
         // apart by the exit code, which is the thing it has to read anyway.
-        let code = match render(planned, report, Intent::Preview, inside) {
+        let code = match render(planned, report, Intent::Preview, inside, keeping) {
             Ok(shown) => emit(&shown, skipped, verbose),
             Err(err) => return json_failed(err),
         };
@@ -353,7 +464,7 @@ fn remove(
     // second JSON value on the way to it would make the stream unparseable.
     eprint!(
         "{}",
-        render_clean(planned, None, Intent::Removing, report, inside)
+        human(planned, None, Intent::Removing, report, inside, keeping)
     );
     if confirm > 0 {
         // Reached only with `--yes`, or with `require-confirmation` turned off.
@@ -435,6 +546,61 @@ fn scan_with_spinner(options: &ScanOptions, message: &'static str) -> ScanTree {
     tree
 }
 
+/// Add one root's pool counts to the run's.
+///
+/// `clean` with no path walks a root per rule, so one pool can be filled from
+/// several of them — and a report saying "everywhere: 40 files" twice would be
+/// describing the walk rather than the search.
+fn merge_pools(into: &mut Vec<Searched>, found: Vec<Searched>) {
+    for pool in found {
+        match into.iter_mut().find(|kept| kept.rule == pool.rule) {
+            Some(kept) => kept.files += pool.files,
+            None => into.push(pool),
+        }
+    }
+    into.sort_by(|a, b| a.rule.cmp(&b.rule));
+}
+
+/// Hash what needs hashing, saying how much of it there is.
+///
+/// The only phase in this tool bounded by disk throughput rather than metadata
+/// calls, so its spinner carries a running total rather than one word: a scan
+/// takes a second and this can take minutes on a large tree.
+///
+/// The message is rebuilt per file, which is far more often than the 100 ms
+/// tick redraws — cheap next to the read that produced it.
+fn search_with_spinner(
+    tree: &ScanTree,
+    duplicating: &args::Duplicating,
+    options: &disk_tools_core::CleanOptions,
+) -> Duplicates {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_message("Comparing…");
+    spinner.enable_steady_tick(Duration::from_millis(100));
+
+    let found = duplicates(
+        tree,
+        &DuplicateOptions {
+            // The rules prune and claim nothing: this is the same detection the
+            // other source would have run, put to the opposite use.
+            detect: options.detect.clone(),
+            rules: duplicating.rules.clone(),
+            min_size: duplicating.min_size,
+            keep: duplicating.keep,
+            keep_in: duplicating.keep_in.clone(),
+        },
+        &|hashed| {
+            spinner.set_message(format!(
+                "Comparing… {} read",
+                render::tree::format_size(hashed.running_total)
+            ));
+        },
+    );
+
+    spinner.finish_and_clear();
+    found
+}
+
 /// Report to stdout, skips to stderr.
 ///
 /// Takes the skips rather than the tree they came from: `clean` with no path
@@ -509,6 +675,7 @@ mod tests {
             rule: "node-modules".into(),
             tier: Tier::Trash,
             purge: false,
+            duplicate_of: None,
             allocated: 4096,
             shared,
         }

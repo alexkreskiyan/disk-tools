@@ -18,14 +18,26 @@ its Roadmap for what lands when; the
 the authoritative task breakdowns; [v0.4](kb/specs/2026.07/2026.07.26-disk-tools-v0.4-tui.md)
 (the TUI) **is complete** — `disk-tools ui` browses a directory as a table, sizes
 its subdirectories in the background, colours them by what the rules say, filters
-with `/`, writes rules back to `config.toml` with every comment intact, and
-always gives the terminal back.
+with `/`, and always gives the terminal back. **Its rule editor is gone** — see
+the configuration section.
 **[v0.5](kb/specs/2026.07/2026.07.29-disk-tools-v0.5-preview-clean.md) is
 complete** — `preview` shows and `clean` removes, on an identical flag set;
 `--apply` and `--allow-dirty` are gone; the report unfolds by `-d` and orders by
 `--sort`; where a candidate goes is a third tier (`purge` / `trash` / `confirm`);
-and both verbs speak `--json`. **v0.6 is duplicates.** User-facing usage, flags,
-the safety model and the documented limitations live in the [README](README.md).
+and both verbs speak `--json`.
+**[v0.7](kb/specs/2026.07/2026.07.30-disk-tools-v0.7-duplicate-rules.md) is
+complete** — a rule is a **name, a consequence and a list of parts**, and
+satisfying any part satisfies the rule; `clean-rules:` and `duplicate-rules:` are
+two lists on that one shape, where a duplicate rule's parts **pool** rather than
+match; pool membership is exclusive, first rule in list order; and `--explain`
+says what a command would do without walking, reading or removing anything.
+**[v0.6](kb/specs/2026.07/2026.07.30-disk-tools-v0.6-duplicates.md) is
+complete** — `--dup` on both verbs switches the candidate source from the rules
+to file *contents*, found by a staged size → xxh3-128 → blake3 funnel; each group
+keeps one copy, chosen by `--keep` (creation time by default) or by `--keep-in`;
+every duplicate is confirm-tier, so `clean --dup` refuses without `--yes`. User-facing
+usage, flags, the safety model and the documented limitations live in the
+[README](README.md).
 
 ## Important: Documentation Requirements
 
@@ -61,6 +73,7 @@ rather than as ad-hoc commands.
 | `just run <ARGS>` | Run the CLI, e.g. `just run scan ~/Downloads --json` |
 | `just release` | Optimized host build → `target/release/disk-tools` |
 | `just install-cli` | `cargo install --path cli`, then check that the installed copy is the one first on PATH |
+| `just bench-dup <dir>` | Read-only diagnostic: run the duplicate pipeline over a real tree and print the funnel and the biggest groups. `DT_DUP_MIN` sets the floor |
 | `just bench-fixtures <dir>` / `just bench <dir>` / `just bench-memory <path>` / `just bench-phases <path>` / `just bench-stat <dir>` | Benchmark harness — needs `hyperfine` + `diskus`; results recorded in `kb/benchmarks/` |
 
 CI (`.github/workflows/ci.yml`) runs `just verify` + `just build` + `just smoke-trash`
@@ -85,34 +98,38 @@ disc-tools/
 │       ├── walk.rs     # read_dir + rayon par_iter recursion, skip collection
 │       ├── size.rs     # allocated (blocks*512 | GetCompressedFileSizeW) + apparent
 │       ├── dedup.rs    # hardlink attribution + the link groups it finds
+│       ├── duplicates.rs # cfg(feature="duplicates"): identical contents, staged
+│       ├── dup_rules.rs  # cfg(feature="duplicates"): pools, and who belongs to which
 │       ├── tree.rs     # ScanNode / ScanTree / SkippedEntry + aggregation
 │       ├── windows_dir.rs  # cfg(windows): AllocationSize, file id, LastWriteTime
 │       ├── paths.rs    # the path comparisons that decide what is a candidate
-│       ├── rules.rs    # Rule / Rules — one GlobSet, list order is precedence
+│       ├── rules.rs    # Part / Rule / Rules — one GlobSet over every part; list order is precedence
 │       ├── detect.rs   # the one pass that applies them
 │       ├── git.rs      # is there uncommitted work here?
-│       ├── clean.rs    # denylist, tiers, totals → CleanPlan. Writes nothing
+│       ├── clean.rs    # denylist, tiers, totals → CleanPlan (both sources). Writes nothing
 │       ├── measure.rs  # one subtree's bytes and its claim; reports each directory as it finishes
 │       └── trash.rs    # cfg(feature="trash"): the only code that removes anything
 ├── cli/                # disk-tools (bin) — CLI frontend
-│   ├── Cargo.toml      # clap, toml, serde, serde_ignored, indicatif, unicode-width
+│   ├── Cargo.toml      # clap, yaml_serde, serde, serde_ignored, indicatif, unicode-width
 │   ├── src/
 │   │   ├── main.rs     # verb dispatch (scan | preview | clean | ui); spinner to stderr
+│   │   ├── explain.rs  # --explain: what would happen, and where each value came from
 │   │   ├── args.rs     # clap derive; parse_size, parse_duration; Mode
-│   │   ├── config/     # locate/parse/validate the TOML file; `config init`
-│   │   │   └── write.rs    # putting a rule back, comments and all
+│   │   ├── config/     # locate/parse/validate the YAML file; `config init`
 │   │   ├── ui/         # the TUI
 │   │   │   ├── term.rs     # restores the terminal on every path
 │   │   │   ├── app.rs      # cwd, cursor, order, filter — every key as a function
 │   │   │   ├── listing.rs  # one directory, one metadata call per entry
-│   │   │   ├── sort.rs     # four orders; reports the one it could apply
+│   │   │   ├── sort.rs     # five orders; reports the one it could apply
 │   │   │   ├── layout.rs   # the table: which columns fit, and what is in them
-│   │   │   ├── edit.rs     # the rule form and its chooser, as values
-│   │   │   └── measure.rs  # the sizing worker, its queue and its session cache
+│   │   │   ├── measure.rs  # the sizing worker, its queue and its session cache
+│   │   │   └── removal.rs  # `D`: plan on a worker, ask, remove on a worker, say
+│   │   │                   #   only what is true while it runs
 │   │   ├── env.rs      # UserDirs + XDG from the environment — what the core refuses
 │   │   └── render/
 │   │       ├── mod.rs
 │   │       ├── tree.rs     # dust-style tree, parent-relative bars
+│   │       ├── dup.rs      # the duplicate report: groups, keep/remove, the basis, the pools
 │   │       ├── json.rs     # --json: the tree, a plan, or an outcome — raw byte counts
 │   │       ├── clean.rs    # the plan by depth, and what a removal did
 │   │       └── skipped.rs  # skipped-entries summary (capped at 10)
@@ -134,13 +151,19 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 |------|-------|------|
 | `scan(&ScanOptions) -> ScanTree` | `core/src/lib.rs` | Walk → dedup → aggregate, in that order |
 | `plan(&ScanTree, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | Decides what may go and what that frees. **Writes nothing** |
+| `duplicates(&ScanTree, &DuplicateOptions, progress) -> Duplicates` | `core/src/duplicates.rs` | Files with identical contents, as groups with a keeper. The **only** code here that reads file contents; still writes nothing and still returns its failures as data |
+| `plan_duplicates(&ScanTree, &Duplicates, &CleanOptions) -> CleanPlan` | `core/src/clean.rs` | The same plan type, from the other source. Keeps the denylist, `--safe`, `--purge`, `--min-size` and `shared`; drops the git guard, which says nothing about a photograph |
+| `Keep` / `Kept` | `core/src/duplicates.rs`, `core/src/clean.rs` | Which copy stays, and — on every candidate — which one did and what decided it |
 | `CleanPlan::merge(Vec<CleanPlan>)` | `core/src/clean.rs` | One plan from several roots. Additive **only because** `Rules::scan_roots` drops nested roots |
 | `measure(root, claim, cancel, finished) -> Measured` | `core/src/measure.rs` | One subtree's bytes **and what the rules claim of them**, from one walk. Reports **every directory as that directory finishes**, so an outer walk subsumes the inner ones instead of racing them |
 | `Claim` | `core/src/measure.rs` | The rules, `now`, and whether `root` is *already* claimed — without the last, a walk of a `node_modules` reports nothing reclaimable, since nothing inside one matches `**/node_modules/` |
 | `apply(&CleanPlan, progress) -> CleanOutcome` | `core/src/trash.rs` | The only function that removes anything. Takes **no** removal mode: where each candidate goes is already on it, so `preview` prints exactly what this does. Trashing batches; purging is per item |
 | `ScanOptions` | `core/src/options.rs` | The scan's whole input — and the file that states the core reads no config and no environment |
 | `ScanNode` / `ScanTree` | `core/src/tree.rs` | A node carries `path`, sizes, `is_dir`, `modified`, `links`, `children`; the tree adds `skipped` and `link_groups` |
-| `Rule` / `Rules` | `core/src/rules.rs` | Detection as data. **List order is precedence**; a rule that cannot be expressed matches nothing |
+| `Part` / `Rule` / `Rules` | `core/src/rules.rs` | Detection as data. A rule is a name, a tier and a list of **parts**; satisfying **any** part satisfies the rule. **List order is precedence** — over parts as well, since they are flattened in (rule, part) order |
+| `DuplicateRule` / `DuplicateRules` / `Pool` | `core/src/dup_rules.rs` | The same parts, pooling instead of matching. `pool(path)` returns the **first** rule that matches — membership is exclusive |
+| `Dropped` / `Why` | `core/src/rules.rs` | What compilation threw away and why. Dropping is silent by design; this is what `--explain` asks |
+| `Source` / `Sources` | `cli/src/args.rs` | Where each shown value came from — flag, file, or default. Recorded by the same function that chooses it |
 | `Rules::state -> State` | `core/src/rules.rs` | Why a row is that colour: `untracked` / `in scope` / `included` / `excluded`. Shares `matching`, `excluded` **and `predicates_hold`** with `detect`, so `included` means exactly "detect would claim this" |
 | `Facts` | `core/src/rules.rs` | What the caller already knows — siblings, mtime, `now` — so the other predicates need no filesystem and no clock. `any_sibling` is a *predicate over names*, not a name: `requires_sibling` is a glob and only `Rules` has it compiled |
 | `DetectOptions` / `Detection` | `core/src/detect.rs` | The pass's input and output. `now` is mandatory, so a rule's `older_than` can never be half-armed |
@@ -148,6 +171,7 @@ formatting lives in `cli/src/render/tree.rs`, since only the renderer needs it
 | `CleanOutcome` | `core/src/trash.rs` | `trashed` / `purged` / `failed` — never a `Result`, and the two halves are **never added up by the core**: one figure over both would not say what can be brought back |
 | `SkippedEntry` / `SkipReason` | `core/src/tree.rs` | Failures returned **as data** — the core never prints |
 | `RenderOptions` | `cli/src/render/tree.rs` | Display-only knobs |
+| `Duplicating` | `cli/src/args.rs` | What `--dup` resolved to. **Its presence is the switch**: `Some` means the candidates come from contents, so an empty duplicate run still prints the duplicate report |
 | `Intent` | `cli/src/args.rs` | `Preview` or `Removing` — the verb, as a value. The closing line of the report differs, and printing the wrong one before a deletion is the defect it exists for |
 | `Report` | `cli/src/args.rs` | `depth` and `sort` — display only. Nothing in it can keep a candidate out of the removal, only out of the printout |
 | `Config` / `Environment` | `cli/src/config.rs`, `cli/src/args.rs` | The file's contents, and everything the frontend resolved before the args became work |
@@ -164,6 +188,89 @@ Invariants worth keeping in mind:
   size and file identity both come from one `GetFileInformationByHandleEx` call
   per directory; `size.rs` is only the fallback there. Unix takes the per-file
   path and is unchanged.
+- **`*` stops at a separator; only `**` crosses one.** globset does not do this
+  by default, and until v0.7 the two were synonyms — so `parent/*/` claimed
+  grandchildren and "the direct children of this directory" was inexpressible.
+  Set once, in `rules::compile`, because both rule kinds compile through it.
+- **A part is a self-contained statement.** Everything deciding *whether* an
+  object qualifies is in the part; everything about the *consequence* is on the
+  rule. A tier on a part would make the part a rule, and the rule would stop
+  being the unit the report groups by. There is **no flat form**: two spellings
+  of one thing would have to be answered for in every example, message and field
+  added later.
+- **A part that cannot be expressed is dropped and its siblings stand — but a
+  rule left with no parts is dropped whole.** Keeping it would put a name in
+  `names()` and `get()` that can never match, which is exactly the "my rule is
+  not running" state the browser must be able to tell from "my rule does not
+  cover this".
+- **For a clean rule the parts are matchers; for a duplicate rule they are a
+  population.** Adding a part to the first adds candidates; adding one to the
+  second can *create* groups that did not exist, because two populations can now
+  pair.
+- **Pool membership is exclusive.** Overlapping pools are not an ambiguity but a
+  corrupt plan: one would name a file its keeper while another listed it for
+  removal, and both merge. The cost — two separate rules never compare their
+  files — is paid for by the report always saying how many pools it searched and
+  how big each was.
+- **`purge` is refused on a duplicate rule.** For a clean rule it claims "one
+  command regenerates this"; nothing regenerates a copy. `--purge` the flag still
+  applies, typed by hand, like `--yes`.
+- **`..` is refused in every pattern field.** It is the only way a pattern can
+  leave its root, and every way it could is a mistake that would otherwise be
+  silent — the glob never matches and the part stops claiming anything.
+- **Removing runs on a worker, and the progress says only what is true.**
+  `apply` reports a trashed candidate **before** submitting the batch, so those
+  callbacks mean *listed*, not *gone* — the modal counts them as such and then
+  says it is waiting on one call. Purging is per item, so there the figure is
+  real. No key is offered while it runs: stopping half way through a batch the OS
+  already has is not a promise this can keep.
+- **A removal re-walks only what changed.** `Sizer::forget` is called on the one
+  path that was removed from and the listing is re-requested — `request` skips
+  what it already holds, so exactly one walk runs. It happens where the
+  **outcome arrives**, not where the key was pressed, because the two are no
+  longer the same moment. `remeasure`, which forgets the
+  whole listing, stays what the `r` key does. And the re-read goes through
+  `refresh`, not `arrive`: the latter clears the filter, which is right for a
+  move and wrong for standing still.
+- **Sorting by what would be freed degrades like sorting by creation time.**
+  Both read a figure that may not be there — one because the platform never
+  recorded it, one because the walk has not finished — so both fall back to name
+  and **say so**, and an unknown sorts last in either direction. The difference
+  is that this one corrects itself: `absorb_sizes` re-sorts when a walk
+  completes, for `Size` and `Cleanable` alike.
+- **The browser removes only what a rule claims, and always asks.** `D` plans
+  the subtree under the cursor exactly as `clean <path>` would, on a **worker**
+  so the screen keeps drawing. The **strictest tier in the plan** decides how it
+  is **announced**: anything destroying puts a red heading on the modal and
+  names every share as destroyed. Agreeing is `Y` either way — the tier changes
+  what is said, not what is asked. On the command line the verb is the moment of intent; a
+  keypress has none, so the modal supplies one. `Backspace` is not the key — it
+  navigates, and a destructive action must not share a finger with a habit.
+- **`--explain` exits without walking, reading or removing.** Explaining and then
+  acting would make it a log line; the point of a check is that it happens first.
+  It names every flag passed, including the display-only ones, because a flag
+  passed and never mentioned reads as a flag ignored.
+- **Hardlink collapse cost nothing to write.** `dedup::attribute` zeroes every
+  name of an inode but one, and a zeroed entry fails the duplicate pass's first
+  filter — which is exactly right, since removing one name frees no bytes. The
+  concept's "hardlink-collapse" stage is a stage that never had to exist.
+- **A file that could not be read is not evidence.** It drops out of its group
+  **and is reported**; if fewer than two members remain the group disappears. A
+  copy is never proposed for removal against content the tool could not read.
+- **A keeper rule degrades rather than misleads.** A copy whose date the platform
+  did not record never wins; a group where *none* has it falls back to the other
+  date, then to the path, and says so per group (`Kept::fell_back`). "Kept the
+  oldest" and "kept the first path" are different claims about one run.
+- **Both dates come from the re-stat the pass already makes**, so choosing by
+  creation time costs no syscall and `ScanNode` never grew a field for it.
+- **Which report is printed is settled by the mode, not by the plan.** An empty
+  `--dup` run has to say *no duplicates found* and name the two things that
+  explain it; a plan with no candidates cannot be told from any other empty plan.
+- **`--dup` is not a config key**, for the same reason `--yes` and `--purge` are
+  not: a file that switched what `clean` removes would switch it invisibly.
+  `duplicate` is a **reserved rule name** — one line of a plan must not be able
+  to mean two things, and they differ where it matters, since a rule may say
+  `tier = "purge"` and a duplicate never can.
 - **The safe-list is data, not code.** Five built-in `Rule`s replace v0.2's four
   hardcoded categories, and a user may edit any of them. **The denylist is the
   one thing no rule, flag or config can reach.**
@@ -237,11 +344,13 @@ Invariants worth keeping in mind:
   only while that column sorted.
 - **The TUI cancels only what the user asks it to** (`r`) and what exit
   requires. Cancelling on navigation destroyed work that was about to be wanted.
-- **The config file is edited, never regenerated.** `toml_edit` keeps comments,
-  spacing and key order; serialising the parsed form would throw away the
-  explanations that make the file worth having. An **absent `[[rules]]` means
-  "leave the built-ins alone"**, so adding the first rule writes them out too
-  rather than silently turning five rules into one.
+- **The tool never writes the config file except `config init`,** which refuses
+  to overwrite without `-f`. v0.4's comment-preserving write-back is gone with
+  the TOML it was built on: the YAML editor that could have replaced it produces
+  wrong indentation on the one operation it was needed for (appending a mapping
+  to a sequence), and a config editor that can corrupt a config is worse than
+  none. An **absent `rules:` still means "leave the built-ins alone"**, and an
+  empty list still means "no rules".
 - **A colour and a candidate are decided by the same code.** `detect::claim` and
   `Rules::state` both run `matching` → `excluded` → `predicates_hold`, in that
   order. A `target/` with no `Cargo.toml` beside it is `in scope`, not
@@ -261,13 +370,15 @@ Invariants worth keeping in mind:
 
 ## Configuration
 
-`disk-tools` reads a TOML file: `$XDG_CONFIG_HOME/disk-tools/config.toml` when
-that is set (on **every** platform), otherwise `%APPDATA%\disk-tools\config.toml`
-on Windows and `~/.config/disk-tools/config.toml` elsewhere. `--config <PATH>`
-overrides it; `disk-tools config init` writes the commented defaults.
+`disk-tools` reads a YAML file (see [the v0.7 snapshot](kb/architecture/2026.08/2026.08.01-parts-and-pools.md) for the rule model): `$XDG_CONFIG_HOME/disk-tools/config.yml` when
+that is set (on **every** platform), otherwise `%APPDATA%\disk-tools\config.yml`
+on Windows and `~/.config/disk-tools/config.yml` elsewhere. `--config <PATH>`
+overrides it; `disk-tools config init` writes the commented defaults, and refuses to overwrite without `-f`.
 
-The file supplies the **rules**. An absent `[[rules]]` leaves the built-ins
-alone; an empty list means none. `root` is required, and `"*"` is how a rule says
+The file supplies both rule lists. An absent `clean-rules:` leaves the built-ins alone;
+an empty list means none. A leftover `config.toml` with no `config.yml` beside it
+is an **error**, not a fallback: ignoring it would run `clean` under rules the
+user did not write. `root` is required, and `"*"` is how a rule says
 it applies wherever the scan goes. `tier` is one of `purge` / `trash` /
 `confirm`, and `"auto"` is an **error** naming `trash` rather than an alias.
 
@@ -288,8 +399,8 @@ What configuration exists beyond that is build-time:
 | File | Holds |
 |------|-------|
 | `Cargo.toml` (workspace) | `version`, `edition = "2024"`, `rust-version = "1.88"`, inherited by both crates |
-| `core/Cargo.toml` | The optional `serde` feature; `windows-sys` under `[target.'cfg(windows)'.dependencies]` |
-| `cli/Cargo.toml` | Enables the core's `serde` feature for `--json`; `toml_edit` for writing rules back |
+| `core/Cargo.toml` | The optional `serde` and `duplicates` features; `windows-sys` under `[target.'cfg(windows)'.dependencies]`. **blake3 carries `features = ["pure"]`** — its default build assembles x86 sources through `cc`, which needs `ml64.exe` on the Windows target and so breaks `just lint-windows` on a Unix host |
+| `cli/Cargo.toml` | Enables the core's `serde` feature for `--json`; `yaml_serde` (the maintained fork of the archived `serde_yaml`) for the config |
 | `.gitattributes` | `* text=auto eol=lf` — a CRLF checkout would fail `cargo fmt --check` on Windows |
 
 `.gitignore` also lists `.env`, `.direnv/`, `chat/` and `logs/`; none of these
@@ -306,11 +417,11 @@ kb/<folder>/<YYYY.MM>/<YYYY.MM.DD>-<slug>.md
 
 | Folder | Purpose | Latest snapshot |
 |--------|---------|-----------------|
-| `kb/architecture/` | System design, key patterns | `2026.07/2026.07.30` |
+| `kb/architecture/` | System design, key patterns | `2026.08/2026.08.02` |
 | `kb/guides/` | Developer-facing how-tos | `2026.07/2026.07.25` |
-| `kb/benchmarks/` | Recorded performance/memory measurements | `2026.07/2026.07.26` |
+| `kb/benchmarks/` | Recorded performance/memory measurements | `2026.08/2026.08.01` |
 | `kb/concepts/` | Concept documents (`/write-concept`) | `2026.07` |
-| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.29` |
+| `kb/specs/` | Feature specs (`/write-spec`) | `2026.07/2026.07.30` |
 | `kb/brainstorms/` | Brainstorm sessions (`/brainstorm`) | `2026.07` |
 | `kb/research/` | Research reports (`/research`) | `2026.07/2026.07.25` |
 | `kb/plans/` | Execution plans (`/brainstorm`) | `2026.07/2026.07.25` |
@@ -320,7 +431,10 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 
 ## Documentation
 
-**Architecture** (snapshots from `kb/architecture/2026.07/`)
+**Architecture** (snapshots from `kb/architecture/`)
+- [After v0.7: removing from the browser, and what a progress report may claim](kb/architecture/2026.08/2026.08.02-removal-from-the-browser.md) — why a keypress needs a modal to supply intent, why the trash and purge halves count differently, where the tidying belongs
+- [After v0.7: parts, pools, and what a configuration cannot say for itself](kb/architecture/2026.08/2026.08.01-parts-and-pools.md) — why the cross product could not say "or", why pools are exclusive, and what `--explain` is answering
+- [After v0.6: a second source of candidates](kb/architecture/2026.07/2026.07.30-duplicates.md) — why `--dup` is a flag and not a verb, what the staged funnel costs, what the keeper rule went through
 - [After v0.5: two verbs, three tiers, and a plan that says what it will do](kb/architecture/2026.07/2026.07.30-preview-and-clean.md) — what was ceremony and what was a guard, why `--purge` must not rewrite a tier, display versus plan
 - [After v0.4: the browser, and why it does not scan](kb/architecture/2026.07/2026.07.27-tui-lazy-model.md) — the lazy model, what replaced the generation counter, what four rounds of real use found
 - [After v0.3: detection as data](kb/architecture/2026.07/2026.07.26-overview.md) — the rule engine, the config path, multi-root `clean`, which invariants moved
@@ -336,3 +450,5 @@ Files are always written under a `<YYYY.MM>/` folder — never directly under `k
 - [What the cleanup engine costs](kb/benchmarks/2026.07/2026.07.25-clean-latency.md) — the git guard at ~23 ms per repository
 - [The trash backend](kb/benchmarks/2026.07/2026.07.25-trash-backend.md) — 10,000 files across three platforms
 - [What detection costs](kb/benchmarks/2026.07/2026.07.26-detect-budget.md) — 285 ns per node before v0.3's rule engine, 201 ns after
+- [What the duplicate search costs](kb/benchmarks/2026.07/2026.07.30-duplicate-cost.md) — the funnel on real trees, and what the 1 MiB floor is worth
+- [What duplicate rules are worth](kb/benchmarks/2026.08/2026.08.01-duplicate-rules-cost.md) — a rooted pool: 49.8 GiB read in 13.6 s becomes 125 MiB in 0.38 s

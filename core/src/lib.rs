@@ -29,6 +29,10 @@
 mod clean;
 mod dedup;
 mod detect;
+#[cfg(feature = "duplicates")]
+mod dup_rules;
+#[cfg(feature = "duplicates")]
+mod duplicates;
 mod git;
 mod measure;
 mod options;
@@ -42,13 +46,21 @@ mod walk;
 #[cfg(windows)]
 mod windows_dir;
 
-pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, plan};
+#[cfg(feature = "duplicates")]
+pub use clean::plan_duplicates;
+pub use clean::{Candidate, CleanOptions, CleanPlan, ExcludeReason, Excluded, Kept, plan};
 pub use detect::{DetectOptions, Detection, detect};
+#[cfg(feature = "duplicates")]
+pub use dup_rules::{DuplicateRule, DuplicateRules, Pool, builtin_duplicate_rules};
+#[cfg(feature = "duplicates")]
+pub use duplicates::{
+    Copy, DuplicateGroup, DuplicateOptions, Duplicates, Hashed, Keep, Searched, duplicates,
+};
 pub use measure::{Claim, Finished, Measured, measure};
 pub use options::ScanOptions;
 pub use rules::{
-    AnySibling, Facts, NameTest, Rule, RuleError, Rules, State, Tier, UserDirs, age_rule,
-    builtin_rules,
+    AnySibling, Dropped, Facts, NameTest, Part, Rule, RuleError, Rules, State, Tier, UserDirs, Why,
+    age_rule, builtin_rules, user_path,
 };
 pub use size::allocated_size;
 #[cfg(feature = "trash")]

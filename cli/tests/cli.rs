@@ -588,7 +588,7 @@ fn a_relative_path_finds_what_the_absolute_one_does() {
     let config = home_dir.join("rules.toml");
     std::fs::write(
         &config,
-        "[[rules]]\nname = \"js\"\nroot = \"~\"\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n",
+        "clean-rules:\n  - name: js\n    tier: trash\n    parts:\n      - root: \"~\"\n        includes: [\"**/node_modules/\"]\n",
     )
     .expect("write config");
     let config = config.to_str().expect("utf8");
@@ -803,8 +803,8 @@ fn a_config_that_names_no_directory_says_so() {
     let home = isolated();
     let config = write(
         home.path(),
-        "config.toml",
-        "[[rules]]\nname = \"anywhere\"\nroot = \"*\"\nincludes = [\"**/x/\"]\n",
+        "config.yml",
+        "clean-rules:\n  - name: \"anywhere\"\n    parts:\n      - root: \"*\"\n        includes: [\"**/x/\"]\n",
     );
 
     let output = run(&["--config", config.to_str().expect("utf8"), "preview"]);
@@ -1092,8 +1092,8 @@ fn a_configured_rule_replaces_the_builtins() {
     let home = tempfile::tempdir().expect("tempdir");
     let config = write(
         home.path(),
-        "config.toml",
-        "[[rules]]\nname = \"mine\"\nroot = \"*\"\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n",
+        "config.yml",
+        "clean-rules:\n  - name: \"mine\"\n    parts:\n      - root: \"*\"\n        includes: [\"**/node_modules/\"]\n    tier: \"trash\"\n",
     );
 
     let output = run(&[
@@ -1121,7 +1121,11 @@ fn a_configured_rule_replaces_the_builtins() {
 fn a_malformed_config_stops_the_program_before_scanning() {
     let fixture = node_modules_dir();
     let home = tempfile::tempdir().expect("tempdir");
-    let config = write(home.path(), "config.toml", "[scan]\none-file-system = \n");
+    let config = write(
+        home.path(),
+        "config.yml",
+        "scan:\n  one-file-system: true\n bad-indent: 1\n",
+    );
 
     let output = run(&[
         "--config",
@@ -1138,7 +1142,7 @@ fn a_malformed_config_stops_the_program_before_scanning() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("line 2"),
+        stderr.contains("line 3"),
         "must locate the mistake:\n{stderr}"
     );
 }
@@ -1171,8 +1175,8 @@ fn an_unknown_key_warns_but_the_run_continues() {
     let home = tempfile::tempdir().expect("tempdir");
     let config = write(
         home.path(),
-        "config.toml",
-        "[scan]\none-file-sistem = true\n",
+        "config.yml",
+        "scan:\n  one-file-sistem: true\n",
     );
 
     let output = run(&[
@@ -1202,8 +1206,8 @@ fn a_rule_missing_its_root_is_refused_by_name() {
     let home = tempfile::tempdir().expect("tempdir");
     let config = write(
         home.path(),
-        "config.toml",
-        "[[rules]]\nname = \"mine\"\nincludes = [\"**/x/\"]\n",
+        "config.yml",
+        "clean-rules:\n  - name: \"mine\"\n    parts:\n      - includes: [\"**/x/\"]\n",
     );
 
     let output = run(&[
@@ -1224,7 +1228,7 @@ fn a_rule_missing_its_root_is_refused_by_name() {
 #[test]
 fn config_init_writes_a_usable_file_and_prints_its_path() {
     let home = tempfile::tempdir().expect("tempdir");
-    let target = home.path().join("nested").join("config.toml");
+    let target = home.path().join("nested").join("config.yml");
 
     let output = run(&["--config", target.to_str().expect("utf8"), "config", "init"]);
 
@@ -1252,7 +1256,7 @@ fn config_init_writes_a_usable_file_and_prints_its_path() {
 #[test]
 fn config_init_refuses_to_overwrite_without_force() {
     let home = tempfile::tempdir().expect("tempdir");
-    let target = write(home.path(), "config.toml", "# mine\n");
+    let target = write(home.path(), "config.yml", "# mine\n");
 
     let output = run(&["--config", target.to_str().expect("utf8"), "config", "init"]);
 
@@ -1275,7 +1279,7 @@ fn config_init_refuses_to_overwrite_without_force() {
     assert!(
         std::fs::read_to_string(&target)
             .expect("read")
-            .contains("[[rules]]")
+            .contains("clean-rules:\n  - name:")
     );
 }
 
@@ -1288,14 +1292,14 @@ fn seed_node_modules(dir: &Path, bytes: usize) {
 
 /// A config rooting one rule at each of `roots`.
 fn rules_rooted_at(at: &Path, roots: &[&Path]) -> std::path::PathBuf {
-    let mut text = String::new();
+    let mut text = String::from("clean-rules:\n");
     for (index, root) in roots.iter().enumerate() {
         text.push_str(&format!(
-            "[[rules]]\nname = \"r{index}\"\nroot = {:?}\nincludes = [\"**/node_modules/\"]\ntier = \"trash\"\n\n",
+            "  - name: \"r{index}\"\n    tier: \"trash\"\n    parts:\n      - root: {:?}\n        includes: [\"**/node_modules/\"]\n",
             root.to_str().expect("utf8")
         ));
     }
-    write(at, "config.toml", &text)
+    write(at, "config.yml", &text)
 }
 
 /// The promise Task 2 made when it required `root` in the file.
@@ -1552,8 +1556,8 @@ fn the_setting_can_be_turned_off() {
     let home = isolated();
     let config = write(
         home.path(),
-        "config.toml",
-        "[clean]\nrequire-confirmation = false\n",
+        "config.yml",
+        "clean:\n  require-confirmation: false\n",
     );
 
     let output = run(&[
@@ -1744,4 +1748,228 @@ fn help_lists_the_ui_verb() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ui"), "{stdout}");
+}
+
+// ---- duplicates -----------------------------------------------------------
+
+/// End to end, on real files: the whole path from `--dup` to a report that names
+/// what stays. Every unit below it is tested on hand-built values, and this is
+/// the only test that proves the hashing, the plan and the report agree.
+#[test]
+fn preview_dup_finds_identical_files_and_says_which_one_stays() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    // Written first, so the default rule keeps it; sorts last, so the *path*
+    // cannot be what decided.
+    std::fs::write(root.join("z-original.bin"), &bytes).expect("write");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(root.join("a-copy.bin"), &bytes).expect("write");
+    std::fs::write(root.join("unique.bin"), vec![b'y'; 2 * 1024 * 1024]).expect("write");
+
+    let output = spawn(
+        &["preview", "--dup", "-d", "1", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(report.contains("keep    "), "{report}");
+    assert!(report.contains("remove  "), "{report}");
+    assert!(
+        report.contains("a-copy.bin"),
+        "the copy is offered: {report}"
+    );
+    assert!(
+        !report.contains("unique.bin"),
+        "a file with no twin is not a duplicate: {report}"
+    );
+    assert!(report.contains("Preview — nothing was removed"), "{report}");
+    // And nothing was: a preview is a preview.
+    assert!(root.join("a-copy.bin").exists());
+}
+
+/// With no path the duplicate rules say where to look, exactly as the clean
+/// rules do for an ordinary run. The shipped rule is unrooted, so a bare
+/// `preview --dup` has nowhere to go — and says which list to edit.
+#[test]
+fn dup_without_a_path_names_the_list_it_consulted() {
+    let output = run(&["preview", "--dup"]);
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("no duplicate rule"), "{stderr}");
+    assert!(
+        !stderr.contains("to clean"),
+        "the clean rules are not what was consulted: {stderr}"
+    );
+}
+
+/// And a rooted duplicate rule is walked without a path being typed.
+#[test]
+fn a_rooted_duplicate_rule_is_walked_with_no_path() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(root.join("one.bin"), &bytes).expect("write");
+    std::fs::write(root.join("two.bin"), &bytes).expect("write");
+
+    let config = write(
+        home.path(),
+        "config.yml",
+        &format!(
+            "duplicate-rules:\n  - name: here\n    parts:\n      - root: {:?}\n        includes: [\"**\"]\n",
+            root.to_str().expect("utf8")
+        ),
+    );
+
+    let output = spawn(
+        &[
+            "--config",
+            config.to_str().expect("utf8"),
+            "preview",
+            "--dup",
+        ],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success(), "{:?}", output.status);
+    let report = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(report.contains("keeps"), "{report}");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("examining"), "and it says where: {stderr}");
+}
+
+/// A duplicate is confirm-tier, always. `clean --dup` without `--yes` therefore
+/// refuses, removes nothing and exits 2 — v0.5's rule, inherited whole.
+#[test]
+fn clean_dup_refuses_without_yes_and_leaves_both_copies() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(root.join("one.bin"), &bytes).expect("write");
+    std::fs::write(root.join("two.bin"), &bytes).expect("write");
+
+    let output = spawn(
+        &["clean", "--dup", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(root.join("one.bin").exists(), "nothing was removed");
+    assert!(root.join("two.bin").exists(), "nothing was removed");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("--yes"), "{stderr}");
+}
+
+/// `--safe` admits only what needs no confirming, and no duplicate does.
+#[test]
+fn safe_and_dup_together_plan_nothing() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(root.join("one.bin"), &bytes).expect("write");
+    std::fs::write(root.join("two.bin"), &bytes).expect("write");
+
+    let output = spawn(
+        &["preview", "--dup", "--safe", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(report.contains("No duplicates found."), "{report}");
+    assert!(
+        report.contains("--safe is hiding"),
+        "and it says the flag is why: {report}"
+    );
+}
+
+/// The machine-readable half, on the same fixture.
+#[test]
+fn dup_json_is_groups_on_stdout_and_nothing_else() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(root.join("one.bin"), &bytes).expect("write");
+    std::fs::write(root.join("two.bin"), &bytes).expect("write");
+
+    let output = spawn(
+        &["preview", "--dup", "--json", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is one JSON document");
+    let groups = value["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["copies"].as_array().expect("copies").len(), 1);
+    assert!(groups[0]["keeper"]["path"].is_string());
+}
+
+// ---- --explain ------------------------------------------------------------
+
+/// It explains and **stops**. A check that acted afterwards would be a log line.
+#[test]
+fn explain_walks_nothing_and_removes_nothing() {
+    let home = isolated();
+    let root = home.path().join("files");
+    std::fs::create_dir(&root).expect("mkdir");
+    std::fs::create_dir(root.join("node_modules")).expect("mkdir");
+    std::fs::write(root.join("node_modules/a.bin"), vec![b'x'; 4096]).expect("write");
+
+    let output = spawn(
+        &["clean", "--yes", "--explain", root.to_str().expect("utf-8")],
+        home.path(),
+    )
+    .output()
+    .expect("spawn disk-tools");
+
+    assert!(output.status.success(), "{:?}", output.status);
+    assert!(
+        root.join("node_modules/a.bin").exists(),
+        "--yes and all, it removed nothing"
+    );
+    let said = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(said.contains("Would examine"), "{said}");
+    assert!(said.contains("node-modules"), "the rules in force: {said}");
+    assert!(
+        !said.contains("Reclaimable"),
+        "and no report, because nothing was walked: {said}"
+    );
+}
+
+/// Explaining is not a way to skip validation: the rules decide what may be
+/// deleted, and a file that cannot be read leaves that unknown.
+#[test]
+fn explain_still_refuses_a_config_it_cannot_read() {
+    let home = isolated();
+    let config = write(home.path(), "config.yml", "clean-rules:\n  - name: mine\n");
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("utf-8"),
+        "--explain",
+        "preview",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(stderr.contains("`parts` is required"), "{stderr}");
 }
